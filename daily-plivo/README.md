@@ -1,13 +1,13 @@
-# Pipecat Plivo SIP Dial-Out Example
+# Daily Plivo SIP Dial-Out Example
 
-This example demonstrates how to use Pipecat with Plivo for SIP dial-out functionality, using Daily as the WebRTC transport layer.
+This example demonstrates how to use Daily.co with Plivo for SIP dial-out functionality, using Daily as the WebRTC transport layer.
 
 ## Architecture Overview
 
 The system consists of three main components:
 
 1. **FastAPI Server** (`server.py`): Handles outbound call requests and orchestrates the call setup
-2. **Bot Process** (`bot.py`): Manages the AI conversation using Pipecat
+2. **Bot Process** (`bot.py`): Manages the AI conversation using Daily.co WebRTC
 3. **External Services**:
    - **Daily**: Provides WebRTC transport and SIP capabilities
    - **Plivo**: Handles actual phone call routing (instead of Twilio)
@@ -257,11 +257,11 @@ Then use the ngrok URL as your webhook endpoint.
 
 ## Additional Resources
 
-- [Pipecat Documentation](https://docs.pipecat.ai/)
+- [Daily.co Documentation](https://docs.daily.co/)
 - [Plivo Documentation](https://www.plivo.com/docs/)
-- [Daily Documentation](https://docs.daily.co/)
 - [Plivo XML Reference](https://www.plivo.com/docs/voice/xml/)
 - [Plivo API Reference](https://www.plivo.com/docs/voice/api/)
+- [Pipecat Documentation](https://docs.pipecat.ai/) (AI framework used by the bot)
 
 ## License
 
@@ -270,6 +270,6 @@ This example is provided as-is for educational purposes.
 ## Support
 
 For issues related to:
-- **Pipecat**: https://github.com/pipecat-ai/pipecat
+- **Daily.co**: https://help.daily.co/
 - **Plivo**: https://support.plivo.com/
-- **Daily**: https://help.daily.co/
+- **Pipecat** (AI framework): https://github.com/pipecat-ai/pipecat

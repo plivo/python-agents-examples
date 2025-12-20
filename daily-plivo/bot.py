@@ -168,7 +168,7 @@ async def main(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Pipecat Plivo Dial-out Bot")
+    parser = argparse.ArgumentParser(description="Daily Plivo Dial-out Bot")
     parser.add_argument("-u", "--url", type=str, required=True, help="Daily room URL")
     parser.add_argument("-t", "--token", type=str, required=True, help="Daily token")
     parser.add_argument("-n", "--number", type=str, required=True, help="Phone number to call")
