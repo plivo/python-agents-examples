@@ -111,7 +111,7 @@ gemini-live-plivo/
 | Gemini → Agent | PCM16 | 24 kHz |
 | Agent → Plivo | μ-law | 8 kHz |
 
-Audio conversion uses numpy (not the deprecated `audioop` module) for Python 3.11+ compatibility.
+Audio conversion uses numpy for Python 3.11+ compatibility.
 
 ## Function Calling
 
@@ -259,10 +259,6 @@ For developers extending this code:
    types.FunctionResponse(id=fc.id, name=fc.name, response={...})
    ```
 
-3. **Audio conversion** uses numpy-based μ-law encoding/decoding instead of the deprecated `audioop` module (removed in Python 3.13).
+3. **Audio conversion** uses numpy-based μ-law encoding/decoding.
 
 4. **Plivo audio chunks** must be 160 bytes (20ms at 8kHz μ-law) - larger chunks cause `incorrectPayload` errors.
-
-## License
-
-MIT

@@ -16,9 +16,10 @@ from pipecat.processors.aggregators.llm_response import (
     LLMAssistantResponseAggregator,
     LLMUserResponseAggregator,
 )
-from pipecat.services.deepgram import DeepgramSTTService
-from pipecat.services.openai import OpenAILLMService, OpenAITTSService
-from pipecat.transports.network.fastapi_websocket import (
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.openai.llm import OpenAILLMService
+from pipecat.services.openai.tts import OpenAITTSService
+from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketTransport,
     FastAPIWebsocketParams,
 )
@@ -95,15 +96,18 @@ async def websocket_endpoint(websocket: WebSocket):
     """
     WebSocket endpoint that handles real-time audio streaming from Plivo.
     """
-    
+    print(">>> WebSocket connection request received!")
+
     await websocket.accept()
-    
+    print(">>> WebSocket connection accepted!")
+
     try:
         # Read the start message from Plivo
+        print(">>> Waiting for start message from Plivo...")
         start_data = await websocket.receive_text()
         start_message = json.loads(start_data)
-        
-        print(f"Received start message: {start_message}")
+
+        print(f">>> Received start message: {start_message}")
         
         # Extract Plivo-specific IDs from the start event
         start_info = start_message.get("start", {})
@@ -171,16 +175,22 @@ async def websocket_endpoint(websocket: WebSocket):
             ]
         )
         
-        # Create initial conversation context
+        # Create initial conversation context with greeting prompt
         messages = [
             {
                 "role": "system",
-                "content": """You are a helpful voice assistant. Keep your responses 
+                "content": """You are a helpful voice assistant. Keep your responses
                 concise and natural for voice conversation. Be friendly and professional.
                 Ask clarifying questions when needed.""",
-            }
+            },
+            {
+                "role": "user",
+                "content": "Hello!",
+            },
         ]
-        
+
+        print(">>> Creating pipeline task...")
+
         # Create and run the pipeline task
         task = PipelineTask(
             pipeline,
@@ -190,16 +200,22 @@ async def websocket_endpoint(websocket: WebSocket):
                 enable_usage_metrics=True,
             ),
         )
-        
+
         # Store the task
         active_tasks[call_id] = task
-        
+
+        print(">>> Queuing initial LLM messages to trigger greeting...")
+
         # Queue initial LLM messages
         await task.queue_frames([LLMMessagesFrame(messages)])
-        
+
+        print(">>> Running pipeline...")
+
         # Run the pipeline
         runner = PipelineRunner()
         await runner.run(task)
+
+        print(">>> Pipeline completed")
         
     except Exception as e:
         print(f"Error in WebSocket handler: {e}")
