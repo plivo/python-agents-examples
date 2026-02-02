@@ -23,7 +23,7 @@ Real-time voice agent using Google Gemini Live API for speech-to-speech conversa
 ### 1. Install dependencies
 
 ```bash
-cd gemini-live-plivo
+cd gemini-live-native
 uv sync
 ```
 
@@ -69,7 +69,7 @@ Call your Plivo phone number and start talking to the agent.
 ## Project Structure
 
 ```
-gemini-live-plivo/
+gemini-live-native/
 ├── agent.py            # Voice agent with Gemini Live API
 ├── server.py           # FastAPI server with Plivo webhooks
 ├── tests/              # Integration and voice tests
