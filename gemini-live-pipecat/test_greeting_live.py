@@ -78,18 +78,17 @@ async def test_greeting():
                             data = json.loads(response)
                             event_type = data.get("event", "unknown")
 
-                            if event_type == "media":
-                                # Audio data received - this means agent is speaking
-                                media_data = data.get("media", {})
-                                payload = media_data.get("payload", "")
+                            if event_type == "playAudio":
+                                # Plivo playAudio event - agent is speaking
+                                payload = data.get("media", {}).get("payload", "")
                                 if payload:
                                     audio_bytes = len(base64.b64decode(payload))
                                     audio_bytes_total += audio_bytes
                                     if not greeting_received:
                                         print(f"Receiving audio from agent...")
                                         greeting_received = True
-                            elif event_type == "clear":
-                                pass  # Ignore clear events
+                            elif event_type in ("clear", "media"):
+                                pass  # Ignore clear and media events
                             elif "metrics" in str(data.get("type", "")):
                                 pass  # Ignore metrics
                             else:
