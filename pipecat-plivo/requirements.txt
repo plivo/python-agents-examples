@@ -1,7 +1,7 @@
 aenum==3.1.16
 aiofiles==24.1.0
 aiohappyeyeballs==2.6.1
-aiohttp==3.13.2
+aiohttp==3.13.3
 aiosignal==1.4.0
 annotated-doc==0.0.4
 annotated-types==0.7.0
@@ -31,7 +31,7 @@ llvmlite==0.44.0
 loguru==0.7.3
 lxml==6.0.2
 Markdown==3.10
-marshmallow==3.26.1
+marshmallow==3.26.2
 multidict==6.7.0
 mypy_extensions==1.1.0
 nltk==3.9.2
@@ -43,7 +43,7 @@ pillow==11.3.0
 pipecat-ai==0.0.97
 plivo==4.59.3
 propcache==0.4.1
-protobuf==5.29.5
+protobuf==5.29.6
 pydantic==2.12.5
 pydantic_core==2.41.5
 PyJWT==2.10.1
@@ -62,7 +62,7 @@ tqdm==4.67.1
 typing-inspect==0.9.0
 typing-inspection==0.4.2
 typing_extensions==4.15.0
-urllib3==2.6.1
+urllib3==2.6.3
 uvicorn==0.38.0
 uvloop==0.22.1
 watchfiles==1.1.1
