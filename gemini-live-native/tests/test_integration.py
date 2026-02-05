@@ -47,7 +47,7 @@ PLIVO_AUTH_ID = os.getenv("PLIVO_AUTH_ID", "")
 PLIVO_AUTH_TOKEN = os.getenv("PLIVO_AUTH_TOKEN", "")
 PLIVO_PHONE_NUMBER = os.getenv("PLIVO_PHONE_NUMBER", "")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "")
-SERVER_PORT = int(os.getenv("SERVER_PORT", "7860"))
+SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
 
 LOCAL_WS_URL = f"ws://localhost:{SERVER_PORT}/ws"
 LOCAL_HTTP_URL = f"http://localhost:{SERVER_PORT}"

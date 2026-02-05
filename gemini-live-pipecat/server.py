@@ -6,6 +6,8 @@ import base64
 import contextlib
 import json
 import os
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 
 import phonenumbers
 import plivo
@@ -32,6 +34,9 @@ DEFAULT_COUNTRY_CODE = os.getenv("DEFAULT_COUNTRY_CODE", "US")
 # Public URL for webhooks (ngrok URL or production domain)
 PUBLIC_URL = os.getenv("PUBLIC_URL", "")
 
+# Store active pipeline tasks
+active_tasks: dict[str, object] = {}
+
 
 def normalize_phone_number(phone: str, default_region: str = DEFAULT_COUNTRY_CODE) -> str:
     """Normalize phone number to E.164 format (digits only, no leading +)."""
@@ -45,13 +50,6 @@ def normalize_phone_number(phone: str, default_region: str = DEFAULT_COUNTRY_COD
     except phonenumbers.NumberParseException as e:
         logger.warning(f"Failed to parse phone number '{phone}': {e}")
         return "".join(c for c in phone if c.isdigit())
-
-
-app = FastAPI(
-    title="Gemini-Plivo Voice Agent",
-    description="Voice agent using Google Gemini Live API with Plivo telephony",
-    version="0.1.0",
-)
 
 
 def configure_plivo_webhooks() -> bool:
@@ -72,7 +70,7 @@ def configure_plivo_webhooks() -> bool:
     try:
         client = plivo.RestClient(auth_id=PLIVO_AUTH_ID, auth_token=PLIVO_AUTH_TOKEN)
 
-        app_name = "Gemini_Voice_Agent"
+        app_name = "Gemini_Live_Pipecat_Agent"
         answer_url = f"{PUBLIC_URL}/answer"
         hangup_url = f"{PUBLIC_URL}/hangup"
 
@@ -126,13 +124,33 @@ def configure_plivo_webhooks() -> bool:
         return False
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Lifespan context manager for FastAPI startup/shutdown."""
+    logger.info("Starting Gemini Live Pipecat Voice Agent")
+    yield
+    logger.info("Shutting down...")
+    for task in active_tasks.values():
+        with contextlib.suppress(Exception):
+            await task.cancel()
+
+
+app = FastAPI(
+    title="Gemini Live Pipecat Voice Agent",
+    description="Voice agent using Pipecat with Google Gemini Live API",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+
 @app.get("/")
 async def health_check() -> dict:
     """Health check endpoint."""
     phone = normalize_phone_number(PLIVO_PHONE_NUMBER)
     return {
         "status": "ok",
-        "service": "gemini-plivo-voice-agent",
+        "service": "gemini-live-pipecat",
+        "model": agent.GEMINI_MODEL,
         "phone_number": f"+{phone}" if phone else "not configured",
     }
 
@@ -222,6 +240,8 @@ async def websocket_endpoint(
     body: str = Query(default=""),
 ) -> None:
     """WebSocket endpoint for bidirectional audio streaming with Plivo."""
+    logger.info("WebSocket connection request received")
+
     await websocket.accept()
     logger.info("WebSocket connection accepted")
 
@@ -233,39 +253,62 @@ async def websocket_endpoint(
         except Exception as e:
             logger.warning(f"Failed to decode call metadata: {e}")
 
+    call_id = None
+
     try:
+        # Read the start message from Plivo
+        logger.info("Waiting for start message from Plivo...")
         start_data = await websocket.receive_text()
         start_message = json.loads(start_data)
+
+        logger.info(f"Received start message: {start_message}")
 
         if start_message.get("event") != "start":
             logger.error(f"Expected start event, got: {start_message.get('event')}")
             await websocket.close()
             return
 
+        # Extract Plivo-specific IDs from the start event
         start_info = start_message.get("start", {})
-        call_id = start_info.get("callId", call_data.get("call_uuid", "unknown"))
         stream_id = start_info.get("streamId")
-        logger.info(f"Plivo stream started: callId={call_id}, streamId={stream_id}")
+        call_id = start_info.get("callId", call_data.get("call_uuid", "unknown"))
 
-        await agent.run_agent(
+        if not stream_id or not call_id:
+            logger.error("Missing stream_id or call_id")
+            await websocket.close()
+            return
+
+        task = await agent.run_agent(
             websocket=websocket,
             call_id=call_id,
-            from_number=call_data.get("from", ""),
-            to_number=call_data.get("to", ""),
+            stream_id=stream_id,
+            auth_id=PLIVO_AUTH_ID,
+            auth_token=PLIVO_AUTH_TOKEN,
         )
+
+        # Store the task
+        active_tasks[call_id] = task
 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"Error in WebSocket handler: {e}")
+        import traceback
+
+        traceback.print_exc()
+
     finally:
+        # Cleanup
+        if call_id and call_id in active_tasks:
+            del active_tasks[call_id]
+
         with contextlib.suppress(Exception):
             await websocket.close()
 
 
 def main() -> None:
     """Run the server."""
-    logger.info(f"Starting Gemini-Plivo Voice Agent on port {SERVER_PORT}")
+    logger.info(f"Starting Gemini Live Pipecat Voice Agent on port {SERVER_PORT}")
 
     if PLIVO_PHONE_NUMBER and PUBLIC_URL:
         logger.info("Configuring Plivo webhooks...")
