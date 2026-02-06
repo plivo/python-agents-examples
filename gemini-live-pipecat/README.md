@@ -51,7 +51,7 @@ PUBLIC_URL=https://your-ngrok-url.ngrok-free.app
 ### 3. Start ngrok
 
 ```bash
-ngrok http 8080
+ngrok http 8000
 ```
 
 Copy the ngrok URL to `PUBLIC_URL` in your `.env` file.
@@ -134,7 +134,7 @@ the pipeline is simpler than traditional STT → LLM → TTS architectures.
 | `PLIVO_AUTH_ID` | Plivo Auth ID | Required |
 | `PLIVO_AUTH_TOKEN` | Plivo Auth Token | Required |
 | `PUBLIC_URL` | Public URL for webhooks (ngrok) | Required |
-| `SERVER_PORT` | Server port | `8080` |
+| `SERVER_PORT` | Server port | `8000` |
 | `GEMINI_MODEL` | Gemini model name | `models/gemini-2.5-flash-native-audio-preview-12-2025` |
 | `GEMINI_VOICE` | Gemini voice name | `Puck` |
 | `SYSTEM_PROMPT` | Custom system prompt | Default assistant prompt |
