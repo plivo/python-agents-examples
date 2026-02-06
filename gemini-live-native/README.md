@@ -46,7 +46,7 @@ PUBLIC_URL=https://your-ngrok-url.ngrok-free.app
 ### 3. Start ngrok
 
 ```bash
-ngrok http 7860
+ngrok http 8000
 ```
 
 Copy the ngrok URL to `PUBLIC_URL` in your `.env` file.
@@ -58,7 +58,7 @@ uv run python server.py
 ```
 
 The server will:
-1. Start on port 7860
+1. Start on port 8000
 2. Auto-configure Plivo webhooks for your phone number
 3. Display "Ready! Call +1234567890 to test"
 
@@ -155,7 +155,7 @@ elif name == "my_function":
 | `PLIVO_AUTH_TOKEN` | Plivo Auth Token | Required |
 | `PLIVO_PHONE_NUMBER` | Your Plivo phone number | Required |
 | `PUBLIC_URL` | Public URL for webhooks (ngrok) | Required |
-| `SERVER_PORT` | Server port | `7860` |
+| `SERVER_PORT` | Server port | `8000` |
 | `GEMINI_MODEL` | Gemini model name | `gemini-2.5-flash-native-audio-preview-12-2025` |
 | `GEMINI_VOICE` | Voice name | `Kore` |
 
@@ -191,7 +191,7 @@ PATH="$PWD:$PATH" uv run python tests/test_multiturn_voice.py
 
 ```bash
 docker build -t gemini-live-voice-agent .
-docker run -p 7860:7860 --env-file .env gemini-live-voice-agent
+docker run -p 8000:8000 --env-file .env gemini-live-voice-agent
 ```
 
 ## Troubleshooting
