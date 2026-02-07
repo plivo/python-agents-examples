@@ -38,6 +38,7 @@ These examples wire up separate providers for speech-to-text, language model, an
 | Example | STT | LLM | TTS | Framework |
 |---------|-----|-----|-----|-----------|
 | [gemini-deepgram-cartesia-native](./gemini-deepgram-cartesia-native/) | Deepgram | Gemini | Cartesia | None |
+| [gemini-deepgram-elevenlabs-native](./gemini-deepgram-elevenlabs-native/) | Deepgram | Gemini | ElevenLabs | None |
 | [pipecat-plivo](./pipecat-plivo/) | Deepgram | OpenAI | OpenAI TTS | Pipecat |
 | [daily-plivo](./daily-plivo/) | Deepgram | OpenAI | Cartesia | Pipecat + Daily |
 
