@@ -21,7 +21,7 @@ import agent
 load_dotenv()
 
 # Configuration
-SERVER_PORT = int(os.getenv("SERVER_PORT", "7860"))
+SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
 
 # Plivo configuration
 PLIVO_AUTH_ID = os.getenv("PLIVO_AUTH_ID", "")

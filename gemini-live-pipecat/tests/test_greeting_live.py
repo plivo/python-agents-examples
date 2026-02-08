@@ -28,7 +28,7 @@ async def send_silence(websocket, stream_id: str):
 
 async def test_greeting():
     """Connect to the voice agent and verify greeting behavior."""
-    uri = "ws://localhost:8080/ws/stream"
+    uri = "ws://localhost:8000/ws"
     stream_id = "test-stream-12345"
 
     print("Connecting to voice agent WebSocket...")
@@ -85,7 +85,7 @@ async def test_greeting():
                                     audio_bytes = len(base64.b64decode(payload))
                                     audio_bytes_total += audio_bytes
                                     if not greeting_received:
-                                        print(f"Receiving audio from agent...")
+                                        print("Receiving audio from agent...")
                                         greeting_received = True
                             elif event_type in ("clear", "media"):
                                 pass  # Ignore clear and media events
@@ -132,7 +132,7 @@ async def test_greeting():
 
     except ConnectionRefusedError:
         print("ERROR: Could not connect to voice agent.")
-        print("Make sure the server is running: python voice_agent.py")
+        print("Make sure the server is running: python server.py")
         return False
     except Exception as e:
         print(f"ERROR: {type(e).__name__}: {e}")
