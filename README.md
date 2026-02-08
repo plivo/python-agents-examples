@@ -30,6 +30,7 @@ These examples use models that handle both speech input and output natively — 
 |---------|-------|-----------|------------|
 | [gemini-live-native](./gemini-live-native/) | Gemini Live | None | Direct API integration, function calling, auto-webhook config |
 | [gemini-live-pipecat](./gemini-live-pipecat/) | Gemini Live | Pipecat | Modular pipeline, built-in VAD, less code |
+| [grok-voice-native](./grok-voice-native/) | Grok Voice | None | Silero VAD, barge-in support, function calling |
 
 ### STT + LLM + TTS Pipeline
 
