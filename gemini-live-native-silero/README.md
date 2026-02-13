@@ -58,7 +58,7 @@ uv sync
 ### 2. Configure environment
 
 ```bash
-cp env.example .env
+cp .env.example .env
 ```
 
 Edit `.env` with your credentials:
@@ -103,7 +103,7 @@ gemini-live-native-silero/
 ├── server.py           # FastAPI server with Plivo webhooks
 ├── tests/              # Integration and voice tests
 ├── pyproject.toml      # Project dependencies
-├── env.example         # Environment variable template
+├── .env.example         # Environment variable template
 └── Dockerfile          # Container deployment
 ```
 

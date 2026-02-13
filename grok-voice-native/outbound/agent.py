@@ -1,23 +1,12 @@
-"""
-Voice agent using xAI Grok Voice Agent API for speech-to-speech conversations.
+"""Outbound voice agent — GrokVoiceAgent engine + call state management.
 
-This module provides a production-ready voice agent that:
-- Connects to xAI's Grok Realtime API for real-time speech processing
-- Uses Silero VAD for client-side voice activity detection and turn management
-- Handles bidirectional audio streaming with Plivo telephony
-- Supports function calling for actions during conversations
-- Manages audio format conversion between Plivo (μ-law 8kHz) and Grok (PCM 24kHz)
+Loads the outbound system prompt and provides run_agent() for handling
+outbound call WebSocket sessions, plus CallManager for tracking call lifecycle.
 
-Usage:
-    from agent import run_agent
-
-    # In your WebSocket handler:
-    await run_agent(websocket, call_id, from_number, to_number)
-
-Configuration (via environment variables):
-    XAI_API_KEY: xAI API key (required)
-    GROK_MODEL: Model name (default: grok-3-fast-voice)
-    GROK_VOICE: Voice name (default: Sal)
+Status state machine:
+    initiating -> ringing -> connected -> completed
+                         |-> no_answer
+                |-> failed
 """
 
 from __future__ import annotations
@@ -28,382 +17,194 @@ import contextlib
 import json
 import os
 import random
+import threading
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
-from dotenv import load_dotenv
 from loguru import logger
-from scipy import signal as scipy_signal
-from silero_vad import load_silero_vad
+
+from utils import (
+    GROK_MODEL,
+    GROK_VOICE,
+    XAI_API_KEY,
+    XAI_REALTIME_URL,
+    SileroVADProcessor,
+    grok_to_plivo,
+    plivo_to_grok,
+    plivo_to_vad,
+)
 
 if TYPE_CHECKING:
     from fastapi import WebSocket
-
-load_dotenv()
-
-# =============================================================================
-# Configuration
-# =============================================================================
-
-XAI_API_KEY = os.getenv("XAI_API_KEY", "")
-GROK_MODEL = os.getenv("GROK_MODEL", "grok-3-fast-voice")
-GROK_VOICE = os.getenv("GROK_VOICE", "Sal")
-XAI_REALTIME_URL = "wss://api.x.ai/v1/realtime"
-
-# Audio format constants
-PLIVO_SAMPLE_RATE = 8000  # Plivo uses 8kHz μ-law
-GROK_SAMPLE_RATE = 24000  # Grok default PCM sample rate
-VAD_SAMPLE_RATE = 16000  # Silero VAD operates at 16kHz
-
-# Silero VAD configuration
-VAD_CHUNK_SAMPLES = 512  # 32ms at 16kHz (Silero expects 512 samples at 16kHz)
-VAD_START_THRESHOLD = 0.5  # Speech probability to trigger speech start
-VAD_END_THRESHOLD = 0.35  # Speech probability below this to consider silence
-VAD_MIN_SILENCE_MS = 300  # Minimum silence duration (ms) to trigger speech end
-VAD_PRE_SPEECH_PAD_MS = 150  # Audio to keep before speech start for context
 
 # =============================================================================
 # System Prompt
 # =============================================================================
 
-
-def _load_system_prompt() -> str:
-    return (Path(__file__).parent / "system_prompt.md").read_text().strip()
+_OUTBOUND_PROMPT_TEMPLATE = (Path(__file__).parent / "system_prompt.md").read_text().strip()
 
 
-DEFAULT_SYSTEM_PROMPT = _load_system_prompt()
-SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
+def build_outbound_prompt(
+    opening_reason: str = "",
+    objective: str = "",
+    context: str = "",
+) -> str:
+    """Build a concrete outbound system prompt by substituting template variables."""
+    prompt = _OUTBOUND_PROMPT_TEMPLATE
+    prompt = prompt.replace("{{opening_reason}}", opening_reason)
+    prompt = prompt.replace("{{objective}}", objective)
+    prompt = prompt.replace("{{context}}", context)
+    return prompt
+
+
+# Default system prompt (no template substitution)
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", _OUTBOUND_PROMPT_TEMPLATE)
 
 # =============================================================================
-# Audio Conversion Utilities
+# Outbound Call Records
 # =============================================================================
 
-# μ-law decoding table (ITU-T G.711)
-_ULAW_DECODE_TABLE = np.array(
-    [
-        -32124,
-        -31100,
-        -30076,
-        -29052,
-        -28028,
-        -27004,
-        -25980,
-        -24956,
-        -23932,
-        -22908,
-        -21884,
-        -20860,
-        -19836,
-        -18812,
-        -17788,
-        -16764,
-        -15996,
-        -15484,
-        -14972,
-        -14460,
-        -13948,
-        -13436,
-        -12924,
-        -12412,
-        -11900,
-        -11388,
-        -10876,
-        -10364,
-        -9852,
-        -9340,
-        -8828,
-        -8316,
-        -7932,
-        -7676,
-        -7420,
-        -7164,
-        -6908,
-        -6652,
-        -6396,
-        -6140,
-        -5884,
-        -5628,
-        -5372,
-        -5116,
-        -4860,
-        -4604,
-        -4348,
-        -4092,
-        -3900,
-        -3772,
-        -3644,
-        -3516,
-        -3388,
-        -3260,
-        -3132,
-        -3004,
-        -2876,
-        -2748,
-        -2620,
-        -2492,
-        -2364,
-        -2236,
-        -2108,
-        -1980,
-        -1884,
-        -1820,
-        -1756,
-        -1692,
-        -1628,
-        -1564,
-        -1500,
-        -1436,
-        -1372,
-        -1308,
-        -1244,
-        -1180,
-        -1116,
-        -1052,
-        -988,
-        -924,
-        -876,
-        -844,
-        -812,
-        -780,
-        -748,
-        -716,
-        -684,
-        -652,
-        -620,
-        -588,
-        -556,
-        -524,
-        -492,
-        -460,
-        -428,
-        -396,
-        -372,
-        -356,
-        -340,
-        -324,
-        -308,
-        -292,
-        -276,
-        -260,
-        -244,
-        -228,
-        -212,
-        -196,
-        -180,
-        -164,
-        -148,
-        -132,
-        -120,
-        -112,
-        -104,
-        -96,
-        -88,
-        -80,
-        -72,
-        -64,
-        -56,
-        -48,
-        -40,
-        -32,
-        -24,
-        -16,
-        -8,
-        0,
-        32124,
-        31100,
-        30076,
-        29052,
-        28028,
-        27004,
-        25980,
-        24956,
-        23932,
-        22908,
-        21884,
-        20860,
-        19836,
-        18812,
-        17788,
-        16764,
-        15996,
-        15484,
-        14972,
-        14460,
-        13948,
-        13436,
-        12924,
-        12412,
-        11900,
-        11388,
-        10876,
-        10364,
-        9852,
-        9340,
-        8828,
-        8316,
-        7932,
-        7676,
-        7420,
-        7164,
-        6908,
-        6652,
-        6396,
-        6140,
-        5884,
-        5628,
-        5372,
-        5116,
-        4860,
-        4604,
-        4348,
-        4092,
-        3900,
-        3772,
-        3644,
-        3516,
-        3388,
-        3260,
-        3132,
-        3004,
-        2876,
-        2748,
-        2620,
-        2492,
-        2364,
-        2236,
-        2108,
-        1980,
-        1884,
-        1820,
-        1756,
-        1692,
-        1628,
-        1564,
-        1500,
-        1436,
-        1372,
-        1308,
-        1244,
-        1180,
-        1116,
-        1052,
-        988,
-        924,
-        876,
-        844,
-        812,
-        780,
-        748,
-        716,
-        684,
-        652,
-        620,
-        588,
-        556,
-        524,
-        492,
-        460,
-        428,
-        396,
-        372,
-        356,
-        340,
-        324,
-        308,
-        292,
-        276,
-        260,
-        244,
-        228,
-        212,
-        196,
-        180,
-        164,
-        148,
-        132,
-        120,
-        112,
-        104,
-        96,
-        88,
-        80,
-        72,
-        64,
-        56,
-        48,
-        40,
-        32,
-        24,
-        16,
-        8,
-        0,
-    ],
-    dtype=np.int16,
-)
+
+@dataclass
+class OutboundCallRecord:
+    """Tracks the state of a single outbound call."""
+
+    call_id: str
+    phone_number: str
+    status: str = "initiating"  # initiating|ringing|connected|completed|failed|no_answer
+    campaign_id: str = ""
+    context: str = ""
+    system_prompt: str = ""
+    initial_message: str = ""
+    opening_reason: str = ""
+    objective: str = ""
+    plivo_request_uuid: str = ""
+    plivo_call_uuid: str = ""
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    connected_at: datetime | None = None
+    ended_at: datetime | None = None
+    duration: int = 0
+    hangup_cause: str = ""
+    outcome: str = ""  # success|no_answer|busy|failed
 
 
-def ulaw_to_pcm(ulaw_data: bytes) -> bytes:
-    """Convert μ-law encoded audio to 16-bit PCM."""
-    ulaw_samples = np.frombuffer(ulaw_data, dtype=np.uint8)
-    pcm_samples = _ULAW_DECODE_TABLE[ulaw_samples]
-    return pcm_samples.tobytes()
+def determine_outcome(hangup_cause: str, duration: int) -> str:
+    """Map Plivo hangup cause and duration to a high-level outcome.
+
+    See https://www.plivo.com/docs/voice/troubleshooting/hangup-causes/
+    """
+    cause = hangup_cause.upper() if hangup_cause else ""
+
+    if cause in ("NO_ANSWER", "ORIGINATOR_CANCEL"):
+        return "no_answer"
+    if cause in ("USER_BUSY", "CALL_REJECTED"):
+        return "busy"
+    if cause in (
+        "UNALLOCATED_NUMBER",
+        "INVALID_NUMBER_FORMAT",
+        "NO_ROUTE_DESTINATION",
+        "NETWORK_OUT_OF_ORDER",
+        "SERVICE_UNAVAILABLE",
+        "RECOVERY_ON_TIMER_EXPIRE",
+        "BEARERCAPABILITY_NOTAVAIL",
+    ):
+        return "failed"
+
+    # If the call was answered and had meaningful duration, consider it success
+    if duration > 0 or cause in ("NORMAL_CLEARING", ""):
+        return "success"
+
+    return "failed"
 
 
-def pcm_to_ulaw(pcm_data: bytes) -> bytes:
-    """Convert 16-bit PCM audio to μ-law encoding."""
-    BIAS = 0x84
-    CLIP = 32635
+class CallManager:
+    """Thread-safe manager for outbound call records."""
 
-    pcm_samples = np.frombuffer(pcm_data, dtype=np.int16).astype(np.int32)
-    sign = (pcm_samples >> 8) & 0x80
-    pcm_samples = np.where(sign != 0, -pcm_samples, pcm_samples)
-    pcm_samples = np.clip(pcm_samples, 0, CLIP) + BIAS
+    def __init__(self) -> None:
+        self._calls: dict[str, OutboundCallRecord] = {}
+        self._lock = threading.Lock()
 
-    segment = np.floor(np.log2(pcm_samples >> 7)).astype(np.int32)
-    segment = np.clip(segment, 0, 7)
+    def create_call(
+        self,
+        phone_number: str,
+        campaign_id: str = "",
+        opening_reason: str = "",
+        objective: str = "",
+        context: str = "",
+    ) -> OutboundCallRecord:
+        """Create and register a new outbound call record."""
+        call_id = str(uuid.uuid4())
+        system_prompt = build_outbound_prompt(opening_reason, objective, context)
 
-    ulaw = sign | ((segment << 4) | ((pcm_samples >> (segment + 3)) & 0x0F))
-    ulaw = ~ulaw & 0xFF
+        if opening_reason:
+            initial_message = (
+                "The call has been answered. Begin with your outbound greeting now. "
+                "State your name, company, and that you are reaching out regarding: "
+                f"{opening_reason}. Then ask if now is a good time."
+            )
+        else:
+            initial_message = (
+                "The call has been answered. Begin with your outbound greeting now. "
+                "State your name, company, and why you are calling. Then ask if now is a good time."
+            )
 
-    return ulaw.astype(np.uint8).tobytes()
+        record = OutboundCallRecord(
+            call_id=call_id,
+            phone_number=phone_number,
+            campaign_id=campaign_id,
+            opening_reason=opening_reason,
+            objective=objective,
+            context=context,
+            system_prompt=system_prompt,
+            initial_message=initial_message,
+        )
 
+        with self._lock:
+            self._calls[call_id] = record
 
-def resample_audio(audio_data: bytes, input_rate: int, output_rate: int) -> bytes:
-    """Resample audio from one sample rate to another."""
-    if input_rate == output_rate:
-        return audio_data
+        return record
 
-    samples = np.frombuffer(audio_data, dtype=np.int16)
-    ratio = output_rate / input_rate
-    new_length = int(len(samples) * ratio)
-    resampled = scipy_signal.resample(samples.astype(np.float64), new_length)
-    return np.clip(resampled, -32768, 32767).astype(np.int16).tobytes()
+    def get_call(self, call_id: str) -> OutboundCallRecord | None:
+        """Look up a call by its ID."""
+        with self._lock:
+            return self._calls.get(call_id)
 
+    def update_status(self, call_id: str, status: str, **kwargs: Any) -> OutboundCallRecord | None:
+        """Thread-safe status update with optional extra fields."""
+        with self._lock:
+            record = self._calls.get(call_id)
+            if record is None:
+                return None
+            record.status = status
+            for key, value in kwargs.items():
+                if hasattr(record, key):
+                    setattr(record, key, value)
+            return record
 
-def plivo_to_grok(mulaw_8k: bytes) -> bytes:
-    """Convert Plivo audio (μ-law 8kHz) to Grok format (PCM16 24kHz)."""
-    pcm_8k = ulaw_to_pcm(mulaw_8k)
-    return resample_audio(pcm_8k, PLIVO_SAMPLE_RATE, GROK_SAMPLE_RATE)
+    def get_active_calls(self) -> list[OutboundCallRecord]:
+        """Return calls with status in (initiating, ringing, connected)."""
+        with self._lock:
+            return [
+                r for r in self._calls.values()
+                if r.status in ("initiating", "ringing", "connected")
+            ]
 
+    def get_calls_by_campaign(self, campaign_id: str) -> list[OutboundCallRecord]:
+        """Return all calls for a given campaign."""
+        with self._lock:
+            return [r for r in self._calls.values() if r.campaign_id == campaign_id]
 
-def grok_to_plivo(pcm_24k: bytes) -> bytes:
-    """Convert Grok audio (PCM16 24kHz) to Plivo format (μ-law 8kHz)."""
-    pcm_8k = resample_audio(pcm_24k, GROK_SAMPLE_RATE, PLIVO_SAMPLE_RATE)
-    return pcm_to_ulaw(pcm_8k)
-
-
-def plivo_to_vad(mulaw_8k: bytes) -> np.ndarray:
-    """Convert Plivo audio (μ-law 8kHz) to Silero VAD format (float32 16kHz)."""
-    pcm_8k = ulaw_to_pcm(mulaw_8k)
-    pcm_16k = resample_audio(pcm_8k, PLIVO_SAMPLE_RATE, VAD_SAMPLE_RATE)
-    samples = np.frombuffer(pcm_16k, dtype=np.int16).astype(np.float32)
-    return samples / 32768.0  # Normalize to [-1, 1]
+    def reset(self) -> None:
+        """Clear all records (useful for testing)."""
+        with self._lock:
+            self._calls.clear()
 
 
 # =============================================================================
-# Tool Functions
+# Tool Functions — replace these with your actual implementations
 # =============================================================================
 
 
@@ -487,88 +288,11 @@ async def transfer_call(department: str, reason: str) -> dict[str, Any]:
 
 
 # =============================================================================
-# Silero VAD Processor
+# Grok Voice Agent
 # =============================================================================
 
 
-class SileroVADProcessor:
-    """Processes audio frames through Silero VAD for speech detection.
-
-    Accumulates audio in a buffer and runs VAD when enough samples are available.
-    Tracks speech state transitions (silence → speaking → silence) to determine
-    when the user has finished a turn.
-    """
-
-    def __init__(self):
-        self._model = load_silero_vad(onnx=True)
-        self._buffer = np.array([], dtype=np.float32)
-        self._is_speaking = False
-        self._silence_frames = 0
-        self._min_silence_frames = int(
-            VAD_MIN_SILENCE_MS / (VAD_CHUNK_SAMPLES / VAD_SAMPLE_RATE * 1000)
-        )
-
-    def reset(self) -> None:
-        """Reset VAD state for a new turn."""
-        self._model.reset_states()
-        self._buffer = np.array([], dtype=np.float32)
-        self._is_speaking = False
-        self._silence_frames = 0
-
-    def process(self, audio_f32: np.ndarray) -> tuple[bool, bool]:
-        """Process audio and return (speech_started, speech_ended) events.
-
-        Args:
-            audio_f32: Float32 audio samples normalized to [-1, 1] at 16kHz.
-
-        Returns:
-            Tuple of (speech_started, speech_ended) booleans. Only one can be
-            True at a time. Both False means no state change.
-        """
-        import torch
-
-        self._buffer = np.concatenate([self._buffer, audio_f32])
-
-        speech_started = False
-        speech_ended = False
-
-        while len(self._buffer) >= VAD_CHUNK_SAMPLES:
-            chunk = self._buffer[:VAD_CHUNK_SAMPLES]
-            self._buffer = self._buffer[VAD_CHUNK_SAMPLES:]
-
-            chunk_tensor = torch.from_numpy(chunk)
-            speech_prob = self._model(chunk_tensor, VAD_SAMPLE_RATE).item()
-
-            if not self._is_speaking:
-                if speech_prob >= VAD_START_THRESHOLD:
-                    self._is_speaking = True
-                    self._silence_frames = 0
-                    speech_started = True
-                    logger.debug(f"VAD: speech started (prob={speech_prob:.2f})")
-            else:
-                if speech_prob < VAD_END_THRESHOLD:
-                    self._silence_frames += 1
-                    if self._silence_frames >= self._min_silence_frames:
-                        self._is_speaking = False
-                        self._silence_frames = 0
-                        speech_ended = True
-                        logger.debug(f"VAD: speech ended (prob={speech_prob:.2f})")
-                else:
-                    self._silence_frames = 0
-
-        return speech_started, speech_ended
-
-    @property
-    def is_speaking(self) -> bool:
-        return self._is_speaking
-
-
-# =============================================================================
-# Grok Voice Bot
-# =============================================================================
-
-
-class GrokVoiceBot:
+class GrokVoiceAgent:
     """Manages a voice conversation session between Plivo and xAI Grok Realtime API."""
 
     def __init__(
@@ -591,7 +315,7 @@ class GrokVoiceBot:
         self._send_queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._vad = SileroVADProcessor()
         self._grok_ws = None
-        self._is_responding = False  # Track if Grok is currently generating a response
+        self._is_responding = False
 
     def _build_tools(self) -> list[dict[str, Any]]:
         """Build tool definitions for Grok function calling."""
@@ -715,7 +439,6 @@ class GrokVoiceBot:
             logger.error(f"Error in function {name}: {e}")
             result = {"error": str(e)}
 
-        # Send function result back to Grok
         await self._grok_send(
             {
                 "type": "conversation.item.create",
@@ -726,7 +449,6 @@ class GrokVoiceBot:
                 },
             }
         )
-        # Request the model to continue with a response
         await self._grok_send(
             {
                 "type": "response.create",
@@ -759,7 +481,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
             "session": {
                 "instructions": system_prompt,
                 "voice": GROK_VOICE,
-                "turn_detection": None,  # Disable server VAD; using Silero VAD
+                "turn_detection": None,
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
                 "tools": self._build_tools(),
@@ -787,10 +509,8 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                 self._grok_ws = grok_ws
                 logger.info("Connected to xAI Grok Realtime API")
 
-                # Configure the session
                 await self._grok_send(self._build_session_config())
 
-                # Wait for session confirmation
                 while True:
                     msg = json.loads(await grok_ws.recv())
                     if msg.get("type") == "session.updated":
@@ -800,7 +520,6 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                         logger.error(f"Grok session error: {msg}")
                         return
 
-                # Send initial message to trigger greeting
                 await self._grok_send(
                     {
                         "type": "conversation.item.create",
@@ -861,7 +580,6 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                     if payload:
                         mulaw_audio = base64.b64decode(payload)
 
-                        # Convert to PCM 24kHz and send to Grok input buffer
                         pcm_24k = plivo_to_grok(mulaw_audio)
                         audio_b64 = base64.b64encode(pcm_24k).decode("utf-8")
                         await self._grok_send(
@@ -871,16 +589,13 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                             }
                         )
 
-                        # Run Silero VAD on the audio
                         vad_audio = plivo_to_vad(mulaw_audio)
                         speech_started, speech_ended = self._vad.process(vad_audio)
 
                         if speech_started and self._is_responding:
-                            # Barge-in: user started speaking while agent responds
                             logger.info("Barge-in detected, cancelling response")
                             await self._grok_send({"type": "response.cancel"})
                             self._is_responding = False
-                            # Clear the Plivo send queue
                             while not self._send_queue.empty():
                                 try:
                                     self._send_queue.get_nowait()
@@ -888,7 +603,6 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                                     break
 
                         if speech_ended:
-                            # User finished speaking - commit and request response
                             logger.debug("VAD: committing audio buffer")
                             await self._grok_send({"type": "input_audio_buffer.commit"})
                             await self._grok_send(
@@ -899,7 +613,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                             )
                             self._vad.reset()
 
-                elif event == "text":  # For testing - inject text as user input
+                elif event == "text":
                     text = message.get("text", "")
                     if text:
                         logger.info(f"Injecting text: {text[:50]}...")
@@ -938,7 +652,6 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                 event_type = message.get("type", "")
 
                 if event_type == "response.output_audio.delta":
-                    # Audio chunk from Grok
                     audio_b64 = message.get("delta", "")
                     if audio_b64:
                         pcm_24k = base64.b64decode(audio_b64)
@@ -953,7 +666,6 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                     logger.debug("Grok response complete")
 
                 elif event_type == "response.function_call_arguments.done":
-                    # Function call from Grok
                     await self._handle_function_call(
                         name=message.get("name", ""),
                         call_id=message.get("call_id", ""),
@@ -961,7 +673,6 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                     )
 
                 elif event_type == "response.output_audio_transcript.delta":
-                    # Transcript for logging
                     transcript = message.get("delta", "")
                     if transcript:
                         logger.debug(f"Agent: {transcript}")
@@ -977,7 +688,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
 
     async def _send_to_plivo(self) -> None:
         """Send queued audio to Plivo WebSocket in 20ms chunks."""
-        PLIVO_CHUNK_SIZE = 160  # 20ms at 8kHz μ-law
+        PLIVO_CHUNK_SIZE = 160
         audio_buffer = bytearray()
 
         try:
@@ -1020,17 +731,8 @@ async def run_agent(
     system_prompt: str | None = None,
     initial_message: str = "Hello, I'm calling for help.",
 ) -> None:
-    """Run a voice agent session for an incoming call.
-
-    Args:
-        websocket: FastAPI WebSocket connection from Plivo
-        call_id: Unique identifier for this call
-        from_number: Caller's phone number
-        to_number: Called phone number
-        system_prompt: Custom system prompt (default: DEFAULT_SYSTEM_PROMPT)
-        initial_message: Message to trigger agent greeting
-    """
-    agent = GrokVoiceBot(
+    """Run a voice agent session for an outbound call."""
+    agent = GrokVoiceAgent(
         websocket=websocket,
         call_id=call_id,
         from_number=from_number,

@@ -23,7 +23,10 @@ import base64
 import json
 import math
 import os
+import signal
 import struct
+import subprocess
+import sys
 import time
 import uuid
 
@@ -34,7 +37,7 @@ import websockets
 from dotenv import load_dotenv
 
 # Import audio functions from agent module
-from agent import pcm_to_ulaw, ulaw_to_pcm
+from utils import pcm_to_ulaw, ulaw_to_pcm
 
 load_dotenv()
 
@@ -45,10 +48,10 @@ PLIVO_AUTH_ID = os.getenv("PLIVO_AUTH_ID", "")
 PLIVO_AUTH_TOKEN = os.getenv("PLIVO_AUTH_TOKEN", "")
 PLIVO_PHONE_NUMBER = os.getenv("PLIVO_PHONE_NUMBER", "")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "")
-SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
 
-LOCAL_WS_URL = f"ws://localhost:{SERVER_PORT}/ws"
-LOCAL_HTTP_URL = f"http://localhost:{SERVER_PORT}"
+TEST_PORT = 18001
+LOCAL_WS_URL = f"ws://localhost:{TEST_PORT}/ws"
+LOCAL_HTTP_URL = f"http://localhost:{TEST_PORT}"
 
 
 # =============================================================================
@@ -143,17 +146,45 @@ class TestUnitPhoneNormalization:
 class TestLocalIntegration:
     """Integration tests using local WebSocket connection."""
 
-    @pytest.fixture
-    def server_running(self):
-        """Check if the local server is running."""
-        try:
-            response = httpx.get(LOCAL_HTTP_URL, timeout=2.0)
-            return response.status_code == 200
-        except Exception:
-            pytest.skip("Local server not running. Start with: uv run python server.py")
+    @pytest.fixture(scope="class")
+    def server_process(self):
+        """Start the inbound server as a subprocess."""
+        env = os.environ.copy()
+        env["SERVER_PORT"] = str(TEST_PORT)
+
+        project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "inbound.server"],
+            cwd=project_dir,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+
+        ready = False
+        for _ in range(30):
+            try:
+                resp = httpx.get(LOCAL_HTTP_URL, timeout=1.0)
+                if resp.status_code == 200:
+                    ready = True
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        if not ready:
+            proc.terminate()
+            proc.wait()
+            output = proc.stdout.read().decode() if proc.stdout else ""
+            pytest.skip(f"Server did not start in time. Output:\n{output[:2000]}")
+
+        yield proc
+
+        os.kill(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=5)
 
     @pytest.mark.asyncio
-    async def test_local_health_check(self, server_running):
+    async def test_local_health_check(self, server_process):
         """Test the health check endpoint."""
         async with httpx.AsyncClient() as client:
             response = await client.get(LOCAL_HTTP_URL)
@@ -162,7 +193,7 @@ class TestLocalIntegration:
             assert data["status"] == "ok"
 
     @pytest.mark.asyncio
-    async def test_local_answer_webhook(self, server_running):
+    async def test_local_answer_webhook(self, server_process):
         """Test the answer webhook returns valid XML."""
         async with httpx.AsyncClient() as client:
             response = await client.post(
@@ -175,7 +206,7 @@ class TestLocalIntegration:
             assert "bidirectional" in response.text
 
     @pytest.mark.asyncio
-    async def test_local_websocket_connection(self, server_running):
+    async def test_local_websocket_connection(self, server_process):
         """Test WebSocket connection and audio reception."""
         body_data = {"call_uuid": "test123", "from": "+15551234567", "to": "+16572338892"}
         body_b64 = base64.b64encode(json.dumps(body_data).encode()).decode()
@@ -203,7 +234,7 @@ class TestLocalIntegration:
             assert audio_received, "No audio received from server"
 
     @pytest.mark.asyncio
-    async def test_local_audio_quality(self, server_running):
+    async def test_local_audio_quality(self, server_process):
         """Test audio quality from the agent."""
         body_data = {"call_uuid": "test123", "from": "+15551234567", "to": "+16572338892"}
         body_b64 = base64.b64encode(json.dumps(body_data).encode()).decode()
