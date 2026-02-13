@@ -36,7 +36,7 @@ pip install -e .
 ### 2. Configure environment
 
 ```bash
-cp env.example .env
+cp .env.example .env
 ```
 
 Edit `.env` with your credentials:
@@ -79,7 +79,7 @@ Call your Plivo phone number and start talking to the agent.
 gemini-live-pipecat/
 ├── voice_agent.py      # Main application with Pipecat pipeline
 ├── pyproject.toml      # Project dependencies
-├── env.example         # Environment variable template
+├── .env.example         # Environment variable template
 └── README.md           # This file
 ```
 

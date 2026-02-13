@@ -1,57 +1,38 @@
-"""FastAPI server for Plivo webhook and WebSocket handling."""
+"""Standalone FastAPI server for inbound calls."""
 
 from __future__ import annotations
 
 import base64
 import contextlib
 import json
-import os
 
-import phonenumbers
 import plivo
 import uvicorn
-from dotenv import load_dotenv
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from loguru import logger
 from plivo import plivoxml
 
-import agent
-
-load_dotenv()
-
-# Configuration
-SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
-
-# Plivo configuration
-PLIVO_AUTH_ID = os.getenv("PLIVO_AUTH_ID", "")
-PLIVO_AUTH_TOKEN = os.getenv("PLIVO_AUTH_TOKEN", "")
-PLIVO_PHONE_NUMBER = os.getenv("PLIVO_PHONE_NUMBER", "")
-DEFAULT_COUNTRY_CODE = os.getenv("DEFAULT_COUNTRY_CODE", "US")
-
-# Public URL for webhooks (ngrok URL or production domain)
-PUBLIC_URL = os.getenv("PUBLIC_URL", "")
-
-
-def normalize_phone_number(phone: str, default_region: str = DEFAULT_COUNTRY_CODE) -> str:
-    """Normalize phone number to E.164 format (digits only, no leading +)."""
-    if not phone:
-        return ""
-
-    try:
-        parsed = phonenumbers.parse(phone, default_region)
-        e164 = phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
-        return e164.lstrip("+")
-    except phonenumbers.NumberParseException as e:
-        logger.warning(f"Failed to parse phone number '{phone}': {e}")
-        return "".join(c for c in phone if c.isdigit())
-
+from inbound.agent import run_agent
+from utils import (
+    PLIVO_AUTH_ID,
+    PLIVO_AUTH_TOKEN,
+    PLIVO_PHONE_NUMBER,
+    PUBLIC_URL,
+    SERVER_PORT,
+    normalize_phone_number,
+)
 
 app = FastAPI(
-    title="Grok-Plivo Voice Agent",
-    description="Voice agent using xAI Grok Voice Agent API with Plivo telephony",
+    title="Grok-Plivo Voice Agent (Inbound)",
+    description="Inbound voice agent using xAI Grok with Plivo telephony",
     version="0.1.0",
 )
+
+
+# =============================================================================
+# Plivo Webhook Configuration
+# =============================================================================
 
 
 def configure_plivo_webhooks() -> bool:
@@ -126,13 +107,18 @@ def configure_plivo_webhooks() -> bool:
         return False
 
 
+# =============================================================================
+# Routes
+# =============================================================================
+
+
 @app.get("/")
 async def health_check() -> dict:
     """Health check endpoint."""
     phone = normalize_phone_number(PLIVO_PHONE_NUMBER)
     return {
         "status": "ok",
-        "service": "grok-plivo-voice-agent",
+        "service": "grok-plivo-voice-agent-inbound",
         "phone_number": f"+{phone}" if phone else "not configured",
     }
 
@@ -199,15 +185,6 @@ async def hangup_webhook(request: Request) -> Response:
     return Response(content="OK", media_type="text/plain")
 
 
-@app.get("/hold")
-@app.post("/hold")
-async def hold_webhook() -> Response:
-    """Hold endpoint - keeps call alive silently (used for outbound A-leg)."""
-    response = plivoxml.ResponseElement()
-    response.add(plivoxml.WaitElement(length=120))
-    return Response(content=response.to_string(), media_type="application/xml")
-
-
 @app.post("/fallback")
 async def fallback_webhook(request: Request) -> Response:
     """Fallback webhook if primary answer webhook fails."""
@@ -222,6 +199,15 @@ async def fallback_webhook(request: Request) -> Response:
     )
     response.add(plivoxml.HangupElement())
 
+    return Response(content=response.to_string(), media_type="application/xml")
+
+
+@app.get("/hold")
+@app.post("/hold")
+async def hold_webhook() -> Response:
+    """Hold endpoint - keeps call alive silently (used during testing)."""
+    response = plivoxml.ResponseElement()
+    response.add(plivoxml.WaitElement(length=120))
     return Response(content=response.to_string(), media_type="application/xml")
 
 
@@ -256,7 +242,7 @@ async def websocket_endpoint(
         stream_id = start_info.get("streamId")
         logger.info(f"Plivo stream started: callId={call_id}, streamId={stream_id}")
 
-        await agent.run_agent(
+        await run_agent(
             websocket=websocket,
             call_id=call_id,
             from_number=call_data.get("from", ""),
@@ -272,9 +258,14 @@ async def websocket_endpoint(
             await websocket.close()
 
 
+# =============================================================================
+# Main
+# =============================================================================
+
+
 def main() -> None:
-    """Run the server."""
-    logger.info(f"Starting Grok-Plivo Voice Agent on port {SERVER_PORT}")
+    """Run the inbound server."""
+    logger.info(f"Starting Grok-Plivo Inbound Voice Agent on port {SERVER_PORT}")
 
     if PLIVO_PHONE_NUMBER and PUBLIC_URL:
         logger.info("Configuring Plivo webhooks...")
@@ -286,7 +277,7 @@ def main() -> None:
     else:
         logger.info("To enable auto-configuration, set PUBLIC_URL and PLIVO_PHONE_NUMBER")
 
-    uvicorn.run("server:app", host="0.0.0.0", port=SERVER_PORT, log_level="info")
+    uvicorn.run("inbound.server:app", host="0.0.0.0", port=SERVER_PORT, log_level="info")
 
 
 if __name__ == "__main__":

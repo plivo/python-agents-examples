@@ -42,8 +42,7 @@ import pytest
 import websockets
 from dotenv import load_dotenv
 
-# Add parent to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils import ulaw_to_pcm
 
 load_dotenv()
 
@@ -67,8 +66,6 @@ pytestmark = pytest.mark.skipif(
 # =============================================================================
 # Helpers
 # =============================================================================
-
-from agent import ulaw_to_pcm  # noqa: E402
 
 
 def pcm16_to_wav(pcm_data: bytes, sample_rate: int = 8000) -> bytes:
@@ -155,7 +152,7 @@ def server_process():
 
     project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     proc = subprocess.Popen(
-        [sys.executable, "server.py"],
+        [sys.executable, "-m", "inbound.server"],
         cwd=project_dir,
         env=env,
         stdout=subprocess.PIPE,

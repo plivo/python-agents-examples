@@ -5,7 +5,7 @@ This is a standalone test script that demonstrates the voice agent
 handling multiple conversation turns with real synthesized speech.
 
 Requirements:
-    - Server running: uv run python server.py
+    - Server running: uv run python -m inbound.server
     - ffmpeg/ffprobe in PATH (for audio conversion)
     - gTTS and pydub installed (included in dev dependencies)
 
@@ -18,16 +18,13 @@ import asyncio
 import base64
 import json
 import os
-import sys
 import tempfile
 import time
 import uuid
 
 import websockets
 
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from agent import pcm_to_ulaw
+from utils import pcm_to_ulaw
 
 
 def generate_tts_audio(text: str) -> bytes | None:
@@ -232,7 +229,7 @@ async def test_multiturn_voice():
 
     except ConnectionRefusedError:
         print("\nERROR: Could not connect to server")
-        print("Make sure the server is running: uv run python server.py")
+        print("Make sure the server is running: uv run python -m inbound.server")
     except Exception as e:
         print(f"\nERROR: {e}")
         import traceback

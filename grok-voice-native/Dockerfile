@@ -19,12 +19,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-install-project --no-dev
 
 # Copy application code
-COPY agent.py agent.py
-COPY server.py server.py
-COPY system_prompt.md system_prompt.md
+COPY utils.py utils.py
+COPY inbound/ inbound/
+COPY outbound/ outbound/
 
 # Expose port
 EXPOSE 8000
 
-# Run the server
-CMD ["uv", "run", "python", "server.py"]
+# Run the inbound server by default (override with outbound.server for outbound)
+CMD ["uv", "run", "python", "-m", "inbound.server"]

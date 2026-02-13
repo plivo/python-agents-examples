@@ -66,7 +66,7 @@ These examples wire up separate providers for speech-to-text, language model, an
 
 3. **Configure environment variables:**
    ```bash
-   cp env.example .env   # or: cp .env.example .env
+   cp .env.example .env
    ```
    Edit `.env` with your API keys and Plivo credentials.
 

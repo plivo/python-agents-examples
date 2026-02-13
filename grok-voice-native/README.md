@@ -32,7 +32,7 @@ uv sync
 ### 2. Configure environment
 
 ```bash
-cp env.example .env
+cp .env.example .env
 ```
 
 Edit `.env` with your credentials:
@@ -56,10 +56,14 @@ Copy the ngrok URL to `PUBLIC_URL` in your `.env` file.
 ### 4. Run the server
 
 ```bash
-uv run python server.py
+# Inbound (receives calls)
+uv run python -m inbound.server
+
+# Outbound (places calls)
+uv run python -m outbound.server
 ```
 
-The server will:
+The inbound server will:
 1. Start on port 8000
 2. Auto-configure Plivo webhooks for your phone number
 3. Display "Ready! Call +1234567890 to test"
@@ -72,11 +76,19 @@ Call your Plivo phone number and start talking to the agent.
 
 ```
 grok-voice-native/
-├── agent.py            # Voice agent with Grok Realtime API + Silero VAD
-├── server.py           # FastAPI server with Plivo webhooks
-├── pyproject.toml      # Project dependencies
-├── env.example         # Environment variable template
-└── README.md           # This file
+├── utils.py               # Config + phone utils + audio conversion + VAD
+├── inbound/
+│   ├── agent.py           # GrokVoiceAgent + tools + run_agent for inbound calls
+│   ├── server.py          # Standalone inbound FastAPI app
+│   └── system_prompt.md   # Inbound call system prompt
+├── outbound/
+│   ├── agent.py           # GrokVoiceAgent + tools + CallManager for outbound
+│   ├── server.py          # Standalone outbound FastAPI app
+│   └── system_prompt.md   # Outbound call system prompt (with template variables)
+├── tests/                 # Integration and E2E tests
+├── pyproject.toml         # Project dependencies
+├── .env.example           # Environment variable template
+└── README.md              # This file
 ```
 
 ## How It Works
@@ -133,11 +145,11 @@ The agent uses client-side Silero VAD instead of Grok's built-in server VAD for 
 | `VAD_MIN_SILENCE_MS` | 300 | Minimum silence duration to end turn |
 | `VAD_CHUNK_SAMPLES` | 512 | Samples per VAD frame (32ms at 16kHz) |
 
-These can be tuned in `agent.py` for your use case.
+These can be tuned in `utils.py` for your use case.
 
 ## Function Calling
 
-The agent includes these functions:
+The agent includes these tool functions in each `agent.py`. Replace them with your own implementations:
 
 | Function | Description |
 |----------|-------------|
@@ -146,6 +158,34 @@ The agent includes these functions:
 | `schedule_callback` | Schedule callback from specialist |
 | `transfer_call` | Transfer to human agent |
 | `end_call` | End the conversation gracefully |
+
+To add a new tool, define the function and add its schema to `_build_tools()`:
+
+```python
+# 1. Add the tool function
+async def get_weather(city: str) -> dict[str, Any]:
+    """Get current weather for a city."""
+    # Your implementation here
+    return {"temperature": "72F", "conditions": "sunny"}
+
+# 2. Add the schema in _build_tools()
+{
+    "type": "function",
+    "name": "get_weather",
+    "description": "Get current weather for a city.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "city": {"type": "string", "description": "City name"},
+        },
+        "required": ["city"],
+    },
+}
+
+# 3. Add the handler in _handle_function_call()
+elif name == "get_weather":
+    result = await get_weather(city=args.get("city", ""))
+```
 
 ## Configuration
 
@@ -169,6 +209,44 @@ The agent includes these functions:
 | Sal | Neutral | Smooth, versatile |
 | Eve | Female | Energetic, upbeat |
 | Leo | Male | Authoritative, commanding |
+
+## Testing
+
+The test suite includes unit tests, integration tests, and end-to-end live call tests.
+
+```bash
+# Run all tests
+uv run pytest tests/ -v
+
+# Run specific test levels
+uv run pytest tests/test_integration.py -v              # Unit + integration tests
+uv run pytest tests/test_e2e_live.py -v -s              # E2E with real Grok API
+uv run pytest tests/test_live_call.py -v -s             # Real phone calls via Plivo
+uv run pytest tests/test_outbound_call.py -v -s         # Outbound call tests
+uv run pytest tests/test_multiturn_voice.py -v -s       # Multi-turn conversation
+```
+
+**Requirements for live call tests:**
+- Valid Plivo credentials and phone numbers in `.env`
+- Valid xAI API key in `.env`
+- ngrok installed at `/usr/local/bin/ngrok`
+- `faster-whisper` (dev dependency, for transcription verification)
+
+## Deployment
+
+### Docker
+
+```bash
+# Build the image
+docker build -t grok-voice-agent .
+
+# Run inbound server (default)
+docker run -p 8000:8000 --env-file .env grok-voice-agent
+
+# Run outbound server
+docker run -p 8000:8000 --env-file .env grok-voice-agent \
+  uv run python -m outbound.server
+```
 
 ## Troubleshooting
 

@@ -44,7 +44,7 @@ A voice agent that uses Google Gemini for conversation, Deepgram for speech-to-t
 
 2. **Create environment file:**
    ```bash
-   cp env.example .env
+   cp .env.example .env
    ```
 
 3. **Configure your `.env` file** with your API keys and Plivo phone number.
