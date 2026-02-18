@@ -15,6 +15,9 @@ from dotenv import load_dotenv
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import LLMContextFrame
+from pipecat.observers.loggers.llm_log_observer import LLMLogObserver
+from pipecat.observers.loggers.transcription_log_observer import TranscriptionLogObserver
+from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -93,8 +96,6 @@ async def run_agent(
 
     stt = DeepgramSTTService(
         api_key=DEEPGRAM_API_KEY,
-        encoding="mulaw",
-        sample_rate=8000,
     )
 
     llm = OpenAILLMService(
@@ -133,6 +134,12 @@ async def run_agent(
         ]
     )
 
+    latency_observer = UserBotLatencyObserver()
+
+    @latency_observer.event_handler("on_latency_measured")
+    async def _on_latency(observer, latency: float):
+        logger.info(f"[Latency] user stopped -> bot started: {latency:.2f}s")
+
     task = PipelineTask(
         pipeline,
         params=PipelineParams(
@@ -140,6 +147,11 @@ async def run_agent(
             enable_metrics=True,
             enable_usage_metrics=True,
         ),
+        observers=[
+            TranscriptionLogObserver(),
+            LLMLogObserver(),
+            latency_observer,
+        ],
     )
 
     initial_context = LLMContext(
