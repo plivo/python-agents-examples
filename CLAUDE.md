@@ -114,6 +114,12 @@ For framework examples: no VAD in utils (framework handles it).
 
 **Framework orchestration**: `run_agent()` function assembles Pipeline. No custom class needed.
 
+**Pipecat PipelineRunner signal handling**:
+- Use `PipelineRunner()` (default `handle_sigterm=False`) when running inside uvicorn.
+- Do NOT use `PipelineRunner(handle_sigterm=True)` — it calls `loop.add_signal_handler(signal.SIGTERM, ...)` in `__init__`, which **replaces** uvicorn's SIGTERM handler. After the pipeline finishes, uvicorn's handler is never restored, so uvicorn never receives a shutdown signal and the process hangs indefinitely.
+- `handle_sigterm=True` is only appropriate for standalone scripts where PipelineRunner owns the process lifecycle.
+- PipelineRunner idle timeout is 300s, cancel timeout is 20s — relevant for shutdown timing.
+
 ## WebSocket Protocol
 
 1. Plivo sends `{"event": "start", "start": {"callId": "...", "streamId": "..."}}` — handle first
@@ -185,6 +191,17 @@ Run: `uv run ruff check .`
 
 Test infra: `conftest.py` sets `sys.path`, `helpers.py` has ngrok/recording/transcription utils.
 
+**Server subprocess teardown** in `server_process` fixture — always use SIGTERM with SIGKILL fallback:
+```python
+os.kill(proc.pid, signal.SIGTERM)
+try:
+    proc.wait(timeout=5)
+except subprocess.TimeoutExpired:
+    proc.kill()
+    proc.wait()
+```
+Pipecat servers may not exit on SIGTERM alone when a PipelineRunner has been active (see "Pipecat PipelineRunner signal handling" above). Native servers typically exit cleanly on SIGTERM, but the fallback pattern is safe for all examples.
+
 Run: `uv run pytest tests/test_integration.py -v -k "unit"` (offline)
 
 ## Reference Files
@@ -195,7 +212,7 @@ Run: `uv run pytest tests/test_integration.py -v -k "unit"` (offline)
 - `grok-voice-native/outbound/agent.py` — OutboundCallRecord, CallManager pattern
 - `grok-voice-native/tests/` — full test suite to replicate
 - `gemini-live-native-no-vad/` — alternative native pattern (SDK-based, server-side VAD, no client-side VAD)
-- `gemini-live-pipecat/agent.py` — framework Pipeline reference
+- `gemini-live-pipecat/inbound/agent.py` — framework Pipeline reference
 
 ## Slash Commands (Phase Workflow)
 
