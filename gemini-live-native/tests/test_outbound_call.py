@@ -19,7 +19,7 @@ Requirements:
     - Port 18003 available
 
 Usage:
-    cd gemini-live-native-silero
+    cd gemini-live-native
     uv run pytest tests/test_outbound_call.py -v -s
 """
 

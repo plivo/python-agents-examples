@@ -22,7 +22,7 @@ Requirements:
     - Port 18002 available
 
 Usage:
-    cd gemini-live-native-silero
+    cd gemini-live-native
     uv run pytest tests/test_live_call.py -v -s
 """
 

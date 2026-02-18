@@ -11,6 +11,17 @@
 
 Read `CLAUDE.md` for the canonical file structure and rules. Use `grok-voice-native/` as the primary reference.
 
+### 0. Validate the example name
+
+Before creating any files, verify `{example-name}` follows the naming convention:
+`{provider}-{optional-stt}-{optional-tts}-{orchestration}[-{variant}]`
+
+- Must end with a known orchestration type: `native`, `pipecat`, `livekit`, `vapi`
+- If a variant suffix follows the orchestration type, it must be a known variant: `no-vad`, `webrtcvad`
+- Unknown suffixes should be flagged — ask the user before proceeding
+
+If the name does not match, stop and ask the user to provide a corrected name.
+
 ### 1. Create the full directory structure
 
 Create ALL of these files under `{example-name}/`:

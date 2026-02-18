@@ -20,6 +20,10 @@ First, determine orchestration type by reading `{example-name}/inbound/agent.py`
 
 Run through EVERY item. Report PASS or FAIL with details for each.
 
+#### Naming (1 check)
+
+0. **Directory name follows convention**: Must match `{provider}-...-{orchestration}[-{variant}]` where orchestration is `native|pipecat|livekit|vapi` and variant (if present) is `no-vad|webrtcvad`
+
 #### Structure (8 checks)
 
 1. **All canonical files exist**: Check every file from the canonical structure in CLAUDE.md

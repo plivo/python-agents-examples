@@ -51,7 +51,7 @@ When the user speaks while the agent is talking:
 ### 1. Install dependencies
 
 ```bash
-cd gemini-live-native-silero
+cd gemini-live-native
 uv sync
 ```
 
@@ -98,7 +98,7 @@ Call your Plivo phone number and start talking to the agent. Try interrupting th
 ## Project Structure
 
 ```
-gemini-live-native-silero/
+gemini-live-native/
 ├── agent.py            # Voice agent with Gemini Live API + Silero VAD
 ├── server.py           # FastAPI server with Plivo webhooks
 ├── tests/              # Integration and voice tests

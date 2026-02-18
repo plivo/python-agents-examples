@@ -64,6 +64,33 @@ echo "=========================================="
 echo ""
 
 # =============================================================================
+# 0. Naming Convention Check
+# =============================================================================
+
+echo "--- Naming ---"
+
+# Extract orchestration type and optional variant from directory name
+# Convention: {provider}-{optional-stt}-{optional-tts}-{orchestration}[-{variant}]
+KNOWN_ORCH="native|pipecat|livekit|vapi"
+KNOWN_VARIANTS="no-vad|webrtcvad"
+
+name_valid=false
+# Check if name ends with a known orchestration type (with optional known variant)
+if [[ "$EXAMPLE" =~ -($KNOWN_ORCH)$ ]]; then
+    name_valid=true
+elif [[ "$EXAMPLE" =~ -($KNOWN_ORCH)-($KNOWN_VARIANTS)$ ]]; then
+    name_valid=true
+fi
+
+if $name_valid; then
+    pass "Directory name follows naming convention"
+else
+    fail "Directory name '$EXAMPLE' does not follow naming convention ({provider}-...-{orchestration}[-{variant}])"
+fi
+
+echo ""
+
+# =============================================================================
 # 1. Structure Checks
 # =============================================================================
 

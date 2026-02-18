@@ -17,7 +17,7 @@ Requirements:
     - Port 18001 available (used by test server)
 
 Usage:
-    cd gemini-live-native-silero
+    cd gemini-live-native
     uv run pytest tests/test_e2e_live.py -v -s
 """
 
