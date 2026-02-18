@@ -169,7 +169,11 @@ class TestLocalIntegration:
         yield proc
 
         os.kill(proc.pid, signal.SIGTERM)
-        proc.wait(timeout=5)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
     @pytest.mark.asyncio
     async def test_local_health_check(self, server_process):
