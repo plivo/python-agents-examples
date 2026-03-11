@@ -1,0 +1,1724 @@
+"""Inbound voice agent — Dual-LLM lead qualification with smart-turn detection.
+
+Architecture:
+  Plivo audio → Deepgram nova-3 (streaming STT) + Silero VAD + smart-turn-v2
+  → GPT-4.1 mini (conversation) → [tool_calls?] → GPT-4.1 (reasoning + tools)
+  → ElevenLabs flash v2.5 (streaming TTS) → Plivo audio
+
+Dual-LLM routing:
+  GPT-4.1 mini handles every turn with tool definitions. If it returns tool_calls,
+  GPT-4.1 executes the tools and generates the follow-up response. If it returns
+  text only, we use that directly. OpenAI's function-calling is the routing signal.
+
+Smart-turn-v2:
+  Combines Silero VAD (is_speech signal) with a Wav2Vec2-based ML model that
+  predicts semantic turn completion (~12ms inference). This avoids cutting off
+  users mid-thought (e.g., "um...", "so...") while still responding quickly
+  to complete utterances.
+
+Pipeline logging is controlled by the LOG_LEVEL env var:
+  verbose — every pipeline event: per-packet stats, VAD frames, queue sizes, TTFB
+  normal  — key events: turn lifecycle, STT results, LLM responses, TTS timing (default)
+  quiet   — errors and session start/end only
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import contextlib
+import json
+import os
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import aiohttp
+import numpy as np
+from dotenv import load_dotenv
+from loguru import logger
+
+from utils import (
+    SileroVADProcessor,
+    elevenlabs_to_plivo,
+    plivo_to_deepgram,
+    plivo_to_vad,
+)
+
+if TYPE_CHECKING:
+    from fastapi import WebSocket
+
+load_dotenv()
+
+# =============================================================================
+# Agent Configuration
+# =============================================================================
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_CONVERSATION_MODEL = os.getenv("OPENAI_CONVERSATION_MODEL", "gpt-4.1-mini")
+OPENAI_REASONING_MODEL = os.getenv("OPENAI_REASONING_MODEL", "gpt-4.1")
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
+DEEPGRAM_MODEL = os.getenv("DEEPGRAM_MODEL", "nova-3")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # Rachel
+ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5")
+HUBSPOT_ACCESS_TOKEN = os.getenv("HUBSPOT_ACCESS_TOKEN", "")
+CAL_COM_API_KEY = os.getenv("CAL_COM_API_KEY", "")
+CAL_COM_EVENT_TYPE_ID = os.getenv("CAL_COM_EVENT_TYPE_ID", "")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+PLIVO_AUTH_ID = os.getenv("PLIVO_AUTH_ID", "")
+PLIVO_AUTH_TOKEN = os.getenv("PLIVO_AUTH_TOKEN", "")
+PLIVO_PHONE_NUMBER = os.getenv("PLIVO_PHONE_NUMBER", "")
+
+# Smart-turn configuration
+SMART_TURN_STOP_SECS = float(os.getenv("SMART_TURN_STOP_SECS", "3.0"))
+
+# Conversation history window — keep the last N messages to prevent context overflow.
+# Each delegated turn generates ~6 messages, so 40 ≈ 6-7 full delegated turns.
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "40"))
+
+# Logging verbosity: "verbose", "normal" (default), "quiet"
+LOG_LEVEL = os.getenv("LOG_LEVEL", "normal").lower()
+
+# =============================================================================
+# System Prompt
+# =============================================================================
+
+SYSTEM_PROMPT = (Path(__file__).parent / "system_prompt.md").read_text().strip()
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", SYSTEM_PROMPT)
+
+
+# =============================================================================
+# Smart-Turn Processor
+# =============================================================================
+
+
+class SmartTurnProcessor:
+    """Semantic turn detection using smart-turn-v2 model.
+
+    Wraps Silero VAD (for is_speech signal) + smart-turn-v2 ML model
+    (for semantic turn completion). Runs model in thread executor to
+    avoid blocking the event loop.
+
+    Flow:
+    1. Silero VAD provides is_speech boolean per audio frame
+    2. Audio is accumulated during speech
+    3. When VAD detects silence after speech, smart-turn model runs (~12ms)
+    4. If model predicts "complete" (prob > 0.5) → trigger response
+    5. If model predicts "incomplete" → keep waiting for more speech
+    6. Safety fallback: if silence exceeds stop_secs, force turn complete
+    """
+
+    def __init__(self, stop_secs: float = SMART_TURN_STOP_SECS):
+        self._vad = SileroVADProcessor()
+        self._audio_buffer: list[np.ndarray] = []
+        self._speech_active = False
+        self._silence_start: float | None = None
+        self._stop_secs = stop_secs
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._model = None
+        self._processor = None
+        self._model_loaded = False
+
+    def _ensure_model(self) -> None:
+        """Lazy-load the smart-turn-v2 model."""
+        if self._model_loaded:
+            return
+        try:
+            import torch
+            from transformers import Wav2Vec2ForSequenceClassification, Wav2Vec2Processor
+
+            self._processor = Wav2Vec2Processor.from_pretrained("pipecat-ai/smart-turn-v2")
+            self._model = Wav2Vec2ForSequenceClassification.from_pretrained(
+                "pipecat-ai/smart-turn-v2"
+            )
+            self._model.eval()
+            if torch.cuda.is_available():
+                self._model = self._model.cuda()
+            self._model_loaded = True
+            logger.info("Smart-turn-v2 model loaded")
+        except Exception as e:
+            logger.warning(f"Failed to load smart-turn-v2 model: {e}. Using VAD-only fallback.")
+            self._model_loaded = True  # Don't retry
+
+    def process_audio(self, audio_f32_16k: np.ndarray) -> tuple[bool, bool]:
+        """Process audio frame through VAD. Returns (speech_started, speech_ended_vad)."""
+        speech_started, speech_ended = self._vad.process(audio_f32_16k)
+
+        if speech_started:
+            self._speech_active = True
+            self._silence_start = None
+
+        if self._speech_active or self._vad.is_speaking:
+            self._audio_buffer.append(audio_f32_16k)
+
+        if speech_ended:
+            self._silence_start = time.monotonic()
+
+        return speech_started, speech_ended
+
+    async def analyze_turn(self) -> bool:
+        """Run smart-turn model on accumulated audio. Returns True if turn is complete."""
+        self._ensure_model()
+
+        if not self._audio_buffer:
+            return True  # No audio = treat as complete
+
+        # Safety fallback: if silence exceeds stop_secs, force complete
+        if self._silence_start and (time.monotonic() - self._silence_start) >= self._stop_secs:
+            logger.debug("Smart-turn: forced complete (silence timeout)")
+            return True
+
+        if self._model is None or self._processor is None:
+            return True  # Model not available, fall back to VAD-only
+
+        audio = np.concatenate(self._audio_buffer)
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(self._executor, self._predict, audio)
+        return result["prediction"] == 1
+
+    def _predict(self, audio_array: np.ndarray) -> dict:
+        """Run model inference (called in thread)."""
+        import torch
+
+        # Truncate to last 8 seconds (model context window)
+        max_samples = 8 * 16000
+        if len(audio_array) > max_samples:
+            audio_array = audio_array[-max_samples:]
+
+        inputs = self._processor(
+            audio_array, sampling_rate=16000, return_tensors="pt", padding=True
+        )
+        if torch.cuda.is_available():
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = self._model(**inputs)
+            logits = outputs.logits[0]
+            probs = logits.softmax(dim=-1)
+            # Model outputs 2 classes: [incomplete, complete]. If shape is
+            # unexpected (single class), fall back to treating it as complete.
+            probability = probs[1].item() if probs.shape[0] >= 2 else probs[0].item()
+
+        return {"prediction": 1 if probability > 0.5 else 0, "probability": probability}
+
+    def reset(self) -> None:
+        """Reset state for a new turn."""
+        self._audio_buffer.clear()
+        self._speech_active = False
+        self._silence_start = None
+        self._vad.reset()
+
+    @property
+    def is_speaking(self) -> bool:
+        return self._vad.is_speaking
+
+
+# =============================================================================
+# Deepgram STT Client
+# =============================================================================
+
+
+class DeepgramSTT:
+    """Real-time speech-to-text using Deepgram WebSocket API.
+
+    Streams audio continuously and maintains the latest final transcript.
+    Uses Deepgram's ``speech_final`` signal to indicate when the utterance
+    is complete — this is used as a convergence gate with SmartTurn so we
+    never harvest a half-finished transcript.
+    """
+
+    def __init__(self):
+        self._ws = None
+        self._session: aiohttp.ClientSession | None = None
+        self._running = False
+        self._receive_task: asyncio.Task | None = None
+        self._latest_transcript = ""
+        self._transcript_parts: list[str] = []
+        self._utterance_complete = asyncio.Event()
+
+    @property
+    def latest_transcript(self) -> str:
+        """Get the latest accumulated transcript."""
+        return " ".join(self._transcript_parts).strip()
+
+    def clear_transcript(self) -> None:
+        """Clear the transcript buffer for a new turn."""
+        self._transcript_parts.clear()
+        self._latest_transcript = ""
+        self._utterance_complete.clear()
+
+    async def wait_for_utterance(self, timeout: float = 1.0) -> bool:
+        """Wait for Deepgram to signal the utterance is complete.
+
+        Returns True if utterance completed within timeout, False otherwise.
+        The caller should still use the transcript even on timeout — it just
+        means Deepgram's endpointing hasn't fired yet (partial transcript is
+        still usable).
+        """
+        try:
+            await asyncio.wait_for(self._utterance_complete.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def connect(self) -> None:
+        """Connect to Deepgram WebSocket."""
+        self._session = aiohttp.ClientSession()
+        self._running = True
+
+        url = (
+            f"wss://api.deepgram.com/v1/listen"
+            f"?model={DEEPGRAM_MODEL}"
+            f"&encoding=linear16"
+            f"&sample_rate=8000"
+            f"&channels=1"
+            f"&punctuate=true"
+            f"&interim_results=true"
+        )
+
+        headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
+        self._ws = await self._session.ws_connect(url, headers=headers)
+        logger.info("Connected to Deepgram STT")
+        self._receive_task = asyncio.create_task(self._receive_loop())
+
+    async def _receive_loop(self) -> None:
+        """Receive transcription results from Deepgram."""
+        try:
+            async for msg in self._ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    if data.get("type") == "Results":
+                        is_final = data.get("is_final", False)
+                        speech_final = data.get("speech_final", False)
+                        channel = data.get("channel", {})
+                        alternatives = channel.get("alternatives", [])
+                        if alternatives:
+                            transcript = alternatives[0].get("transcript", "")
+                            if transcript.strip() and is_final:
+                                self._transcript_parts.append(transcript)
+                                logger.debug(f"STT final: '{transcript}'")
+                        if speech_final:
+                            self._utterance_complete.set()
+                            logger.debug("STT: speech_final — utterance complete")
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    logger.error(f"Deepgram WebSocket error: {msg.data}")
+                    break
+        except Exception as e:
+            if self._running:
+                logger.error(f"Deepgram receive error: {e}")
+
+    async def send_audio(self, pcm_audio: bytes) -> None:
+        """Send PCM audio to Deepgram."""
+        if self._ws and not self._ws.closed:
+            await self._ws.send_bytes(pcm_audio)
+
+    async def close(self) -> None:
+        """Close the Deepgram connection."""
+        self._running = False
+        if self._receive_task and not self._receive_task.done():
+            self._receive_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._receive_task
+        if self._ws and not self._ws.closed:
+            await self._ws.close()
+        if self._session:
+            await self._session.close()
+
+
+# =============================================================================
+# Tool Implementations (Real Systems)
+# =============================================================================
+
+
+async def lookup_contact(email_or_phone: str) -> dict[str, Any]:
+    """Search contacts in HubSpot CRM by email or phone."""
+    import httpx
+
+    if not HUBSPOT_ACCESS_TOKEN:
+        return {"status": "error", "message": "HubSpot not configured"}
+
+    # Determine if input is email or phone
+    filter_field = "email" if "@" in email_or_phone else "phone"
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(
+            "https://api.hubapi.com/crm/v3/objects/contacts/search",
+            headers={
+                "Authorization": f"Bearer {HUBSPOT_ACCESS_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "filterGroups": [{
+                    "filters": [{
+                        "propertyName": filter_field,
+                        "operator": "EQ",
+                        "value": email_or_phone,
+                    }]
+                }],
+                "properties": [
+                    "email", "phone", "firstname", "lastname", "company",
+                    "jobtitle", "lifecyclestage",
+                ],
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    results = data.get("results", [])
+    if not results:
+        return {"status": "not_found", "message": f"No contact found for {email_or_phone}"}
+
+    contact = results[0]
+    props = contact.get("properties", {})
+    return {
+        "status": "found",
+        "contact_id": contact.get("id"),
+        "email": props.get("email", ""),
+        "phone": props.get("phone", ""),
+        "name": f"{props.get('firstname', '')} {props.get('lastname', '')}".strip(),
+        "company": props.get("company", ""),
+        "job_title": props.get("jobtitle", ""),
+        "lifecycle_stage": props.get("lifecyclestage", ""),
+    }
+
+
+async def create_or_update_contact(
+    email: str, properties: dict[str, str]
+) -> dict[str, Any]:
+    """Create or update a contact in HubSpot CRM."""
+    import httpx
+
+    if not HUBSPOT_ACCESS_TOKEN:
+        return {"status": "error", "message": "HubSpot not configured"}
+
+    props = {"email": email, **properties}
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # Try to create first; if conflict, update
+        response = await client.post(
+            "https://api.hubapi.com/crm/v3/objects/contacts",
+            headers={
+                "Authorization": f"Bearer {HUBSPOT_ACCESS_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={"properties": props},
+        )
+
+        if response.status_code == 409:
+            # Contact exists, update instead
+            existing = response.json()
+            contact_id = existing.get("id", "")
+            if not contact_id:
+                # Search for existing contact
+                search_result = await lookup_contact(email)
+                contact_id = search_result.get("contact_id", "")
+
+            if contact_id:
+                response = await client.patch(
+                    f"https://api.hubapi.com/crm/v3/objects/contacts/{contact_id}",
+                    headers={
+                        "Authorization": f"Bearer {HUBSPOT_ACCESS_TOKEN}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"properties": props},
+                )
+                response.raise_for_status()
+                return {"status": "updated", "contact_id": contact_id}
+
+        response.raise_for_status()
+        data = response.json()
+        return {"status": "created", "contact_id": data.get("id", "")}
+
+
+async def score_lead(
+    contact_id: str,
+    company_size: str,
+    budget: str,
+    timeline: str,
+    authority: str,
+    need: str,
+) -> dict[str, Any]:
+    """BANT scoring + create/update Deal in HubSpot."""
+    import httpx
+
+    if not HUBSPOT_ACCESS_TOKEN:
+        return {"status": "error", "message": "HubSpot not configured"}
+
+    # Simple BANT scoring
+    score = 0
+    reasons = []
+
+    # Budget (0-25)
+    budget_lower = budget.lower()
+    if any(w in budget_lower for w in ["allocated", "approved", "ready", "yes"]):
+        score += 25
+        reasons.append("budget_confirmed")
+    elif any(w in budget_lower for w in ["exploring", "considering"]):
+        score += 15
+        reasons.append("budget_exploring")
+
+    # Authority (0-25)
+    authority_lower = authority.lower()
+    if any(w in authority_lower for w in ["decision", "final", "yes", "i decide", "owner", "ceo"]):
+        score += 25
+        reasons.append("decision_maker")
+    elif any(w in authority_lower for w in ["influencer", "evaluate", "recommend"]):
+        score += 15
+        reasons.append("influencer")
+
+    # Need (0-25)
+    need_lower = need.lower()
+    if any(w in need_lower for w in ["urgent", "critical", "pain", "problem", "struggling"]):
+        score += 25
+        reasons.append("strong_need")
+    elif any(w in need_lower for w in ["exploring", "curious", "interested"]):
+        score += 15
+        reasons.append("moderate_need")
+
+    # Timeline (0-25)
+    timeline_lower = timeline.lower()
+    if any(w in timeline_lower for w in ["now", "asap", "this month", "immediate"]):
+        score += 25
+        reasons.append("immediate_timeline")
+    elif any(w in timeline_lower for w in ["quarter", "this quarter", "soon", "next month"]):
+        score += 20
+        reasons.append("near_timeline")
+    elif any(w in timeline_lower for w in ["year", "next year", "6 months"]):
+        score += 10
+        reasons.append("future_timeline")
+
+    # Determine deal stage based on score
+    if score >= 70:
+        deal_stage = "qualifiedtobuy"
+        stage_label = "Qualified to Buy"
+    elif score >= 50:
+        deal_stage = "presentationscheduled"
+        stage_label = "Presentation Scheduled"
+    else:
+        deal_stage = "appointmentscheduled"
+        stage_label = "Appointment Scheduled"
+
+    # Create deal in HubSpot
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        deal_response = await client.post(
+            "https://api.hubapi.com/crm/v3/objects/deals",
+            headers={
+                "Authorization": f"Bearer {HUBSPOT_ACCESS_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "properties": {
+                    "dealname": f"TechFlow Lead - Score {score}",
+                    "dealstage": deal_stage,
+                    "pipeline": "default",
+                    "amount": budget if budget.replace(".", "").isdigit() else "",
+                    "description": (
+                        f"BANT Score: {score}/100\n"
+                        f"Budget: {budget}\nAuthority: {authority}\n"
+                        f"Need: {need}\nTimeline: {timeline}\n"
+                        f"Company Size: {company_size}\n"
+                        f"Scoring: {', '.join(reasons)}"
+                    ),
+                },
+            },
+        )
+        deal_response.raise_for_status()
+        deal_data = deal_response.json()
+
+        # Associate deal with contact
+        deal_id = deal_data.get("id", "")
+        if deal_id and contact_id:
+            await client.put(
+                f"https://api.hubapi.com/crm/v3/objects/deals/{deal_id}/associations/contacts/{contact_id}/deal_to_contact",
+                headers={"Authorization": f"Bearer {HUBSPOT_ACCESS_TOKEN}"},
+            )
+
+    return {
+        "status": "scored",
+        "score": score,
+        "max_score": 100,
+        "stage": stage_label,
+        "reasons": reasons,
+        "deal_id": deal_id,
+        "qualified": score >= 50,
+    }
+
+
+async def schedule_meeting(
+    email: str, name: str, preferred_time: str
+) -> dict[str, Any]:
+    """Book a demo meeting via Cal.com API."""
+    import httpx
+
+    if not CAL_COM_API_KEY:
+        return {"status": "error", "message": "Cal.com not configured"}
+
+    event_type_id = CAL_COM_EVENT_TYPE_ID or "default"
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(
+            "https://api.cal.com/v2/bookings",
+            headers={
+                "Authorization": f"Bearer {CAL_COM_API_KEY}",
+                "Content-Type": "application/json",
+                "cal-api-version": "2024-08-13",
+            },
+            json={
+                "eventTypeId": int(event_type_id) if event_type_id.isdigit() else 0,
+                "attendee": {
+                    "name": name,
+                    "email": email,
+                    "timeZone": "America/New_York",
+                },
+                "start": preferred_time,
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    booking = data.get("data", {})
+    return {
+        "status": "booked",
+        "booking_id": booking.get("uid", ""),
+        "start_time": booking.get("start", preferred_time),
+        "meeting_url": booking.get("meetingUrl", ""),
+    }
+
+
+async def send_sms(phone_number: str, message: str) -> dict[str, Any]:
+    """Send SMS via Plivo API."""
+    if not all([PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN, PLIVO_PHONE_NUMBER]):
+        return {"status": "error", "message": "Plivo SMS not configured"}
+
+    import plivo
+
+    client = plivo.RestClient(auth_id=PLIVO_AUTH_ID, auth_token=PLIVO_AUTH_TOKEN)
+    try:
+        response = client.messages.create(
+            src=PLIVO_PHONE_NUMBER,
+            dst=phone_number,
+            text=message,
+        )
+        msg_uuid = ""
+        if isinstance(response, dict):
+            msg_uuid = response.get("message_uuid", [""])[0]
+        elif hasattr(response, "message_uuid"):
+            uuids = response.message_uuid
+            msg_uuid = uuids[0] if isinstance(uuids, list) else str(uuids)
+        return {
+            "status": "sent",
+            "message_uuid": msg_uuid,
+            "phone_number": phone_number,
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+async def notify_sales(lead_summary: dict[str, Any]) -> dict[str, Any]:
+    """Post lead notification to Slack channel."""
+    import httpx
+
+    if not SLACK_WEBHOOK_URL:
+        return {"status": "error", "message": "Slack webhook not configured"}
+
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "New Qualified Lead"},
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Name:*\n{lead_summary.get('name', 'Unknown')}"},
+                {"type": "mrkdwn", "text": f"*Company:*\n{lead_summary.get('company', 'Unknown')}"},
+                {"type": "mrkdwn", "text": f"*Score:*\n{lead_summary.get('score', 'N/A')}/100"},
+                {"type": "mrkdwn", "text": f"*Email:*\n{lead_summary.get('email', 'N/A')}"},
+            ],
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Notes:*\n{lead_summary.get('notes', 'No notes')}",
+            },
+        },
+    ]
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(
+            SLACK_WEBHOOK_URL,
+            json={"blocks": blocks, "text": "New Qualified Lead"},
+        )
+        response.raise_for_status()
+
+    return {"status": "notified", "channel": "sales"}
+
+
+# =============================================================================
+# Voice Agent
+# =============================================================================
+
+
+class VoiceAgent:
+    """Dual-LLM voice agent: GPT-4.1 mini (conversation) + GPT-4.1 (reasoning + tools).
+
+    Uses Deepgram nova-3 for streaming STT, smart-turn-v2 for semantic turn
+    detection, and ElevenLabs flash v2.5 for streaming TTS.
+    """
+
+    def __init__(
+        self,
+        websocket: WebSocket,
+        call_id: str,
+        from_number: str = "",
+        to_number: str = "",
+        system_prompt: str | None = None,
+        initial_message: str = "Hello, I'm calling for help.",
+        stream_id: str = "",
+    ):
+        self.websocket = websocket
+        self.call_id = call_id
+        self.from_number = from_number
+        self.to_number = to_number
+        self.system_prompt = system_prompt or SYSTEM_PROMPT
+        self.initial_message = initial_message
+        self._stream_id = stream_id
+
+        self._running = False
+        self._send_queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._smart_turn = SmartTurnProcessor()
+        self._deepgram = DeepgramSTT()
+        self._conversation_history: list[dict[str, Any]] = []
+        self._current_tts_task: asyncio.Task | None = None
+        self._current_turn_task: asyncio.Task | None = None
+        self._turn_lock = asyncio.Lock()
+        self._turn_id: str = ""
+        self._turn_count = 0
+        self._checkpoint_counter = 0
+        self._is_playing = False  # True while Plivo is playing audio
+        self._last_activity: float = 0.0  # monotonic time of last turn/speech
+        self._session_start = time.monotonic()
+        self._plivo_rx_bytes = 0
+        self._plivo_tx_chunks = 0
+
+    # — Structured logging (includes turn_id when active) —
+
+    def _fmt_prefix(self) -> str:
+        elapsed = time.monotonic() - self._session_start
+        turn = f" [t:{self._turn_id[:6]}]" if self._turn_id else ""
+        return f"[{self.call_id[:8]}] [{elapsed:7.2f}s]{turn} [{{}}]"
+
+    def _log(self, stage: str, msg: str) -> None:
+        if LOG_LEVEL == "quiet":
+            return
+        prefix = self._fmt_prefix().format(stage)
+        logger.info(f"{prefix} {msg}")
+
+    def _logv(self, stage: str, msg: str) -> None:
+        if LOG_LEVEL != "verbose":
+            return
+        prefix = self._fmt_prefix().format(stage)
+        logger.debug(f"{prefix} {msg}")
+
+    def _loge(self, stage: str, msg: str) -> None:
+        prefix = self._fmt_prefix().format(stage)
+        logger.error(f"{prefix} {msg}")
+
+    # — Tool Definitions —
+
+    def _build_routing_tool(self) -> list[dict[str, Any]]:
+        """Build the single delegation tool for GPT-4.1 mini (conversation model).
+
+        Mini uses this to signal when reasoning/tool execution is needed.
+        It also provides a spoken_filler phrase to keep the caller engaged
+        while the reasoning model works.
+        """
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "delegate_to_reasoning",
+                    "description": (
+                        "Delegate a task to the reasoning system when the conversation "
+                        "requires CRM lookups, data updates, lead scoring, meeting booking, "
+                        "SMS sending, sales notifications, or ending the call. Provide a "
+                        "clear description of what needs to be done and all relevant context "
+                        "from the conversation. Always include a spoken_filler — a short "
+                        "phrase the agent will say to the caller while the task is processed."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "task": {
+                                "type": "string",
+                                "description": (
+                                    "Clear description of the task including all relevant "
+                                    "data from the conversation (names, emails, phone numbers, "
+                                    "BANT details, etc.)"
+                                ),
+                            },
+                            "spoken_filler": {
+                                "type": "string",
+                                "description": (
+                                    "A natural 1-3 sentence phrase to speak to the caller "
+                                    "while the task is being processed. Should acknowledge "
+                                    "their request and optionally share something useful. "
+                                    "Examples: 'Let me pull up your account real quick.', "
+                                    "'Sure, let me look into that. We actually just launched "
+                                    "some new features that might be relevant to your team.'"
+                                ),
+                            },
+                        },
+                        "required": ["task", "spoken_filler"],
+                    },
+                },
+            },
+        ]
+
+    def _build_tools(self) -> list[dict[str, Any]]:
+        """Build tool definitions for GPT-4.1 (reasoning model).
+
+        The heavy model gets the full tool suite for reasoning and execution.
+        """
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup_contact",
+                    "description": (
+                        "Search for an existing contact in HubSpot CRM "
+                        "by email or phone number."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "email_or_phone": {
+                                "type": "string",
+                                "description": "Email address or phone number to search for",
+                            },
+                        },
+                        "required": ["email_or_phone"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "create_or_update_contact",
+                    "description": (
+                        "Create or update a contact in HubSpot CRM "
+                        "with lead information."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "email": {"type": "string", "description": "Contact email address"},
+                            "firstname": {"type": "string", "description": "First name"},
+                            "lastname": {"type": "string", "description": "Last name"},
+                            "company": {"type": "string", "description": "Company name"},
+                            "jobtitle": {"type": "string", "description": "Job title"},
+                            "phone": {"type": "string", "description": "Phone number"},
+                        },
+                        "required": ["email"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "score_lead",
+                    "description": (
+                        "Score the lead using BANT criteria "
+                        "and create a deal in HubSpot."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "contact_id": {
+                                "type": "string",
+                                "description": "HubSpot contact ID",
+                            },
+                            "company_size": {
+                                "type": "string",
+                                "description": "Number of employees or company size category",
+                            },
+                            "budget": {
+                                "type": "string",
+                                "description": (
+                                    "Budget information "
+                                    "(e.g., 'allocated', '$50k', 'exploring')"
+                                ),
+                            },
+                            "timeline": {
+                                "type": "string",
+                                "description": (
+                                    "Implementation timeline "
+                                    "(e.g., 'this month', 'Q2', 'exploring')"
+                                ),
+                            },
+                            "authority": {
+                                "type": "string",
+                                "description": (
+                                    "Decision-making authority "
+                                    "(e.g., 'decision maker', 'influencer')"
+                                ),
+                            },
+                            "need": {
+                                "type": "string",
+                                "description": "Business need description",
+                            },
+                        },
+                        "required": [
+                            "contact_id", "budget", "timeline", "authority", "need",
+                        ],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "schedule_meeting",
+                    "description": "Book a demo meeting via Cal.com.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "email": {"type": "string", "description": "Attendee email"},
+                            "name": {"type": "string", "description": "Attendee full name"},
+                            "preferred_time": {
+                                "type": "string",
+                                "description": "Preferred meeting time (ISO 8601 format)",
+                            },
+                        },
+                        "required": ["email", "name", "preferred_time"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "send_sms",
+                    "description": "Send an SMS message to a phone number via Plivo.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "phone_number": {"type": "string", "description": "Phone number"},
+                            "message": {"type": "string", "description": "SMS content"},
+                        },
+                        "required": ["phone_number", "message"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "notify_sales",
+                    "description": (
+                        "Post a notification to the sales Slack channel "
+                        "about a qualified lead."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "Lead name"},
+                            "company": {"type": "string", "description": "Company name"},
+                            "email": {"type": "string", "description": "Lead email"},
+                            "score": {"type": "integer", "description": "Lead score (0-100)"},
+                            "notes": {"type": "string", "description": "Summary notes"},
+                        },
+                        "required": ["name", "company", "score"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "end_call",
+                    "description": "End the call gracefully after summarizing outcomes.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "reason": {"type": "string", "description": "Reason for ending"},
+                            "outcome": {
+                                "type": "string",
+                                "description": (
+                                    "Call outcome "
+                                    "(qualified, not_qualified, callback, etc.)"
+                                ),
+                            },
+                        },
+                    },
+                },
+            },
+        ]
+
+    async def _handle_function_call(
+        self, name: str, arguments: str
+    ) -> dict[str, Any]:
+        """Execute a function call and return the result."""
+        try:
+            args = json.loads(arguments) if arguments else {}
+        except json.JSONDecodeError:
+            args = {}
+
+        self._log("tool", f"calling {name}({json.dumps(args)[:100]})")
+
+        try:
+            if name == "lookup_contact":
+                result = await lookup_contact(
+                    email_or_phone=args.get("email_or_phone", ""),
+                )
+            elif name == "create_or_update_contact":
+                email = args.pop("email", "")
+                result = await create_or_update_contact(email=email, properties=args)
+            elif name == "score_lead":
+                result = await score_lead(
+                    contact_id=args.get("contact_id", ""),
+                    company_size=args.get("company_size", ""),
+                    budget=args.get("budget", ""),
+                    timeline=args.get("timeline", ""),
+                    authority=args.get("authority", ""),
+                    need=args.get("need", ""),
+                )
+            elif name == "schedule_meeting":
+                result = await schedule_meeting(
+                    email=args.get("email", ""),
+                    name=args.get("name", ""),
+                    preferred_time=args.get("preferred_time", ""),
+                )
+            elif name == "send_sms":
+                result = await send_sms(
+                    phone_number=args.get("phone_number", ""),
+                    message=args.get("message", ""),
+                )
+            elif name == "notify_sales":
+                result = await notify_sales(lead_summary=args)
+            elif name == "end_call":
+                self._log("tool", f"end_call: {args.get('reason')}")
+                self._running = False
+                result = {"status": "call_ending", "reason": args.get("reason", "")}
+            else:
+                result = {"error": f"Unknown function: {name}"}
+
+            self._log("tool", f"{name} → {result.get('status', 'done')}")
+            return result
+
+        except Exception as e:
+            self._loge("tool", f"{name} ERROR: {e}")
+            return {"error": str(e)}
+
+    # — Conversation History Management —
+
+    def _trim_history(self) -> None:
+        """Window conversation history to prevent context overflow.
+
+        Keeps the last MAX_HISTORY_MESSAGES entries. Ensures we don't cut in
+        the middle of a tool_call/tool response pair by finding a safe trim
+        boundary (a user or assistant message without tool_calls).
+        """
+        if len(self._conversation_history) <= MAX_HISTORY_MESSAGES:
+            return
+
+        overflow = len(self._conversation_history) - MAX_HISTORY_MESSAGES
+        # Find the first safe boundary at or after the overflow point.
+        # Safe = message is "user" or plain "assistant" (not a tool_call/tool pair).
+        trim_at = overflow
+        while trim_at < len(self._conversation_history):
+            msg = self._conversation_history[trim_at]
+            if msg["role"] == "user":
+                break
+            trim_at += 1
+
+        if trim_at >= len(self._conversation_history):
+            trim_at = overflow  # fallback: trim at overflow point
+
+        trimmed = trim_at
+        self._conversation_history = self._conversation_history[trim_at:]
+        self._log(
+            "history",
+            f"trimmed {trimmed} old messages, {len(self._conversation_history)} remaining",
+        )
+
+    # — Dual-LLM Response Generation —
+
+    async def _call_openai(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Make an OpenAI chat completion request."""
+        import httpx
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": 300,
+        }
+        if tools:
+            payload["tools"] = tools
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def _generate_llm_response(self, user_text: str) -> str:
+        """Dual-LLM response: mini controls conversation, GPT-4.1 reasons + executes tools.
+
+        Flow:
+        1. GPT-4.1 mini (light) handles every turn with `delegate_to_reasoning`.
+           It either responds conversationally or delegates with a spoken_filler.
+        2. If delegated: filler is streamed via TTS immediately, GPT-4.1 (heavy)
+           reasons and executes tools concurrently, returns structured JSON results.
+        3. Mini gets a second call with the tool results and crafts the spoken response.
+        Mini owns the voice — the heavy model never speaks to the caller directly.
+        """
+        self._conversation_history.append({"role": "user", "content": user_text})
+        self._trim_history()
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": self.system_prompt},
+            *self._conversation_history,
+        ]
+
+        self._logv("llm", f"request to {OPENAI_CONVERSATION_MODEL} ({len(messages)} messages)")
+        t0 = time.monotonic()
+
+        try:
+            # Step 1: GPT-4.1 mini (conversation model) with delegation tool only
+            result = await self._call_openai(
+                OPENAI_CONVERSATION_MODEL, messages, tools=self._build_routing_tool()
+            )
+            message = result["choices"][0]["message"]
+            latency = (time.monotonic() - t0) * 1000
+            tokens = result.get("usage", {})
+
+            if not message.get("tool_calls"):
+                # Mini responded directly — fast conversational turn
+                self._log(
+                    "llm",
+                    f"{OPENAI_CONVERSATION_MODEL} ({latency:.0f}ms, "
+                    f"{tokens.get('prompt_tokens', '?')}"
+                    f"→{tokens.get('completion_tokens', '?')} tok): "
+                    f"'{message.get('content', '')[:80]}'",
+                )
+                assistant_text = message.get("content", "")
+                self._conversation_history.append({
+                    "role": "assistant", "content": assistant_text,
+                })
+                return assistant_text
+
+            # Mini decided to delegate — extract task + filler
+            tc = message["tool_calls"][0]
+            task_args = json.loads(
+                tc["function"]["arguments"]
+            ) if tc["function"].get("arguments") else {}
+            task_desc = task_args.get("task", "")
+            spoken_filler = task_args.get("spoken_filler", "One moment please.")
+            self._log(
+                "llm",
+                f"{OPENAI_CONVERSATION_MODEL} → delegate ({latency:.0f}ms): "
+                f"'{task_desc[:80]}'",
+            )
+            self._logv("llm", f"filler: '{spoken_filler[:60]}'")
+
+            # Record delegation in conversation history
+            self._conversation_history.append(message)
+            self._conversation_history.append({
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "content": json.dumps({"status": "delegated", "task": task_desc}),
+            })
+
+            # Step 2: Stream filler TTS + run reasoning concurrently
+            reasoning_task = asyncio.create_task(
+                self._run_reasoning_loop(task_desc),
+                name="reasoning",
+            )
+
+            # Stream filler while reasoning works
+            await self._synthesize_with_elevenlabs(spoken_filler)
+
+            # Step 3: Single patience fallback — 5s after filler finishes
+            if not reasoning_task.done():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(reasoning_task), timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    if not reasoning_task.done():
+                        patience = "Still pulling up your details, one moment."
+                        self._log("llm", f"patience fallback: '{patience}'")
+                        await self._synthesize_with_elevenlabs(patience)
+
+            # Await reasoning result
+            reasoning_result = await reasoning_task
+            if isinstance(reasoning_result, BaseException):
+                raise reasoning_result
+
+            # Step 4: Mini crafts the spoken response from structured results
+            self._log("llm", f"reasoning returned: {json.dumps(reasoning_result)[:120]}")
+            self._conversation_history.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "reasoning_result",
+                    "type": "function",
+                    "function": {
+                        "name": "reasoning_result",
+                        "arguments": json.dumps(reasoning_result),
+                    },
+                }],
+            })
+            self._conversation_history.append({
+                "role": "tool",
+                "tool_call_id": "reasoning_result",
+                "content": json.dumps(reasoning_result),
+            })
+
+            followup_messages: list[dict[str, Any]] = [
+                {"role": "system", "content": self.system_prompt},
+                *self._conversation_history,
+                {
+                    "role": "system",
+                    "content": (
+                        "The reasoning system has completed the delegated task. "
+                        "The results are in the tool response above. "
+                        "Now craft a natural spoken response for the caller based on "
+                        "these results. Keep it conversational and concise (1-3 sentences). "
+                        "Do NOT mention the tools or delegation — speak as if you did it."
+                    ),
+                },
+            ]
+
+            self._log("llm", f"mini follow-up → {OPENAI_CONVERSATION_MODEL}")
+            t2 = time.monotonic()
+            followup_result = await self._call_openai(
+                OPENAI_CONVERSATION_MODEL, followup_messages, tools=None,
+            )
+            followup_msg = followup_result["choices"][0]["message"]
+            latency2 = (time.monotonic() - t2) * 1000
+            assistant_text = followup_msg.get("content", "")
+            self._log(
+                "llm",
+                f"mini follow-up ({latency2:.0f}ms): '{assistant_text[:80]}'",
+            )
+
+            self._conversation_history.append({
+                "role": "assistant", "content": assistant_text,
+            })
+            return assistant_text
+
+        except Exception as e:
+            latency = (time.monotonic() - t0) * 1000
+            self._loge("llm", f"ERROR ({latency:.0f}ms): {e}")
+            return (
+                "I'm sorry, I'm having trouble processing that right now. "
+                "Could you repeat that?"
+            )
+
+    async def _run_reasoning_loop(self, task_desc: str) -> dict[str, Any]:
+        """Run GPT-4.1 (reasoning model) in a tool-execution loop.
+
+        Returns structured JSON results — NOT spoken text. The reasoning model
+        executes tools and returns a summary of what was done and the data obtained.
+        Mini (the conversation model) is responsible for crafting the spoken response.
+        """
+        reasoning_system = (
+            "You are the reasoning and tool-execution system for a voice agent. "
+            "You receive delegated tasks from the conversation model. "
+            "Use the available tools to complete the task. When done, respond with "
+            "a JSON object summarizing the results. Include:\n"
+            '- "status": "success" or "error"\n'
+            '- "actions_taken": list of tool calls made and their outcomes\n'
+            '- "data": any relevant data retrieved (contact info, scores, etc.)\n'
+            '- "summary": brief text summary of what happened\n\n'
+            "IMPORTANT: Return ONLY valid JSON. Do NOT write spoken text.\n\n"
+            f"Delegated task: {task_desc}"
+        )
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": reasoning_system},
+            *self._conversation_history,
+        ]
+
+        max_rounds = 5
+        for round_num in range(max_rounds):
+            self._log("llm", f"reasoning round {round_num + 1} → {OPENAI_REASONING_MODEL}")
+            t1 = time.monotonic()
+            result = await self._call_openai(
+                OPENAI_REASONING_MODEL, messages, tools=self._build_tools()
+            )
+            message = result["choices"][0]["message"]
+            latency = (time.monotonic() - t1) * 1000
+
+            if not message.get("tool_calls"):
+                # Reasoning model produced final response — parse as JSON
+                self._log("llm", f"{OPENAI_REASONING_MODEL} done ({latency:.0f}ms)")
+                raw = message.get("content", "{}")
+                try:
+                    return json.loads(raw)
+                except json.JSONDecodeError:
+                    return {"status": "success", "summary": raw}
+
+            # Execute tool calls and continue loop
+            tool_names = [tc["function"]["name"] for tc in message["tool_calls"]]
+            self._log(
+                "llm",
+                f"{OPENAI_REASONING_MODEL} → tools ({latency:.0f}ms): {tool_names}",
+            )
+            messages.append(message)
+
+            for tool_call in message["tool_calls"]:
+                fn_name = tool_call["function"]["name"]
+                fn_args = tool_call["function"]["arguments"]
+                fn_result = await self._handle_function_call(fn_name, fn_args)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": json.dumps(fn_result),
+                })
+
+        # Exhausted max rounds — request final structured response without tools
+        self._log("llm", "reasoning max rounds reached, requesting final response")
+        result = await self._call_openai(OPENAI_REASONING_MODEL, messages, tools=None)
+        raw = result["choices"][0]["message"].get("content", "{}")
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {"status": "success", "summary": raw}
+
+    # — TTS —
+
+    async def _synthesize_with_elevenlabs(self, text: str) -> None:
+        """Stream text through ElevenLabs TTS and queue audio for Plivo."""
+        import httpx
+
+        if not text.strip():
+            return
+
+        self._logv("tts", f"requesting synthesis ({len(text)} chars)")
+        t0 = time.monotonic()
+
+        try:
+            url = (
+                f"https://api.elevenlabs.io/v1/text-to-speech"
+                f"/{ELEVENLABS_VOICE_ID}/stream"
+                f"?output_format=pcm_24000"
+            )
+            async with httpx.AsyncClient(timeout=30.0) as client, client.stream(
+                "POST",
+                url,
+                headers={
+                    "xi-api-key": ELEVENLABS_API_KEY,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "text": text,
+                    "model_id": ELEVENLABS_MODEL_ID,
+                },
+            ) as response:
+                response.raise_for_status()
+                first_chunk_time = None
+                chunk_count = 0
+                total_bytes = 0
+                async for chunk in response.aiter_bytes(chunk_size=4800):
+                    if not self._running:
+                        self._log(
+                            "tts",
+                            f"interrupted after {chunk_count} chunks (session ending)",
+                        )
+                        break
+                    if first_chunk_time is None:
+                        first_chunk_time = time.monotonic()
+                        ttfb = (first_chunk_time - t0) * 1000
+                        self._logv("tts", f"first chunk (TTFB: {ttfb:.0f}ms)")
+                    plivo_audio = elevenlabs_to_plivo(chunk)
+                    await self._send_queue.put(plivo_audio)
+                    chunk_count += 1
+                    total_bytes += len(plivo_audio)
+
+                total_time = (time.monotonic() - t0) * 1000
+                audio_duration = total_bytes / 8000
+                ttfb_str = ""
+                if first_chunk_time is not None:
+                    ttfb_str = f"TTFB={(first_chunk_time - t0) * 1000:.0f}ms, "
+                self._log(
+                    "tts",
+                    f"done: {chunk_count} chunks, "
+                    f"{ttfb_str}{audio_duration:.1f}s audio in {total_time:.0f}ms",
+                )
+
+        except Exception as e:
+            latency = (time.monotonic() - t0) * 1000
+            self._loge("tts", f"ERROR ({latency:.0f}ms): {e}")
+
+    # — Session Lifecycle —
+
+    def _build_system_prompt(self) -> str:
+        """Build system prompt with call context."""
+        system_prompt = self.system_prompt
+
+        if self.from_number:
+            call_time = datetime.now().strftime("%I:%M %p on %A, %B %d")
+            system_prompt += f"""
+
+## Current Call Context
+- Caller's phone number: {self.from_number}
+- Call ID: {self.call_id}
+- Time: {call_time}
+
+You can use the caller's phone number for SMS or lookups without asking."""
+
+        return system_prompt
+
+    async def run(self) -> None:
+        """Run the voice bot session."""
+        self._session_start = time.monotonic()
+        self._running = True
+        self.system_prompt = self._build_system_prompt()
+        logger.info(
+            f"[{self.call_id[:8]}] [  0.00s] [session] "
+            f"started (from={self.from_number}, to={self.to_number}, log={LOG_LEVEL})"
+        )
+
+        # Connect Deepgram STT
+        try:
+            await self._deepgram.connect()
+        except Exception as e:
+            self._loge("session", f"Deepgram connect ERROR: {e}")
+
+        # Eagerly warm up smart-turn model (avoid first-turn latency penalty)
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, self._smart_turn._ensure_model)
+
+        # Generate initial greeting
+        try:
+            self._turn_count += 1
+            self._log("turn", f"turn {self._turn_count}: generating greeting")
+            greeting = await self._generate_llm_response(self.initial_message)
+            if greeting:
+                self._is_playing = True
+                await self._synthesize_with_elevenlabs(greeting)
+                await self._send_checkpoint()
+                self._log("turn", f"turn {self._turn_count}: greeting queued for playback")
+        except Exception as e:
+            self._loge("session", f"greeting ERROR: {e}")
+
+        # Run streaming tasks
+        self._log("session", "starting streaming tasks (plivo_rx, plivo_tx)")
+        try:
+            await self._run_streaming_tasks()
+        except Exception as e:
+            self._loge("session", f"streaming ERROR: {e}")
+        finally:
+            self._running = False
+            await self._deepgram.close()
+            duration = time.monotonic() - self._session_start
+            logger.info(
+                f"[{self.call_id[:8]}] [{duration:7.2f}s] [session] "
+                f"ended — {self._turn_count} turns, "
+                f"rx={self._plivo_rx_bytes} bytes, tx={self._plivo_tx_chunks} chunks"
+            )
+
+    async def _run_streaming_tasks(self) -> None:
+        """Run the concurrent streaming tasks."""
+        tasks = [
+            asyncio.create_task(self._receive_from_plivo(), name="plivo_rx"),
+            asyncio.create_task(self._send_to_plivo(), name="plivo_tx"),
+        ]
+
+        try:
+            done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                if task.exception():
+                    self._loge("session", f"task {task.get_name()} failed: {task.exception()}")
+        finally:
+            self._running = False
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+    async def _receive_from_plivo(self) -> None:
+        """Receive audio from Plivo, stream to Deepgram, run smart-turn detection."""
+        SILENCE_TIMEOUT_S = 8.0  # re-engage after this much silence
+        media_count = 0
+        self._last_activity = time.monotonic()
+        try:
+            while self._running:
+                data = await self.websocket.receive_text()
+                message = json.loads(data)
+                event = message.get("event")
+
+                if event == "media":
+                    payload = message.get("media", {}).get("payload", "")
+                    if payload:
+                        mulaw_audio = base64.b64decode(payload)
+                        self._plivo_rx_bytes += len(mulaw_audio)
+                        media_count += 1
+
+                        if media_count == 1:
+                            self._log("plivo_rx", "first audio packet received")
+                        if media_count % 500 == 0:
+                            self._logv(
+                                "plivo_rx",
+                                f"{media_count} packets",
+                            )
+
+                        # Forward to Deepgram (continuous streaming)
+                        pcm_audio = plivo_to_deepgram(mulaw_audio)
+                        await self._deepgram.send_audio(pcm_audio)
+
+                        # Run VAD + accumulate for smart-turn
+                        vad_audio = plivo_to_vad(mulaw_audio)
+                        speech_started, speech_ended = self._smart_turn.process_audio(vad_audio)
+
+                        # Barge-in: cancel any in-flight work and stop playback.
+                        # Always send clearAudio — Plivo may still be playing
+                        # from its internal buffer even after our queue is empty.
+                        if speech_started:
+                            self._last_activity = time.monotonic()
+                            self._log("vad", "speech START detected")
+                            interrupted = False
+                            # Cancel in-flight turn task (LLM + reasoning + TTS)
+                            if self._current_turn_task and not self._current_turn_task.done():
+                                self._current_turn_task.cancel()
+                                self._log("vad", "cancelled in-flight turn task")
+                                interrupted = True
+                            if self._current_tts_task and not self._current_tts_task.done():
+                                self._current_tts_task.cancel()
+                                interrupted = True
+                            cleared = 0
+                            while not self._send_queue.empty():
+                                try:
+                                    self._send_queue.get_nowait()
+                                    cleared += 1
+                                except asyncio.QueueEmpty:
+                                    break
+                            # Always stop Plivo playback — audio may be buffered
+                            clear_event = {"event": "clearAudio"}
+                            if self._stream_id:
+                                clear_event["streamId"] = self._stream_id
+                            await self.websocket.send_text(json.dumps(clear_event))
+                            self._log(
+                                "vad",
+                                f"barge-in: clearAudio sent, cancelled={interrupted}, "
+                                f"cleared={cleared} chunks",
+                            )
+                            # Clear transcript when agent was still playing —
+                            # audio contains echo from agent's own TTS output.
+                            if interrupted or cleared > 0 or self._is_playing:
+                                self._deepgram.clear_transcript()
+                            self._is_playing = False
+
+                        # Silence timeout: if no speech for too long and no
+                        # active turn/playback, nudge the caller
+                        idle = time.monotonic() - self._last_activity
+                        if (
+                            idle > SILENCE_TIMEOUT_S
+                            and not self._is_playing
+                            and (
+                                not self._current_turn_task
+                                or self._current_turn_task.done()
+                            )
+                        ):
+                            self._last_activity = time.monotonic()
+                            self._log("session", f"silence timeout ({idle:.1f}s) — nudging caller")
+                            self._turn_count += 1
+                            self._turn_id = uuid.uuid4().hex[:8]
+                            self._current_turn_task = asyncio.create_task(
+                                self._process_text_turn(
+                                    "[silence — the caller has not spoken for a while. "
+                                    "Gently check if they are still there.]"
+                                ),
+                                name=f"silence_nudge_{self._turn_count}",
+                            )
+
+                        # Turn detection: when VAD detects silence after speech
+                        if speech_ended:
+                            self._last_activity = time.monotonic()
+                            self._log("vad", "speech END — running smart-turn analysis")
+                            turn_complete = await self._smart_turn.analyze_turn()
+                            if turn_complete:
+                                # Wait for Deepgram to finish processing — avoids
+                                # harvesting an incomplete transcript. 1s timeout
+                                # ensures we don't block indefinitely; partial
+                                # transcript is still usable on timeout.
+                                dg_ready = await self._deepgram.wait_for_utterance(
+                                    timeout=1.0,
+                                )
+                                if not dg_ready:
+                                    self._logv(
+                                        "smart_turn",
+                                        "Deepgram utterance not finalized, "
+                                        "using partial transcript",
+                                    )
+                                transcript = self._deepgram.latest_transcript
+                                if transcript.strip():
+                                    self._turn_count += 1
+                                    self._turn_id = uuid.uuid4().hex[:8]
+                                    self._log(
+                                        "smart_turn",
+                                        f"turn {self._turn_count} complete: '{transcript[:80]}'",
+                                    )
+                                    self._current_turn_task = asyncio.create_task(
+                                        self._process_text_turn(transcript),
+                                        name=f"turn_{self._turn_count}",
+                                    )
+                                    self._current_turn_task.add_done_callback(
+                                        lambda t: t.exception() if not t.cancelled() else None
+                                    )
+                                else:
+                                    self._logv("smart_turn", "complete but empty transcript")
+                                self._smart_turn.reset()
+                                self._deepgram.clear_transcript()
+                            else:
+                                self._log("smart_turn", "incomplete turn, waiting for more speech")
+
+                elif event == "playedStream":
+                    # Plivo confirms all audio before checkpoint has been played
+                    name = message.get("name", "")
+                    self._is_playing = False
+                    self._last_activity = time.monotonic()
+                    self._log("plivo_rx", f"playedStream: '{name}' — playback complete")
+
+                elif event == "clearedAudio":
+                    self._is_playing = False
+                    self._logv("plivo_rx", "clearedAudio confirmed by Plivo")
+
+                elif event == "stop":
+                    self._log("plivo_rx", "received stop event — call ended")
+                    break
+
+        except Exception as e:
+            if "1000" not in str(e):
+                self._loge("plivo_rx", f"ERROR: {e}")
+        finally:
+            self._logv("plivo_rx", f"exiting — received {media_count} media packets")
+
+    async def _process_text_turn(self, text: str) -> None:
+        """Process a text-based turn: LLM → TTS (serialized via turn lock)."""
+        async with self._turn_lock:
+            try:
+                response_text = await self._generate_llm_response(text)
+                if not response_text.strip():
+                    self._logv("turn", "empty LLM response, skipping TTS")
+                    return
+
+                self._is_playing = True
+                self._current_tts_task = asyncio.create_task(
+                    self._synthesize_with_elevenlabs(response_text),
+                    name="tts_synthesis",
+                )
+                await self._current_tts_task
+                # Send checkpoint so Plivo notifies us when playback finishes
+                await self._send_checkpoint()
+                self._log("turn", "TTS done, audio queued for playback")
+
+            except asyncio.CancelledError:
+                self._is_playing = False
+                self._log("turn", "turn cancelled (barge-in)")
+            except Exception as e:
+                self._is_playing = False
+                self._loge("turn", f"text turn ERROR: {e}")
+            finally:
+                self._turn_id = ""
+
+    async def _send_checkpoint(self) -> None:
+        """Send a Plivo checkpoint event after queued audio.
+
+        Plivo responds with playedStream when all audio before the checkpoint
+        has been played to the caller. We use this to track _is_playing state.
+        """
+        if not self._stream_id:
+            return
+        self._checkpoint_counter += 1
+        name = f"turn_{self._turn_count}_{self._checkpoint_counter}"
+        checkpoint = {
+            "event": "checkpoint",
+            "streamId": self._stream_id,
+            "name": name,
+        }
+        await self.websocket.send_text(json.dumps(checkpoint))
+        self._logv("plivo_tx", f"checkpoint sent: {name}")
+
+    async def _send_to_plivo(self) -> None:
+        """Send queued audio to Plivo WebSocket in 20ms chunks."""
+        PLIVO_CHUNK_SIZE = 160
+        audio_buffer = bytearray()
+
+        try:
+            while self._running:
+                try:
+                    audio = await asyncio.wait_for(self._send_queue.get(), timeout=0.1)
+                    audio_buffer.extend(audio)
+
+                    while len(audio_buffer) >= PLIVO_CHUNK_SIZE:
+                        chunk = bytes(audio_buffer[:PLIVO_CHUNK_SIZE])
+                        audio_buffer = audio_buffer[PLIVO_CHUNK_SIZE:]
+
+                        message = {
+                            "event": "playAudio",
+                            "media": {
+                                "contentType": "audio/x-mulaw",
+                                "sampleRate": 8000,
+                                "payload": base64.b64encode(chunk).decode("utf-8"),
+                            },
+                        }
+                        await self.websocket.send_text(json.dumps(message))
+                        self._plivo_tx_chunks += 1
+                        if self._plivo_tx_chunks == 1:
+                            self._log("plivo_tx", "first audio chunk sent to Plivo")
+                        if self._plivo_tx_chunks % 500 == 0:
+                            q = self._send_queue.qsize()
+                            self._logv(
+                                "plivo_tx",
+                                f"{self._plivo_tx_chunks} chunks sent, queue={q}",
+                            )
+
+                except TimeoutError:
+                    continue
+
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._logv("plivo_tx", f"exiting — total {self._plivo_tx_chunks} chunks sent")
+
+
+# =============================================================================
+# Public API
+# =============================================================================
+
+
+async def run_agent(
+    websocket: WebSocket,
+    call_id: str,
+    from_number: str = "",
+    to_number: str = "",
+    system_prompt: str | None = None,
+    initial_message: str = "Hello, I'm calling for help.",
+    stream_id: str = "",
+) -> None:
+    """Run a voice agent session for an incoming call."""
+    agent = VoiceAgent(
+        websocket=websocket,
+        call_id=call_id,
+        from_number=from_number,
+        to_number=to_number,
+        system_prompt=system_prompt,
+        initial_message=initial_message,
+        stream_id=stream_id,
+    )
+    await agent.run()
