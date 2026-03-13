@@ -443,5 +443,37 @@ class TestPlivoIntegration:
             pytest.fail(f"Phone number {PLIVO_PHONE_NUMBER} not found")
 
 
+# =============================================================================
+# UNIT TESTS - SarvamStreamingSTT
+# =============================================================================
+
+
+class TestUnitSarvamStreamingSTT:
+    """Unit tests for SarvamStreamingSTT message parsing."""
+
+    @pytest.mark.asyncio
+    async def test_transcript_accumulation(self):
+        """Verify transcript parts accumulate correctly."""
+        from inbound.agent import SarvamStreamingSTT
+
+        stt = SarvamStreamingSTT()
+        # Simulate transcript parts (without connecting)
+        stt._transcript_parts.append("Hello")
+        stt._transcript_parts.append("how are you")
+        assert stt.latest_transcript == "Hello how are you"
+
+    @pytest.mark.asyncio
+    async def test_clear_transcript(self):
+        """Verify clear resets state."""
+        from inbound.agent import SarvamStreamingSTT
+
+        stt = SarvamStreamingSTT()
+        stt._transcript_parts.append("test")
+        stt._utterance_complete.set()
+        stt.clear_transcript()
+        assert stt.latest_transcript == ""
+        assert not stt._utterance_complete.is_set()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])
