@@ -87,7 +87,8 @@ class SarvamStreamingSTT:
 
     Streams audio continuously at 8kHz PCM and maintains the latest
     final transcript. Uses Sarvam's data events to accumulate transcript
-    parts.
+    parts. Supports an optional on_transcript callback for event-driven
+    turn processing.
     """
 
     def __init__(self):
@@ -96,7 +97,7 @@ class SarvamStreamingSTT:
         self._running = False
         self._receive_task: asyncio.Task | None = None
         self._transcript_parts: list[str] = []
-        self._utterance_complete = asyncio.Event()
+        self.on_transcript: asyncio.Queue[str] | None = None
 
     @property
     def latest_transcript(self) -> str:
@@ -106,18 +107,6 @@ class SarvamStreamingSTT:
     def clear_transcript(self) -> None:
         """Clear the transcript buffer for a new turn."""
         self._transcript_parts.clear()
-        self._utterance_complete.clear()
-
-    async def wait_for_utterance(self, timeout: float = 1.0) -> bool:
-        """Wait for a transcript to be available.
-
-        Returns True if transcript arrived within timeout, False otherwise.
-        """
-        try:
-            await asyncio.wait_for(self._utterance_complete.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            return False
 
     async def connect(self) -> None:
         """Connect to Sarvam streaming WebSocket."""
@@ -149,8 +138,9 @@ class SarvamStreamingSTT:
                         transcript = data.get("data", {}).get("transcript", "")
                         if transcript.strip():
                             self._transcript_parts.append(transcript)
-                            self._utterance_complete.set()
                             logger.debug(f"Sarvam STT: '{transcript}'")
+                            if self.on_transcript is not None:
+                                self.on_transcript.put_nowait(transcript)
                     elif msg_type == "error":
                         logger.error(f"Sarvam STT error: {data}")
                 elif msg.type == aiohttp.WSMsgType.ERROR:
@@ -167,7 +157,7 @@ class SarvamStreamingSTT:
                 "audio": {
                     "data": base64.b64encode(pcm_8k).decode(),
                     "sample_rate": "8000",
-                    "encoding": "pcm_s16le",
+                    "encoding": "audio/wav",
                 }
             })
             await self._ws.send_str(payload)
@@ -458,6 +448,7 @@ class VoiceAgent:
         to_number: str = "",
         system_prompt: str | None = None,
         initial_message: str = "Hello, I'm calling for help.",
+        stream_id: str = "",
     ):
         self.websocket = websocket
         self.call_id = call_id
@@ -469,12 +460,18 @@ class VoiceAgent:
         self._running = False
         self._send_queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._vad = SileroVADProcessor()
-        self._is_responding = False
+        self._is_playing = False  # True while Plivo is playing audio to caller
+        self._barged_in = False  # True after first speech_started until speech_ended
+        self._speech_ended_pending = False  # VAD ended but no transcript yet
         self._stt = SarvamStreamingSTT()
+        self._transcript_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._stt.on_transcript = self._transcript_queue
         self._turn_lock = asyncio.Lock()
         self._conversation_history: list[dict[str, str]] = []
         self._current_tts_task: asyncio.Task | None = None
         self._current_turn_task: asyncio.Task | None = None
+        self._stream_id = stream_id  # Plivo stream ID for checkpoint events
+        self._checkpoint_counter = 0
         self._turn_count = 0
         self._barge_in_count = 0
         self._error_count = 0
@@ -795,11 +792,11 @@ class VoiceAgent:
                 chunk_count = 0
                 total_bytes = 0
                 async for chunk in response.aiter_bytes(chunk_size=4800):
-                    if not self._running or not self._is_responding:
+                    if not self._running or not self._is_playing:
                         self._log(
                             "tts",
                             f"interrupted after {chunk_count} chunks "
-                            f"(running={self._running}, responding={self._is_responding})",
+                            f"(running={self._running}, responding={self._is_playing})",
                         )
                         break
                     if first_chunk_time is None:
@@ -871,9 +868,9 @@ You can use the caller's phone number for SMS or callbacks without asking."""
             self._log("turn", f"turn {self._turn_count}: generating greeting")
             greeting = await self._generate_llm_response(self.initial_message)
             if greeting:
-                self._is_responding = True
+                self._is_playing = True
                 await self._synthesize_with_elevenlabs(greeting)
-                self._is_responding = False
+                await self._send_checkpoint()
                 self._log("turn", f"turn {self._turn_count}: greeting queued for playback")
         except Exception as e:
             self._loge("session", f"greeting ERROR: {e}")
@@ -918,6 +915,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
         tasks = [
             asyncio.create_task(self._receive_from_plivo(), name="plivo_rx"),
             asyncio.create_task(self._send_to_plivo(), name="plivo_tx"),
+            asyncio.create_task(self._watch_transcripts(), name="stt_watch"),
         ]
 
         try:
@@ -954,24 +952,37 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                         if media_count % 500 == 0:
                             self._logv("plivo_rx", f"{media_count} packets")
 
-                        # Forward to Sarvam streaming STT
+                        # Always forward audio to Sarvam STT — even
+                        # during playback. Echo gets transcribed but is
+                        # cleared on barge-in (clear_transcript). This
+                        # ensures STT has processed user speech by the
+                        # time speech_ended fires.
                         pcm_8k = plivo_to_sarvam_streaming(mulaw_audio)
                         await self._stt.send_audio(pcm_8k)
 
-                        # Run VAD
+                        # VAD always runs — barge-in must work during
+                        # playback. Echo triggers speech_started which
+                        # stops playback; the empty STT transcript (no
+                        # echo was sent to STT) causes the turn to be
+                        # skipped. Real user speech after barge-in gets
+                        # sent to STT and produces a real transcript.
                         vad_audio = plivo_to_vad(mulaw_audio)
-                        speech_started, speech_ended = self._vad.process(vad_audio)
+                        speech_started, speech_ended = self._vad.process(
+                            vad_audio
+                        )
 
-                        if speech_started:
+                        if speech_started and not self._barged_in:
+                            self._barged_in = True
                             self._log("vad", "speech START detected")
-                            # Cancel any in-flight turn task
                             interrupted = False
                             if (
                                 self._current_turn_task
                                 and not self._current_turn_task.done()
                             ):
                                 self._current_turn_task.cancel()
-                                self._log("vad", "cancelled in-flight turn task")
+                                self._log(
+                                    "vad", "cancelled in-flight turn task"
+                                )
                                 interrupted = True
                             if (
                                 self._current_tts_task
@@ -979,7 +990,6 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                             ):
                                 self._current_tts_task.cancel()
                                 interrupted = True
-                            # Clear send queue
                             cleared = 0
                             while not self._send_queue.empty():
                                 try:
@@ -987,45 +997,53 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                                     cleared += 1
                                 except asyncio.QueueEmpty:
                                     break
-                            # Always send clearAudio to stop Plivo playback
+                            clear_event = {"event": "clearAudio"}
+                            if self._stream_id:
+                                clear_event["streamId"] = self._stream_id
                             await self.websocket.send_text(
-                                json.dumps({"event": "clearAudio"})
+                                json.dumps(clear_event)
                             )
                             self._log(
                                 "vad",
-                                f"barge-in: clearAudio sent, cancelled={interrupted}, "
+                                f"barge-in: clearAudio sent, "
+                                f"cancelled={interrupted}, "
                                 f"cleared={cleared} chunks",
                             )
-                            if interrupted or cleared > 0 or self._is_responding:
-                                self._stt.clear_transcript()
-                            self._is_responding = False
+                            self._stt.clear_transcript()
+                            self._is_playing = False
                             self._barge_in_count += 1
 
                         if speech_ended:
                             self._speech_end_time = time.monotonic()
-                            self._log("vad", "speech END — harvesting transcript")
-                            # Wait briefly for Sarvam to finalize
-                            await self._stt.wait_for_utterance(timeout=1.0)
                             transcript = self._stt.latest_transcript
                             if transcript.strip():
-                                self._turn_count += 1
+                                # STT already delivered — process now
                                 self._log(
-                                    "turn",
-                                    f"turn {self._turn_count}: '{transcript[:80]}'",
+                                    "vad",
+                                    "speech END — transcript ready",
                                 )
-                                self._current_turn_task = asyncio.create_task(
-                                    self._process_text_turn(transcript),
-                                    name=f"turn_{self._turn_count}",
-                                )
-                                self._current_turn_task.add_done_callback(
-                                    lambda t: t.exception()
-                                    if not t.cancelled()
-                                    else None
-                                )
+                                self._commit_turn(transcript)
                             else:
-                                self._logv("turn", "empty transcript, skipping")
-                            self._stt.clear_transcript()
+                                # STT hasn't delivered yet — flag it.
+                                # _watch_transcripts will trigger when
+                                # Sarvam delivers.
+                                self._speech_ended_pending = True
+                                self._log(
+                                    "vad",
+                                    "speech END — waiting for STT",
+                                )
                             self._vad.reset()
+                            self._barged_in = False
+
+                elif event == "playedStream":
+                    # Plivo confirms all audio before checkpoint has played
+                    name = message.get("name", "")
+                    self._is_playing = False
+                    self._log("plivo_rx", f"playedStream: '{name}' — playback complete")
+
+                elif event == "clearedAudio":
+                    self._is_playing = False
+                    self._logv("plivo_rx", "clearedAudio confirmed by Plivo")
 
                 elif event == "text":
                     text = message.get("text", "")
@@ -1053,6 +1071,48 @@ You can use the caller's phone number for SMS or callbacks without asking."""
         finally:
             self._logv("plivo_rx", f"exiting — received {media_count} media packets")
 
+    def _commit_turn(self, transcript: str) -> None:
+        """Commit a turn for processing — creates the turn task."""
+        self._turn_count += 1
+        self._log("turn", f"turn {self._turn_count}: '{transcript[:80]}'")
+        self._current_turn_task = asyncio.create_task(
+            self._process_text_turn(transcript),
+            name=f"turn_{self._turn_count}",
+        )
+        self._current_turn_task.add_done_callback(
+            lambda t: t.exception() if not t.cancelled() else None
+        )
+        self._stt.clear_transcript()
+        self._speech_ended_pending = False
+
+    async def _watch_transcripts(self) -> None:
+        """Watch for STT transcripts that arrive after speech_ended.
+
+        Convergence gate: if VAD fired speech_ended but STT hadn't
+        delivered yet, this task picks up the transcript when it arrives
+        and commits the turn.
+        """
+        try:
+            while self._running:
+                try:
+                    await asyncio.wait_for(
+                        self._transcript_queue.get(), timeout=0.2
+                    )
+                except TimeoutError:
+                    continue
+                # Transcript arrived — check if VAD is waiting
+                if self._speech_ended_pending:
+                    transcript = self._stt.latest_transcript
+                    if transcript.strip():
+                        self._log(
+                            "stt",
+                            "transcript arrived after speech_ended — "
+                            "committing turn",
+                        )
+                        self._commit_turn(transcript)
+        except asyncio.CancelledError:
+            pass
+
     async def _process_text_turn(self, text: str) -> None:
         """Process a text-based turn: LLM → TTS."""
         async with self._turn_lock:
@@ -1062,20 +1122,40 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                     self._logv("turn", "empty LLM response, skipping TTS")
                     return
 
-                self._is_responding = True
+                self._is_playing = True
                 self._current_tts_task = asyncio.create_task(
                     self._synthesize_with_elevenlabs(response_text),
                     name="tts_synthesis",
                 )
                 await self._current_tts_task
-                self._is_responding = False
+                # Send checkpoint so Plivo notifies us when playback finishes
+                await self._send_checkpoint()
+                self._log("turn", "TTS done, audio queued for playback")
 
             except asyncio.CancelledError:
-                self._is_responding = False
-                self._log("turn", "TTS cancelled (barge-in)")
+                self._is_playing = False
+                self._log("turn", "turn cancelled (barge-in)")
             except Exception as e:
-                self._is_responding = False
+                self._is_playing = False
                 self._loge("turn", f"text turn ERROR: {e}")
+
+    async def _send_checkpoint(self) -> None:
+        """Send a Plivo checkpoint event after queued audio.
+
+        Plivo responds with playedStream when all audio before the checkpoint
+        has been played to the caller. We use this to track _is_playing state.
+        """
+        if not self._stream_id:
+            return
+        self._checkpoint_counter += 1
+        name = f"turn_{self._turn_count}_{self._checkpoint_counter}"
+        checkpoint = {
+            "event": "checkpoint",
+            "streamId": self._stream_id,
+            "name": name,
+        }
+        await self.websocket.send_text(json.dumps(checkpoint))
+        self._logv("plivo_tx", f"checkpoint sent: {name}")
 
     async def _send_to_plivo(self) -> None:
         """Send queued audio to Plivo WebSocket in 20ms chunks."""
@@ -1137,6 +1217,7 @@ async def run_agent(
     to_number: str = "",
     system_prompt: str | None = None,
     initial_message: str = "Hello, I'm calling for help.",
+    stream_id: str = "",
 ) -> None:
     """Run a voice agent session for an outbound call."""
     agent = VoiceAgent(
@@ -1146,5 +1227,6 @@ async def run_agent(
         to_number=to_number,
         system_prompt=system_prompt,
         initial_message=initial_message,
+        stream_id=stream_id,
     )
     await agent.run()
