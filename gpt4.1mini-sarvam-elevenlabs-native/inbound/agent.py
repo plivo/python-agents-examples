@@ -282,13 +282,17 @@ class VoiceAgent:
         system_prompt: str | None = None,
         initial_message: str = "Hello, I'm calling for help.",
         stream_id: str = "",
+        parent_call_id: str = "",
+        sip_headers: dict[str, str] | None = None,
     ):
         self.websocket = websocket
         self.call_id = call_id
+        self.parent_call_id = parent_call_id or call_id
         self.from_number = from_number
         self.to_number = to_number
         self.system_prompt = system_prompt or SYSTEM_PROMPT
         self.initial_message = initial_message
+        self.sip_headers = sip_headers or {}
 
         self._running = False
         self._send_queue: asyncio.Queue[bytes] = asyncio.Queue()
@@ -305,6 +309,7 @@ class VoiceAgent:
         self._current_turn_task: asyncio.Task | None = None
         self._stream_id = stream_id  # Plivo stream ID for checkpoint events
         self._checkpoint_counter = 0
+        self._checkpoint_sent_time: float | None = None
         self._turn_count = 0
         self._barge_in_count = 0
         self._error_count = 0
@@ -313,6 +318,15 @@ class VoiceAgent:
         self._plivo_tx_chunks = 0
         self._speech_end_time: float | None = None
         self._ttfs_samples: list[float] = []
+
+        # Per-turn metrics (reset at start of each _process_text_turn)
+        self._turn_llm_ms: float | None = None
+        self._turn_tts_total_ms: float | None = None
+        self._turn_tts_ttfb_ms: float | None = None
+        self._turn_tts_chunks: int = 0
+        self._turn_tts_audio_s: float = 0.0
+        self._turn_text: str = ""
+        self._turn_start_time: float | None = None
 
     # — Structured logging with call ID, elapsed time, and pipeline stage —
 
@@ -340,6 +354,29 @@ class VoiceAgent:
         elapsed = round(time.monotonic() - self._session_start, 2)
         logger.bind(call_id=self.call_id[:8], elapsed_s=elapsed, stage=stage).error(
             f"[{self.call_id[:8]}] [{elapsed:7.2f}s] [{stage}] {msg}"
+        )
+
+    def _emit_turn_complete(self, barge_in: bool = False) -> None:
+        """Emit a structured turn_complete event with per-turn metrics."""
+        playback_ms = None
+        if self._checkpoint_sent_time is not None:
+            playback_ms = round((time.monotonic() - self._checkpoint_sent_time) * 1000)
+            self._checkpoint_sent_time = None
+        logger.bind(
+            event="turn_complete",
+            call_id=self.parent_call_id,
+            turn=self._turn_count,
+            user_text=self._turn_text[:80] if self._turn_text else "",
+            llm_ms=self._turn_llm_ms,
+            tts_total_ms=self._turn_tts_total_ms,
+            tts_ttfb_ms=self._turn_tts_ttfb_ms,
+            tts_chunks=self._turn_tts_chunks,
+            tts_audio_duration_s=self._turn_tts_audio_s,
+            playback_ms=playback_ms,
+            barge_in=barge_in,
+        ).info(
+            f"[{self.call_id[:8]}] turn {self._turn_count} complete"
+            f"{' (barge-in)' if barge_in else ''}"
         )
 
     def _build_tools(self) -> list[dict[str, Any]]:
@@ -521,6 +558,7 @@ class VoiceAgent:
             choice = result["choices"][0]
             message = choice["message"]
             latency = (time.monotonic() - t0) * 1000
+            self._turn_llm_ms = round(latency)
             tokens = result.get("usage", {})
 
             if _otel_trace:
@@ -574,6 +612,7 @@ class VoiceAgent:
                     result = response.json()
                     message = result["choices"][0]["message"]
                     latency2 = (time.monotonic() - t1) * 1000
+                    self._turn_llm_ms = round(latency + latency2)
                     self._logv("llm", f"follow-up response ({latency2:.0f}ms)")
 
             assistant_text = message.get("content", "")
@@ -588,6 +627,7 @@ class VoiceAgent:
 
         except Exception as e:
             latency = (time.monotonic() - t0) * 1000
+            self._turn_llm_ms = round(latency)
             self._loge("llm", f"ERROR ({latency:.0f}ms): {e}")
             return "I'm sorry, I'm having trouble processing that right now. Could you repeat that?"
 
@@ -651,6 +691,14 @@ class VoiceAgent:
                     f"done: {chunk_count} chunks, "
                     f"{ttfb_str}{audio_duration:.1f}s audio in {total_time:.0f}ms",
                 )
+
+                # Store per-turn TTS metrics
+                self._turn_tts_total_ms = round(total_time)
+                self._turn_tts_chunks = chunk_count
+                self._turn_tts_audio_s = round(audio_duration, 2)
+                if first_chunk_time is not None:
+                    self._turn_tts_ttfb_ms = round((first_chunk_time - t0) * 1000)
+
                 if _otel_trace:
                     span = _otel_trace.get_current_span()
                     span.set_attribute("tts.total_ms", total_time)
@@ -692,6 +740,17 @@ You can use the caller's phone number for SMS or callbacks without asking."""
             f"[{self.call_id[:8]}] [  0.00s] [session] "
             f"started (from={self.from_number}, to={self.to_number}, log={LOG_LEVEL})"
         )
+        logger.bind(
+            event="call_answered",
+            call_id=self.parent_call_id,
+            leg_call_id=self.call_id,
+            from_number=self.from_number,
+            to_number=self.to_number,
+            sip_headers=self.sip_headers,
+        ).info(
+            f"[{self.call_id[:8]}] [  0.00s] [session] "
+            f"call answered (sip_headers={self.sip_headers})"
+        )
 
         await self._stt.connect()
 
@@ -726,7 +785,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
             # Session end always logs (even in quiet mode)
             logger.bind(
                 event="call_summary",
-                call_id=self.call_id,
+                call_id=self.parent_call_id,
                 duration_s=duration,
                 turns=self._turn_count,
                 barge_ins=self._barge_in_count,
@@ -845,6 +904,8 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                             self._stt.clear_transcript()
                             self._is_playing = False
                             self._barge_in_count += 1
+                            if interrupted:
+                                self._emit_turn_complete(barge_in=True)
 
                         if speech_ended:
                             self._speech_end_time = time.monotonic()
@@ -872,7 +933,16 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                     # Plivo confirms all audio before checkpoint has played
                     name = message.get("name", "")
                     self._is_playing = False
-                    self._log("plivo_rx", f"playedStream: '{name}' — playback complete")
+                    playback_ms = None
+                    if self._checkpoint_sent_time is not None:
+                        playback_ms = round(
+                            (time.monotonic() - self._checkpoint_sent_time) * 1000
+                        )
+                    self._log(
+                        "plivo_rx",
+                        f"playedStream: '{name}' — playback complete ({playback_ms}ms)",
+                    )
+                    self._emit_turn_complete(barge_in=False)
 
                 elif event == "clearedAudio":
                     self._is_playing = False
@@ -949,6 +1019,14 @@ You can use the caller's phone number for SMS or callbacks without asking."""
     async def _process_text_turn(self, text: str) -> None:
         """Process a text-based turn: LLM → TTS."""
         async with self._turn_lock:
+            # Reset per-turn metrics
+            self._turn_llm_ms = None
+            self._turn_tts_total_ms = None
+            self._turn_tts_ttfb_ms = None
+            self._turn_tts_chunks = 0
+            self._turn_tts_audio_s = 0.0
+            self._turn_text = text
+            self._turn_start_time = time.monotonic()
             try:
                 response_text = await self._generate_llm_response(text)
                 if not response_text.strip():
@@ -988,6 +1066,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
             "name": name,
         }
         await self.websocket.send_text(json.dumps(checkpoint))
+        self._checkpoint_sent_time = time.monotonic()
         self._logv("plivo_tx", f"checkpoint sent: {name}")
 
     async def _send_to_plivo(self) -> None:
@@ -1051,6 +1130,8 @@ async def run_agent(
     system_prompt: str | None = None,
     initial_message: str = "Hello, I'm calling for help.",
     stream_id: str = "",
+    parent_call_id: str = "",
+    sip_headers: dict[str, str] | None = None,
 ) -> None:
     """Run a voice agent session for an incoming call."""
     agent = VoiceAgent(
@@ -1061,5 +1142,7 @@ async def run_agent(
         system_prompt=system_prompt,
         initial_message=initial_message,
         stream_id=stream_id,
+        parent_call_id=parent_call_id,
+        sip_headers=sip_headers,
     )
     await agent.run()

@@ -237,6 +237,8 @@ async def outbound_answer_webhook(
     from_number = From
     to_number = To
 
+    parent_call_uuid = ""
+    sip_headers = {}
     if request.method == "POST":
         try:
             form_data = await request.form()
@@ -244,6 +246,10 @@ async def outbound_answer_webhook(
             call_uuid = call_uuid or str(form_data.get("CallUUID", ""))
             from_number = from_number or str(form_data.get("From", ""))
             to_number = to_number or str(form_data.get("To", ""))
+            parent_call_uuid = str(form_data.get("ParentCallUUID", ""))
+            for key in form_data:
+                if key.startswith("SIP-") or key.startswith("sip-"):
+                    sip_headers[key] = str(form_data.get(key, ""))
         except Exception:
             pass
 
@@ -263,6 +269,8 @@ async def outbound_answer_webhook(
         "to": to_number,
         "is_outbound": True,
         "call_id": call_id,
+        "parent_call_uuid": parent_call_uuid,
+        "sip_headers": sip_headers,
     }
     body_b64 = base64.b64encode(json.dumps(body_data).encode()).decode()
 
@@ -447,6 +455,9 @@ async def websocket_endpoint(
             to_number=call_data.get("to", ""),
             system_prompt=system_prompt,
             initial_message=initial_message,
+            stream_id=stream_id or "",
+            parent_call_id=call_data.get("parent_call_uuid", ""),
+            sip_headers=call_data.get("sip_headers", {}),
         )
 
     except WebSocketDisconnect:
