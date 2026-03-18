@@ -104,6 +104,20 @@ class TestUnitAudioConversion:
             assert normalized_corr > 0.9, "Audio quality degraded too much"
 
 
+    def test_plivo_to_sarvam_streaming_no_resample(self):
+        """plivo_to_sarvam_streaming converts μ-law 8kHz to PCM16 8kHz (no resample)."""
+        from utils import plivo_to_sarvam_streaming, ulaw_to_pcm
+
+        # 160 bytes μ-law = 20ms at 8kHz (one Plivo packet)
+        mulaw_data = b"\xff" * 160
+        result = plivo_to_sarvam_streaming(mulaw_data)
+
+        # Should be PCM16 at 8kHz — same number of samples, 2 bytes each
+        assert len(result) == 320  # 160 samples * 2 bytes
+        # Should match raw ulaw_to_pcm (no resampling)
+        assert result == ulaw_to_pcm(mulaw_data)
+
+
 class TestUnitPhoneNormalization:
     """Unit tests for phone number normalization."""
 
@@ -427,6 +441,36 @@ class TestPlivoIntegration:
             assert number is not None
         except plivo.exceptions.ResourceNotFoundError:
             pytest.fail(f"Phone number {PLIVO_PHONE_NUMBER} not found")
+
+
+# =============================================================================
+# UNIT TESTS - SarvamStreamingSTT
+# =============================================================================
+
+
+class TestUnitSarvamStreamingSTT:
+    """Unit tests for SarvamStreamingSTT message parsing."""
+
+    @pytest.mark.asyncio
+    async def test_transcript_accumulation(self):
+        """Verify transcript parts accumulate correctly."""
+        from inbound.agent import SarvamStreamingSTT
+
+        stt = SarvamStreamingSTT()
+        # Simulate transcript parts (without connecting)
+        stt._transcript_parts.append("Hello")
+        stt._transcript_parts.append("how are you")
+        assert stt.latest_transcript == "Hello how are you"
+
+    @pytest.mark.asyncio
+    async def test_clear_transcript(self):
+        """Verify clear resets state."""
+        from inbound.agent import SarvamStreamingSTT
+
+        stt = SarvamStreamingSTT()
+        stt._transcript_parts.append("test")
+        stt.clear_transcript()
+        assert stt.latest_transcript == ""
 
 
 if __name__ == "__main__":

@@ -35,7 +35,7 @@ VAD_SAMPLE_RATE = 16000  # Silero VAD operates at 16kHz
 VAD_CHUNK_SAMPLES = 512  # 32ms at 16kHz (Silero expects 512 samples at 16kHz)
 VAD_START_THRESHOLD = 0.5  # Speech probability to trigger speech start
 VAD_END_THRESHOLD = 0.35  # Speech probability below this to consider silence
-VAD_MIN_SILENCE_MS = 300  # Minimum silence duration (ms) to trigger speech end
+VAD_MIN_SILENCE_MS = 500  # Minimum silence duration (ms) to trigger speech end
 VAD_PRE_SPEECH_PAD_MS = 150  # Audio to keep before speech start for context
 
 # =============================================================================
@@ -367,6 +367,15 @@ def plivo_to_sarvam(mulaw_8k: bytes) -> bytes:
     """Convert Plivo audio (μ-law 8kHz) to Sarvam format (PCM16 16kHz)."""
     pcm_8k = ulaw_to_pcm(mulaw_8k)
     return resample_audio(pcm_8k, PLIVO_SAMPLE_RATE, SARVAM_SAMPLE_RATE)
+
+
+def plivo_to_sarvam_streaming(mulaw_8k: bytes) -> bytes:
+    """Convert Plivo audio (μ-law 8kHz) to Sarvam streaming format (PCM16 8kHz).
+
+    Unlike plivo_to_sarvam() which resamples to 16kHz for the batch API,
+    the streaming WebSocket API accepts 8kHz directly — no resampling needed.
+    """
+    return ulaw_to_pcm(mulaw_8k)
 
 
 def elevenlabs_to_plivo(pcm_24k: bytes) -> bytes:

@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import functools
 import json
 import os
 import random
@@ -33,18 +34,146 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
 
 from utils import (
-    SARVAM_SAMPLE_RATE,
     SileroVADProcessor,
     elevenlabs_to_plivo,
-    plivo_to_sarvam,
+    plivo_to_sarvam_streaming,
     plivo_to_vad,
 )
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# OTel tracing (optional — no-op when opentelemetry is not installed)
+# ---------------------------------------------------------------------------
+try:
+    from opentelemetry import trace as _otel_trace
+
+    _tracer = _otel_trace.get_tracer("voice-agent")
+except ImportError:
+    _otel_trace = None  # type: ignore[assignment]
+    _tracer = None  # type: ignore[assignment]
+
+
+def _traced(span_name: str):
+    """Decorator that wraps an async method in an OTel span.
+
+    Creates a span with call_id, records exceptions automatically,
+    and ends the span on exit. No-op when opentelemetry is not installed.
+    Methods can call ``_otel_trace.get_current_span()`` to set domain attributes.
+    """
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        async def wrapper(self, *args, **kwargs):
+            if not _tracer:
+                return await fn(self, *args, **kwargs)
+            with _tracer.start_as_current_span(
+                span_name, attributes={"call_id": self.call_id[:8]}
+            ):
+                return await fn(self, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+class SarvamStreamingSTT:
+    """Real-time speech-to-text using Sarvam WebSocket API.
+
+    Streams audio continuously at 8kHz PCM and maintains the latest
+    final transcript. Uses Sarvam's data events to accumulate transcript
+    parts. Supports an optional on_transcript callback for event-driven
+    turn processing.
+    """
+
+    def __init__(self):
+        self._ws = None
+        self._session: aiohttp.ClientSession | None = None
+        self._running = False
+        self._receive_task: asyncio.Task | None = None
+        self._transcript_parts: list[str] = []
+        self.on_transcript: asyncio.Queue[str] | None = None
+
+    @property
+    def latest_transcript(self) -> str:
+        """Get the latest accumulated transcript."""
+        return " ".join(self._transcript_parts).strip()
+
+    def clear_transcript(self) -> None:
+        """Clear the transcript buffer for a new turn."""
+        self._transcript_parts.clear()
+
+    async def connect(self) -> None:
+        """Connect to Sarvam streaming WebSocket."""
+        self._session = aiohttp.ClientSession()
+        self._running = True
+
+        url = (
+            f"wss://api.sarvam.ai/speech-to-text/ws"
+            f"?language-code={SARVAM_STT_LANGUAGE}"
+            f"&model=saaras:v3"
+            f"&mode=transcribe"
+            f"&sample_rate=8000"
+            f"&input_audio_codec=pcm_s16le"
+        )
+
+        headers = {"Api-Subscription-Key": SARVAM_API_KEY}
+        self._ws = await self._session.ws_connect(url, headers=headers)
+        logger.info("Connected to Sarvam streaming STT")
+        self._receive_task = asyncio.create_task(self._receive_loop())
+
+    async def _receive_loop(self) -> None:
+        """Receive transcription results from Sarvam."""
+        try:
+            async for msg in self._ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    msg_type = data.get("type", "")
+                    if msg_type == "data":
+                        transcript = data.get("data", {}).get("transcript", "")
+                        if transcript.strip():
+                            self._transcript_parts.append(transcript)
+                            logger.debug(f"Sarvam STT: '{transcript}'")
+                            if self.on_transcript is not None:
+                                self.on_transcript.put_nowait(transcript)
+                    elif msg_type == "error":
+                        logger.error(f"Sarvam STT error: {data}")
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    logger.error(f"Sarvam WebSocket error: {msg.data}")
+                    break
+        except Exception as e:
+            if self._running:
+                logger.error(f"Sarvam receive error: {e}")
+
+    async def send_audio(self, pcm_8k: bytes) -> None:
+        """Send PCM16 8kHz audio to Sarvam."""
+        if self._ws and not self._ws.closed:
+            payload = json.dumps({
+                "audio": {
+                    "data": base64.b64encode(pcm_8k).decode(),
+                    "sample_rate": "8000",
+                    "encoding": "audio/wav",
+                }
+            })
+            await self._ws.send_str(payload)
+
+    async def close(self) -> None:
+        """Close the Sarvam connection."""
+        self._running = False
+        if self._receive_task and not self._receive_task.done():
+            self._receive_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._receive_task
+        if self._ws and not self._ws.closed:
+            await self._ws.close()
+        if self._session:
+            await self._session.close()
+
 
 # Agent configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -319,6 +448,7 @@ class VoiceAgent:
         to_number: str = "",
         system_prompt: str | None = None,
         initial_message: str = "Hello, I'm calling for help.",
+        stream_id: str = "",
     ):
         self.websocket = websocket
         self.call_id = call_id
@@ -330,14 +460,26 @@ class VoiceAgent:
         self._running = False
         self._send_queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._vad = SileroVADProcessor()
-        self._is_responding = False
-        self._stt_buffer = bytearray()
+        self._is_playing = False  # True while Plivo is playing audio to caller
+        self._barged_in = False  # True after first speech_started until speech_ended
+        self._speech_ended_pending = False  # VAD ended but no transcript yet
+        self._stt = SarvamStreamingSTT()
+        self._transcript_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._stt.on_transcript = self._transcript_queue
+        self._turn_lock = asyncio.Lock()
         self._conversation_history: list[dict[str, str]] = []
         self._current_tts_task: asyncio.Task | None = None
+        self._current_turn_task: asyncio.Task | None = None
+        self._stream_id = stream_id  # Plivo stream ID for checkpoint events
+        self._checkpoint_counter = 0
         self._turn_count = 0
+        self._barge_in_count = 0
+        self._error_count = 0
         self._session_start = time.monotonic()
         self._plivo_rx_bytes = 0
         self._plivo_tx_chunks = 0
+        self._speech_end_time: float | None = None
+        self._ttfs_samples: list[float] = []
 
     # — Structured logging with call ID, elapsed time, and pipeline stage —
 
@@ -345,20 +487,27 @@ class VoiceAgent:
         """Log at 'normal' level — key pipeline events."""
         if LOG_LEVEL == "quiet":
             return
-        elapsed = time.monotonic() - self._session_start
-        logger.info(f"[{self.call_id[:8]}] [{elapsed:7.2f}s] [{stage}] {msg}")
+        elapsed = round(time.monotonic() - self._session_start, 2)
+        logger.bind(call_id=self.call_id[:8], elapsed_s=elapsed, stage=stage).info(
+            f"[{self.call_id[:8]}] [{elapsed:7.2f}s] [{stage}] {msg}"
+        )
 
     def _logv(self, stage: str, msg: str) -> None:
         """Log at 'verbose' level — detailed debugging info."""
         if LOG_LEVEL != "verbose":
             return
-        elapsed = time.monotonic() - self._session_start
-        logger.debug(f"[{self.call_id[:8]}] [{elapsed:7.2f}s] [{stage}] {msg}")
+        elapsed = round(time.monotonic() - self._session_start, 2)
+        logger.bind(call_id=self.call_id[:8], elapsed_s=elapsed, stage=stage).debug(
+            f"[{self.call_id[:8]}] [{elapsed:7.2f}s] [{stage}] {msg}"
+        )
 
     def _loge(self, stage: str, msg: str) -> None:
         """Log errors — always visible regardless of LOG_LEVEL."""
-        elapsed = time.monotonic() - self._session_start
-        logger.error(f"[{self.call_id[:8]}] [{elapsed:7.2f}s] [{stage}] {msg}")
+        self._error_count += 1
+        elapsed = round(time.monotonic() - self._session_start, 2)
+        logger.bind(call_id=self.call_id[:8], elapsed_s=elapsed, stage=stage).error(
+            f"[{self.call_id[:8]}] [{elapsed:7.2f}s] [{stage}] {msg}"
+        )
 
     def _build_tools(self) -> list[dict[str, Any]]:
         """Build tool definitions for OpenAI function calling."""
@@ -503,55 +652,7 @@ class VoiceAgent:
             self._loge("tool", f"{name} ERROR: {e}")
             return {"error": str(e)}
 
-    async def _transcribe_with_sarvam(self, pcm_16k: bytes) -> str:
-        """Send accumulated audio to Sarvam STT and return transcription."""
-        import httpx
-
-        duration_ms = len(pcm_16k) / (SARVAM_SAMPLE_RATE * 2) * 1000
-        if len(pcm_16k) < 1600:  # Less than 50ms of audio
-            self._logv("stt", f"skipping — too short ({duration_ms:.0f}ms)")
-            return ""
-
-        self._log("stt", f"transcribing {duration_ms:.0f}ms of audio ({len(pcm_16k)} bytes)")
-        t0 = time.monotonic()
-
-        try:
-            import io
-            import wave
-
-            wav_buf = io.BytesIO()
-            with wave.open(wav_buf, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(SARVAM_SAMPLE_RATE)
-                wf.writeframes(pcm_16k)
-            wav_bytes = wav_buf.getvalue()
-
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.post(
-                    SARVAM_STT_URL,
-                    headers={
-                        "api-subscription-key": SARVAM_API_KEY,
-                    },
-                    files={"file": ("audio.wav", wav_bytes, "audio/wav")},
-                    data={
-                        "language_code": SARVAM_STT_LANGUAGE,
-                        "model": "saarika:v2.5",
-                        "with_timestamps": "false",
-                    },
-                )
-                response.raise_for_status()
-                result = response.json()
-                transcript = result.get("transcript", "")
-                latency = (time.monotonic() - t0) * 1000
-                self._log("stt", f"result ({latency:.0f}ms): '{transcript}'")
-                return transcript
-
-        except Exception as e:
-            latency = (time.monotonic() - t0) * 1000
-            self._loge("stt", f"ERROR ({latency:.0f}ms): {e}")
-            return ""
-
+    @_traced("llm")
     async def _generate_llm_response(self, user_text: str) -> str:
         """Send conversation to GPT-4.1 mini and return text response."""
         import httpx
@@ -588,6 +689,17 @@ class VoiceAgent:
             message = choice["message"]
             latency = (time.monotonic() - t0) * 1000
             tokens = result.get("usage", {})
+
+            if _otel_trace:
+                span = _otel_trace.get_current_span()
+                span.set_attribute("llm.latency_ms", latency)
+                span.set_attribute("gen_ai.request.model", OPENAI_MODEL)
+                span.set_attribute(
+                    "gen_ai.usage.prompt_tokens", tokens.get("prompt_tokens", 0)
+                )
+                span.set_attribute(
+                    "gen_ai.usage.completion_tokens", tokens.get("completion_tokens", 0)
+                )
 
             # Handle tool calls
             if message.get("tool_calls"):
@@ -646,6 +758,7 @@ class VoiceAgent:
             self._loge("llm", f"ERROR ({latency:.0f}ms): {e}")
             return "I'm sorry, I'm having trouble processing that right now. Could you repeat that?"
 
+    @_traced("tts")
     async def _synthesize_with_elevenlabs(self, text: str) -> None:
         """Stream text through ElevenLabs TTS and queue audio for Plivo."""
         import httpx
@@ -679,11 +792,11 @@ class VoiceAgent:
                 chunk_count = 0
                 total_bytes = 0
                 async for chunk in response.aiter_bytes(chunk_size=4800):
-                    if not self._running or not self._is_responding:
+                    if not self._running or not self._is_playing:
                         self._log(
                             "tts",
                             f"interrupted after {chunk_count} chunks "
-                            f"(running={self._running}, responding={self._is_responding})",
+                            f"(running={self._running}, responding={self._is_playing})",
                         )
                         break
                     if first_chunk_time is None:
@@ -705,6 +818,15 @@ class VoiceAgent:
                     f"done: {chunk_count} chunks, "
                     f"{ttfb_str}{audio_duration:.1f}s audio in {total_time:.0f}ms",
                 )
+                if _otel_trace:
+                    span = _otel_trace.get_current_span()
+                    span.set_attribute("tts.total_ms", total_time)
+                    span.set_attribute("tts.audio_duration_s", audio_duration)
+                    span.set_attribute("tts.chunks", chunk_count)
+                    if first_chunk_time is not None:
+                        span.set_attribute(
+                            "tts.ttfb_ms", (first_chunk_time - t0) * 1000
+                        )
 
         except Exception as e:
             latency = (time.monotonic() - t0) * 1000
@@ -738,15 +860,17 @@ You can use the caller's phone number for SMS or callbacks without asking."""
             f"started (from={self.from_number}, to={self.to_number}, log={LOG_LEVEL})"
         )
 
+        await self._stt.connect()
+
         # Generate initial greeting
         try:
             self._turn_count += 1
             self._log("turn", f"turn {self._turn_count}: generating greeting")
             greeting = await self._generate_llm_response(self.initial_message)
             if greeting:
-                self._is_responding = True
+                self._is_playing = True
                 await self._synthesize_with_elevenlabs(greeting)
-                self._is_responding = False
+                await self._send_checkpoint()
                 self._log("turn", f"turn {self._turn_count}: greeting queued for playback")
         except Exception as e:
             self._loge("session", f"greeting ERROR: {e}")
@@ -759,12 +883,31 @@ You can use the caller's phone number for SMS or callbacks without asking."""
             self._loge("session", f"streaming ERROR: {e}")
         finally:
             self._running = False
-            duration = time.monotonic() - self._session_start
+            await self._stt.close()
+            duration = round(time.monotonic() - self._session_start, 1)
+            avg_ttfs = (
+                round(sum(self._ttfs_samples) / len(self._ttfs_samples))
+                if self._ttfs_samples
+                else None
+            )
             # Session end always logs (even in quiet mode)
-            logger.info(
-                f"[{self.call_id[:8]}] [{duration:7.2f}s] [session] "
+            logger.bind(
+                event="call_summary",
+                call_id=self.call_id,
+                duration_s=duration,
+                turns=self._turn_count,
+                barge_ins=self._barge_in_count,
+                ttfs_avg_ms=avg_ttfs,
+                ttfs_samples=len(self._ttfs_samples),
+                errors=self._error_count,
+                rx_bytes=self._plivo_rx_bytes,
+                tx_chunks=self._plivo_tx_chunks,
+            ).info(
+                f"[{self.call_id[:8]}] [{duration:7.1f}s] [session] "
                 f"ended — {self._turn_count} turns, "
-                f"rx={self._plivo_rx_bytes} bytes, tx={self._plivo_tx_chunks} chunks"
+                f"{self._barge_in_count} barge-ins, "
+                f"TTFS avg={avg_ttfs}ms, "
+                f"rx={self._plivo_rx_bytes}B, tx={self._plivo_tx_chunks} chunks"
             )
 
     async def _run_streaming_tasks(self) -> None:
@@ -772,6 +915,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
         tasks = [
             asyncio.create_task(self._receive_from_plivo(), name="plivo_rx"),
             asyncio.create_task(self._send_to_plivo(), name="plivo_tx"),
+            asyncio.create_task(self._watch_transcripts(), name="stt_watch"),
         ]
 
         try:
@@ -788,7 +932,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                         await task
 
     async def _receive_from_plivo(self) -> None:
-        """Receive audio from Plivo, run VAD, accumulate for STT, and process turns."""
+        """Receive audio from Plivo, stream to Sarvam STT, run VAD for turn detection."""
         media_count = 0
         try:
             while self._running:
@@ -806,64 +950,100 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                         if media_count == 1:
                             self._log("plivo_rx", "first audio packet received")
                         if media_count % 500 == 0:
-                            buf_ms = len(self._stt_buffer) / (SARVAM_SAMPLE_RATE * 2) * 1000
-                            self._logv(
-                                "plivo_rx",
-                                f"{media_count} packets, stt_buffer={buf_ms:.0f}ms, "
-                                f"responding={self._is_responding}",
-                            )
+                            self._logv("plivo_rx", f"{media_count} packets")
 
-                        # Convert and accumulate audio for STT
-                        pcm_16k = plivo_to_sarvam(mulaw_audio)
-                        self._stt_buffer.extend(pcm_16k)
+                        # Always forward audio to Sarvam STT — even
+                        # during playback. Echo gets transcribed but is
+                        # cleared on barge-in (clear_transcript). This
+                        # ensures STT has processed user speech by the
+                        # time speech_ended fires.
+                        pcm_8k = plivo_to_sarvam_streaming(mulaw_audio)
+                        await self._stt.send_audio(pcm_8k)
 
-                        # Run VAD
+                        # VAD always runs — barge-in must work during
+                        # playback. Echo triggers speech_started which
+                        # stops playback; the empty STT transcript (no
+                        # echo was sent to STT) causes the turn to be
+                        # skipped. Real user speech after barge-in gets
+                        # sent to STT and produces a real transcript.
                         vad_audio = plivo_to_vad(mulaw_audio)
-                        speech_started, speech_ended = self._vad.process(vad_audio)
+                        speech_started, speech_ended = self._vad.process(
+                            vad_audio
+                        )
 
-                        if speech_started:
+                        if speech_started and not self._barged_in:
+                            self._barged_in = True
                             self._log("vad", "speech START detected")
-                            if self._is_responding:
+                            interrupted = False
+                            if (
+                                self._current_turn_task
+                                and not self._current_turn_task.done()
+                            ):
+                                self._current_turn_task.cancel()
                                 self._log(
-                                    "vad",
-                                    "barge-in! cancelling TTS and clearing audio queue",
+                                    "vad", "cancelled in-flight turn task"
                                 )
-                                self._is_responding = False
-                                if self._current_tts_task and not self._current_tts_task.done():
-                                    self._current_tts_task.cancel()
-                                cleared = 0
-                                while not self._send_queue.empty():
-                                    try:
-                                        self._send_queue.get_nowait()
-                                        cleared += 1
-                                    except asyncio.QueueEmpty:
-                                        break
-                                self._logv("vad", f"cleared {cleared} queued audio chunks")
-                                await self.websocket.send_text(
-                                    json.dumps({"event": "clearAudio"})
-                                )
-                                self._logv("plivo_tx", "sent clearAudio event")
-                                self._stt_buffer.clear()
-
-                        if speech_ended:
-                            audio_data = bytes(self._stt_buffer)
-                            self._stt_buffer.clear()
-                            self._vad.reset()
-                            buf_ms = len(audio_data) / (SARVAM_SAMPLE_RATE * 2) * 1000
-                            self._turn_count += 1
+                                interrupted = True
+                            if (
+                                self._current_tts_task
+                                and not self._current_tts_task.done()
+                            ):
+                                self._current_tts_task.cancel()
+                                interrupted = True
+                            cleared = 0
+                            while not self._send_queue.empty():
+                                try:
+                                    self._send_queue.get_nowait()
+                                    cleared += 1
+                                except asyncio.QueueEmpty:
+                                    break
+                            clear_event = {"event": "clearAudio"}
+                            if self._stream_id:
+                                clear_event["streamId"] = self._stream_id
+                            await self.websocket.send_text(
+                                json.dumps(clear_event)
+                            )
                             self._log(
                                 "vad",
-                                f"speech END — turn {self._turn_count}, "
-                                f"captured {buf_ms:.0f}ms of audio",
+                                f"barge-in: clearAudio sent, "
+                                f"cancelled={interrupted}, "
+                                f"cleared={cleared} chunks",
                             )
+                            self._stt.clear_transcript()
+                            self._is_playing = False
+                            self._barge_in_count += 1
 
-                            task = asyncio.create_task(
-                                self._process_turn(audio_data),
-                                name=f"turn_{self._turn_count}",
-                            )
-                            task.add_done_callback(
-                                lambda t: t.exception() if not t.cancelled() else None
-                            )
+                        if speech_ended:
+                            self._speech_end_time = time.monotonic()
+                            transcript = self._stt.latest_transcript
+                            if transcript.strip():
+                                # STT already delivered — process now
+                                self._log(
+                                    "vad",
+                                    "speech END — transcript ready",
+                                )
+                                self._commit_turn(transcript)
+                            else:
+                                # STT hasn't delivered yet — flag it.
+                                # _watch_transcripts will trigger when
+                                # Sarvam delivers.
+                                self._speech_ended_pending = True
+                                self._log(
+                                    "vad",
+                                    "speech END — waiting for STT",
+                                )
+                            self._vad.reset()
+                            self._barged_in = False
+
+                elif event == "playedStream":
+                    # Plivo confirms all audio before checkpoint has played
+                    name = message.get("name", "")
+                    self._is_playing = False
+                    self._log("plivo_rx", f"playedStream: '{name}' — playback complete")
+
+                elif event == "clearedAudio":
+                    self._is_playing = False
+                    self._logv("plivo_rx", "clearedAudio confirmed by Plivo")
 
                 elif event == "text":
                     text = message.get("text", "")
@@ -891,44 +1071,91 @@ You can use the caller's phone number for SMS or callbacks without asking."""
         finally:
             self._logv("plivo_rx", f"exiting — received {media_count} media packets")
 
-    async def _process_turn(self, pcm_16k: bytes) -> None:
-        """Process a complete user turn: STT → LLM → TTS."""
-        t0 = time.monotonic()
+    def _commit_turn(self, transcript: str) -> None:
+        """Commit a turn for processing — creates the turn task."""
+        self._turn_count += 1
+        self._log("turn", f"turn {self._turn_count}: '{transcript[:80]}'")
+        self._current_turn_task = asyncio.create_task(
+            self._process_text_turn(transcript),
+            name=f"turn_{self._turn_count}",
+        )
+        self._current_turn_task.add_done_callback(
+            lambda t: t.exception() if not t.cancelled() else None
+        )
+        self._stt.clear_transcript()
+        self._speech_ended_pending = False
+
+    async def _watch_transcripts(self) -> None:
+        """Watch for STT transcripts that arrive after speech_ended.
+
+        Convergence gate: if VAD fired speech_ended but STT hadn't
+        delivered yet, this task picks up the transcript when it arrives
+        and commits the turn.
+        """
         try:
-            transcript = await self._transcribe_with_sarvam(pcm_16k)
-            if not transcript.strip():
-                self._logv("turn", "empty transcript, skipping turn")
-                return
-
-            await self._process_text_turn(transcript)
-            total = (time.monotonic() - t0) * 1000
-            self._log("turn", f"full pipeline completed in {total:.0f}ms")
-
-        except Exception as e:
-            self._loge("turn", f"ERROR: {e}")
+            while self._running:
+                try:
+                    await asyncio.wait_for(
+                        self._transcript_queue.get(), timeout=0.2
+                    )
+                except TimeoutError:
+                    continue
+                # Transcript arrived — check if VAD is waiting
+                if self._speech_ended_pending:
+                    transcript = self._stt.latest_transcript
+                    if transcript.strip():
+                        self._log(
+                            "stt",
+                            "transcript arrived after speech_ended — "
+                            "committing turn",
+                        )
+                        self._commit_turn(transcript)
+        except asyncio.CancelledError:
+            pass
 
     async def _process_text_turn(self, text: str) -> None:
         """Process a text-based turn: LLM → TTS."""
-        try:
-            response_text = await self._generate_llm_response(text)
-            if not response_text.strip():
-                self._logv("turn", "empty LLM response, skipping TTS")
-                return
+        async with self._turn_lock:
+            try:
+                response_text = await self._generate_llm_response(text)
+                if not response_text.strip():
+                    self._logv("turn", "empty LLM response, skipping TTS")
+                    return
 
-            self._is_responding = True
-            self._current_tts_task = asyncio.create_task(
-                self._synthesize_with_elevenlabs(response_text),
-                name="tts_synthesis",
-            )
-            await self._current_tts_task
-            self._is_responding = False
+                self._is_playing = True
+                self._current_tts_task = asyncio.create_task(
+                    self._synthesize_with_elevenlabs(response_text),
+                    name="tts_synthesis",
+                )
+                await self._current_tts_task
+                # Send checkpoint so Plivo notifies us when playback finishes
+                await self._send_checkpoint()
+                self._log("turn", "TTS done, audio queued for playback")
 
-        except asyncio.CancelledError:
-            self._is_responding = False
-            self._log("turn", "TTS cancelled (barge-in)")
-        except Exception as e:
-            self._is_responding = False
-            self._loge("turn", f"text turn ERROR: {e}")
+            except asyncio.CancelledError:
+                self._is_playing = False
+                self._log("turn", "turn cancelled (barge-in)")
+            except Exception as e:
+                self._is_playing = False
+                self._loge("turn", f"text turn ERROR: {e}")
+
+    async def _send_checkpoint(self) -> None:
+        """Send a Plivo checkpoint event after queued audio.
+
+        Plivo responds with playedStream when all audio before the checkpoint
+        has been played to the caller. We use this to track _is_playing state.
+        """
+        if not self._stream_id:
+            return
+        self._checkpoint_counter += 1
+        name = f"turn_{self._turn_count}_{self._checkpoint_counter}"
+        checkpoint = {
+            "event": "checkpoint",
+            "streamId": self._stream_id,
+            "name": name,
+        }
+        await self.websocket.send_text(json.dumps(checkpoint))
+        self._logv("plivo_tx", f"checkpoint sent: {name}")
 
     async def _send_to_plivo(self) -> None:
         """Send queued audio to Plivo WebSocket in 20ms chunks."""
@@ -957,6 +1184,11 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                         self._plivo_tx_chunks += 1
                         if self._plivo_tx_chunks == 1:
                             self._log("plivo_tx", "first audio chunk sent to Plivo")
+                        if self._speech_end_time is not None:
+                            ttfs = (time.monotonic() - self._speech_end_time) * 1000
+                            self._ttfs_samples.append(ttfs)
+                            self._log("metrics", f"TTFS: {ttfs:.0f}ms")
+                            self._speech_end_time = None
                         if self._plivo_tx_chunks % 500 == 0:
                             q = self._send_queue.qsize()
                             self._logv(
@@ -985,6 +1217,7 @@ async def run_agent(
     to_number: str = "",
     system_prompt: str | None = None,
     initial_message: str = "Hello, I'm calling for help.",
+    stream_id: str = "",
 ) -> None:
     """Run a voice agent session for an outbound call."""
     agent = VoiceAgent(
@@ -994,5 +1227,6 @@ async def run_agent(
         to_number=to_number,
         system_prompt=system_prompt,
         initial_message=initial_message,
+        stream_id=stream_id,
     )
     await agent.run()
