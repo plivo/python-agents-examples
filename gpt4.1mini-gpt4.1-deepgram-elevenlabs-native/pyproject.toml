@@ -23,6 +23,18 @@ dependencies = [
     "huggingface-hub>=0.20.0",
 ]
 
+[project.optional-dependencies]
+observability = [
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
+    "opentelemetry-exporter-otlp>=1.20.0",
+    "opentelemetry-instrumentation-httpx>=0.44b0",
+    "traceloop-sdk>=0.30.0",
+]
+streaming = [
+    "redis[hiredis]>=5.0.0",
+]
+
 [dependency-groups]
 dev = [
     "ruff>=0.8.0",

@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import functools
 import json
 import os
 import threading
@@ -75,6 +76,41 @@ PLIVO_PHONE_NUMBER = os.getenv("PLIVO_PHONE_NUMBER", "")
 
 SMART_TURN_STOP_SECS = float(os.getenv("SMART_TURN_STOP_SECS", "3.0"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "normal").lower()
+
+# ---------------------------------------------------------------------------
+# OTel tracing (optional — no-op when opentelemetry is not installed)
+# ---------------------------------------------------------------------------
+try:
+    from opentelemetry import trace as _otel_trace
+
+    _tracer = _otel_trace.get_tracer("voice-agent")
+except ImportError:
+    _otel_trace = None  # type: ignore[assignment]
+    _tracer = None  # type: ignore[assignment]
+
+
+def _traced(span_name: str):
+    """Decorator that wraps an async method in an OTel span.
+
+    Creates a span with call_id, records exceptions automatically,
+    and ends the span on exit. No-op when opentelemetry is not installed.
+    Methods can call ``_otel_trace.get_current_span()`` to set domain attributes.
+    """
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        async def wrapper(self, *args, **kwargs):
+            if not _tracer:
+                return await fn(self, *args, **kwargs)
+            with _tracer.start_as_current_span(
+                span_name, attributes={"call_id": self.call_id[:8]}
+            ):
+                return await fn(self, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
 
 # =============================================================================
 # System Prompt
@@ -862,13 +898,26 @@ class VoiceAgent:
         self._send_queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._smart_turn = SmartTurnProcessor()
         self._deepgram = DeepgramSTT()
-        self._is_responding = False
+        self._playback_end_time: float = 0.0  # estimated Plivo playback end
         self._conversation_history: list[dict[str, Any]] = []
         self._current_tts_task: asyncio.Task | None = None
         self._turn_count = 0
+        self._turn_cooldown_until = 0.0  # suppress VAD after turn commit
+        self._pending_incomplete = False  # smart-turn said "incomplete", awaiting timeout
+        self._barge_in_pending = False  # waiting for sustained speech before committing
+        self._barge_in_start: float = 0.0
         self._session_start = time.monotonic()
         self._plivo_rx_bytes = 0
         self._plivo_tx_chunks = 0
+
+    @property
+    def _is_responding(self) -> bool:
+        """True while Plivo is estimated to still be playing agent audio."""
+        return time.monotonic() < self._playback_end_time
+
+    def _cancel_playback(self) -> None:
+        """Cancel all pending playback (barge-in)."""
+        self._playback_end_time = 0.0
 
     def _log(self, stage: str, msg: str) -> None:
         if LOG_LEVEL == "quiet":
@@ -1157,6 +1206,7 @@ class VoiceAgent:
             response.raise_for_status()
             return response.json()
 
+    @_traced("llm")
     async def _generate_llm_response(self, user_text: str) -> str:
         """Dual-LLM: mini controls conversation, GPT-4.1 reasons + tools.
 
@@ -1193,6 +1243,17 @@ class VoiceAgent:
             message = result["choices"][0]["message"]
             latency = (time.monotonic() - t0) * 1000
             tokens = result.get("usage", {})
+
+            if _otel_trace:
+                span = _otel_trace.get_current_span()
+                span.set_attribute("llm.latency_ms", latency)
+                span.set_attribute("gen_ai.request.model", OPENAI_CONVERSATION_MODEL)
+                span.set_attribute(
+                    "gen_ai.usage.prompt_tokens", tokens.get("prompt_tokens", 0)
+                )
+                span.set_attribute(
+                    "gen_ai.usage.completion_tokens", tokens.get("completion_tokens", 0)
+                )
 
             if not message.get("tool_calls"):
                 # Mini responded directly — fast conversational turn
@@ -1236,7 +1297,6 @@ class VoiceAgent:
             })
 
             # Step 2: Stream filler TTS + run reasoning concurrently
-            self._is_responding = True
             reasoning_task = asyncio.create_task(
                 self._run_reasoning_loop(task_desc),
                 name="reasoning",
@@ -1326,11 +1386,9 @@ class VoiceAgent:
             self._conversation_history.append({
                 "role": "assistant", "content": assistant_text,
             })
-            self._is_responding = False
             return assistant_text
 
         except Exception as e:
-            self._is_responding = False
             latency = (time.monotonic() - t0) * 1000
             self._loge("llm", f"ERROR ({latency:.0f}ms): {e}")
             return (
@@ -1426,6 +1484,7 @@ class VoiceAgent:
         except json.JSONDecodeError:
             return {"status": "success", "summary": raw}
 
+    @_traced("tts")
     async def _synthesize_with_elevenlabs(self, text: str) -> None:
         """Stream text through ElevenLabs TTS and queue audio for Plivo."""
         import httpx
@@ -1459,12 +1518,10 @@ class VoiceAgent:
                 chunk_count = 0
                 total_bytes = 0
                 async for chunk in response.aiter_bytes(chunk_size=4800):
-                    if not self._running or not self._is_responding:
+                    if not self._running:
                         self._log(
                             "tts",
-                            f"interrupted after {chunk_count} chunks "
-                            f"(running={self._running}, "
-                            f"responding={self._is_responding})",
+                            f"interrupted after {chunk_count} chunks (session ended)",
                         )
                         break
                     if first_chunk_time is None:
@@ -1489,6 +1546,15 @@ class VoiceAgent:
                     f"{ttfb_str}{audio_duration:.1f}s audio "
                     f"in {total_time:.0f}ms",
                 )
+                if _otel_trace:
+                    span = _otel_trace.get_current_span()
+                    span.set_attribute("tts.total_ms", total_time)
+                    span.set_attribute("tts.audio_duration_s", audio_duration)
+                    span.set_attribute("tts.chunks", chunk_count)
+                    if first_chunk_time is not None:
+                        span.set_attribute(
+                            "tts.ttfb_ms", (first_chunk_time - t0) * 1000
+                        )
 
         except Exception as e:
             latency = (time.monotonic() - t0) * 1000
@@ -1532,9 +1598,7 @@ You can use the caller's phone number for SMS or lookups without asking."""
             self._log("turn", f"turn {self._turn_count}: generating greeting")
             greeting = await self._generate_llm_response(self.initial_message)
             if greeting:
-                self._is_responding = True
                 await self._synthesize_with_elevenlabs(greeting)
-                self._is_responding = False
                 self._log(
                     "turn",
                     f"turn {self._turn_count}: greeting queued for playback",
@@ -1586,7 +1650,7 @@ You can use the caller's phone number for SMS or lookups without asking."""
                         await task
 
     async def _receive_from_plivo(self) -> None:
-        """Receive audio from Plivo, stream to Deepgram, run smart-turn."""
+        """Receive audio from Plivo, stream to Deepgram, run smart-turn detection."""
         media_count = 0
         try:
             while self._running:
@@ -1602,33 +1666,67 @@ You can use the caller's phone number for SMS or lookups without asking."""
                         media_count += 1
 
                         if media_count == 1:
-                            self._log(
-                                "plivo_rx", "first audio packet received"
-                            )
+                            self._log("plivo_rx", "first audio packet received")
                         if media_count % 500 == 0:
                             self._logv(
                                 "plivo_rx",
-                                f"{media_count} packets, "
-                                f"responding={self._is_responding}",
+                                f"{media_count} packets, responding={self._is_responding}",
                             )
 
+                        # Forward to Deepgram (continuous streaming)
                         pcm_audio = plivo_to_deepgram(mulaw_audio)
                         await self._deepgram.send_audio(pcm_audio)
 
+                        # Run VAD + accumulate for smart-turn
                         vad_audio = plivo_to_vad(mulaw_audio)
-                        speech_started, speech_ended = (
-                            self._smart_turn.process_audio(vad_audio)
-                        )
+                        # Skip VAD during post-turn cooldown (avoids ghost triggers
+                        # from residual audio in the pipeline after turn commit)
+                        if time.monotonic() < self._turn_cooldown_until:
+                            continue
 
+                        speech_started, speech_ended = self._smart_turn.process_audio(vad_audio)
+
+                        # Barge-in
                         if speech_started:
+                            self._pending_incomplete = False  # new speech cancels pending
                             self._log("vad", "speech START detected")
                             if self._is_responding:
+                                # Track barge-in start — require sustained speech
+                                # (500ms) before committing to barge-in. Phone echo
+                                # and noise can sustain 200-400ms at borderline VAD
+                                # probabilities (0.50-0.65). Real barge-in speech
+                                # (user intentionally interrupting) is typically 500ms+.
+                                self._barge_in_pending = True
+                                self._barge_in_start = time.monotonic()
+                                self._logv(
+                                    "vad",
+                                    "potential barge-in — waiting for sustained speech",
+                                )
+
+                        # Sustained barge-in confirmation: if pending barge-in
+                        # and speech has continued for 500ms, commit it.
+                        # If speech ended too quickly, it was noise — cancel.
+                        if self._barge_in_pending:
+                            if speech_ended:
+                                # Speech ended before 500ms — false trigger
+                                elapsed = time.monotonic() - self._barge_in_start
+                                self._logv(
+                                    "vad",
+                                    f"barge-in cancelled — speech ended after "
+                                    f"{elapsed * 1000:.0f}ms (too short)",
+                                )
+                                self._barge_in_pending = False
+                            elif (
+                                self._smart_turn.is_speaking
+                                and (time.monotonic() - self._barge_in_start) >= 0.5
+                            ):
+                                # Sustained speech confirmed — commit barge-in
+                                self._barge_in_pending = False
                                 self._log(
                                     "vad",
-                                    "barge-in! cancelling TTS "
-                                    "and clearing audio queue",
+                                    "barge-in confirmed (sustained speech >500ms)",
                                 )
-                                self._is_responding = False
+                                self._cancel_playback()
                                 if (
                                     self._current_tts_task
                                     and not self._current_tts_task.done()
@@ -1642,29 +1740,20 @@ You can use the caller's phone number for SMS or lookups without asking."""
                                     except asyncio.QueueEmpty:
                                         break
                                 self._logv(
-                                    "vad",
-                                    f"cleared {cleared} queued audio chunks",
+                                    "vad", f"cleared {cleared} queued audio chunks",
                                 )
                                 await self.websocket.send_text(
                                     json.dumps({"event": "clearAudio"})
                                 )
-                                self._logv(
-                                    "plivo_tx", "sent clearAudio event"
-                                )
-                                self._deepgram.clear_transcript()
+                                self._logv("plivo_tx", "sent clearAudio event")
 
-                        if speech_ended:
-                            self._log(
-                                "vad",
-                                "speech END — running smart-turn analysis",
-                            )
-                            turn_complete = (
-                                await self._smart_turn.analyze_turn()
-                            )
+                        # Turn detection: when VAD detects silence after speech
+                        if speech_ended and not self._barge_in_pending:
+                            self._log("vad", "speech END — running smart-turn analysis")
+                            turn_complete = await self._smart_turn.analyze_turn()
                             if turn_complete:
-                                transcript = (
-                                    self._deepgram.latest_transcript
-                                )
+                                self._pending_incomplete = False
+                                transcript = self._deepgram.latest_transcript
                                 if transcript.strip():
                                     self._turn_count += 1
                                     self._log(
@@ -1677,39 +1766,80 @@ You can use the caller's phone number for SMS or lookups without asking."""
                                         name=f"turn_{self._turn_count}",
                                     )
                                     task.add_done_callback(
-                                        lambda t: (
-                                            t.exception()
-                                            if not t.cancelled()
-                                            else None
-                                        )
+                                        lambda t: t.exception()
+                                        if not t.cancelled()
+                                        else None
                                     )
+                                    self._smart_turn.reset()
+                                    self._deepgram.clear_transcript()
+                                    # Cooldown: suppress VAD for 300ms to avoid
+                                    # ghost triggers from residual pipeline audio
+                                    self._turn_cooldown_until = time.monotonic() + 0.3
                                 else:
-                                    self._logv(
+                                    # Empty transcript — Deepgram hasn't finalized
+                                    # yet. DON'T reset or clear: let the transcript
+                                    # accumulate. The next speech_ended or silence
+                                    # timeout will pick it up with the full text.
+                                    self._log(
                                         "smart_turn",
-                                        "complete but empty transcript",
+                                        "complete but empty transcript — "
+                                        "keeping buffer, waiting for Deepgram",
                                     )
-                                self._smart_turn.reset()
-                                self._deepgram.clear_transcript()
+                                    self._pending_incomplete = True
                             else:
                                 self._log(
                                     "smart_turn",
                                     "incomplete turn, waiting for more speech",
                                 )
+                                self._pending_incomplete = True
+
+                        # Silence timeout re-check: if smart-turn previously said
+                        # "incomplete" and user has been silent long enough, force
+                        # the turn complete. This prevents infinite silence when
+                        # smart-turn misjudges a complete utterance as incomplete.
+                        elif (
+                            self._pending_incomplete
+                            and self._smart_turn._silence_start is not None
+                            and not self._smart_turn.is_speaking
+                            and (time.monotonic() - self._smart_turn._silence_start)
+                            >= self._smart_turn._stop_secs
+                        ):
+                            self._pending_incomplete = False
+                            transcript = self._deepgram.latest_transcript
+                            if transcript.strip():
+                                self._turn_count += 1
+                                self._log(
+                                    "smart_turn",
+                                    f"turn {self._turn_count} (silence timeout): "
+                                    f"'{transcript[:80]}'",
+                                )
+                                task = asyncio.create_task(
+                                    self._process_text_turn(transcript),
+                                    name=f"turn_{self._turn_count}",
+                                )
+                                task.add_done_callback(
+                                    lambda t: t.exception()
+                                    if not t.cancelled()
+                                    else None
+                                )
+                            else:
+                                self._logv(
+                                    "smart_turn",
+                                    "silence timeout but empty transcript",
+                                )
+                            self._smart_turn.reset()
+                            self._deepgram.clear_transcript()
+                            self._turn_cooldown_until = time.monotonic() + 0.3
 
                 elif event == "stop":
-                    self._log(
-                        "plivo_rx", "received stop event — call ended"
-                    )
+                    self._log("plivo_rx", "received stop event — call ended")
                     break
 
         except Exception as e:
             if "1000" not in str(e):
                 self._loge("plivo_rx", f"ERROR: {e}")
         finally:
-            self._logv(
-                "plivo_rx",
-                f"exiting — received {media_count} media packets",
-            )
+            self._logv("plivo_rx", f"exiting — received {media_count} media packets")
 
     async def _process_text_turn(self, text: str) -> None:
         """Process a text-based turn: LLM → TTS."""
@@ -1719,32 +1849,31 @@ You can use the caller's phone number for SMS or lookups without asking."""
                 self._logv("turn", "empty LLM response, skipping TTS")
                 return
 
-            self._is_responding = True
             self._current_tts_task = asyncio.create_task(
                 self._synthesize_with_elevenlabs(response_text),
                 name="tts_synthesis",
             )
             await self._current_tts_task
-            self._is_responding = False
 
         except asyncio.CancelledError:
-            self._is_responding = False
             self._log("turn", "TTS cancelled (barge-in)")
         except Exception as e:
-            self._is_responding = False
             self._loge("turn", f"text turn ERROR: {e}")
 
     async def _send_to_plivo(self) -> None:
-        """Send queued audio to Plivo WebSocket in 20ms chunks."""
+        """Send queued audio to Plivo WebSocket in 20ms chunks.
+
+        Tracks estimated playback end time: each 160-byte chunk = 20ms of audio.
+        Plivo buffers and plays chunks, so _is_responding (property) checks
+        whether estimated playback is still in progress.
+        """
         PLIVO_CHUNK_SIZE = 160
         audio_buffer = bytearray()
 
         try:
             while self._running:
                 try:
-                    audio = await asyncio.wait_for(
-                        self._send_queue.get(), timeout=0.1
-                    )
+                    audio = await asyncio.wait_for(self._send_queue.get(), timeout=0.1)
                     audio_buffer.extend(audio)
 
                     while len(audio_buffer) >= PLIVO_CHUNK_SIZE:
@@ -1756,24 +1885,26 @@ You can use the caller's phone number for SMS or lookups without asking."""
                             "media": {
                                 "contentType": "audio/x-mulaw",
                                 "sampleRate": 8000,
-                                "payload": base64.b64encode(chunk).decode(
-                                    "utf-8"
-                                ),
+                                "payload": base64.b64encode(chunk).decode("utf-8"),
                             },
                         }
                         await self.websocket.send_text(json.dumps(message))
                         self._plivo_tx_chunks += 1
+
+                        # Extend estimated playback end by 20ms per chunk
+                        now = time.monotonic()
+                        self._playback_end_time = max(
+                            self._playback_end_time, now
+                        ) + 0.02
+
                         if self._plivo_tx_chunks == 1:
-                            self._log(
-                                "plivo_tx",
-                                "first audio chunk sent to Plivo",
-                            )
+                            self._log("plivo_tx", "first audio chunk sent to Plivo")
                         if self._plivo_tx_chunks % 500 == 0:
-                            q = self._send_queue.qsize()
+                            remaining = self._playback_end_time - now
                             self._logv(
                                 "plivo_tx",
                                 f"{self._plivo_tx_chunks} chunks sent, "
-                                f"queue={q}",
+                                f"~{remaining:.1f}s playback remaining",
                             )
 
                 except TimeoutError:
@@ -1782,10 +1913,7 @@ You can use the caller's phone number for SMS or lookups without asking."""
         except asyncio.CancelledError:
             pass
         finally:
-            self._logv(
-                "plivo_tx",
-                f"exiting — total {self._plivo_tx_chunks} chunks sent",
-            )
+            self._logv("plivo_tx", f"exiting — total {self._plivo_tx_chunks} chunks sent")
 
 
 # =============================================================================

@@ -44,6 +44,72 @@ if _LOG_FILE:
         level="DEBUG",
     )
 
+# ---------------------------------------------------------------------------
+# Redis Streams sink (optional — publishes structured events for real-time UIs)
+# ---------------------------------------------------------------------------
+_REDIS_EVENTS_URL = os.getenv("REDIS_EVENTS_URL", "")
+_REDIS_STREAM_KEY = os.getenv("REDIS_STREAM_KEY", "voice-agent:events")
+
+if _REDIS_EVENTS_URL:
+    try:
+        import redis as _redis_mod
+
+        _redis_client = _redis_mod.Redis.from_url(_REDIS_EVENTS_URL, decode_responses=True)
+        _redis_client.ping()
+
+        def _redis_sink(message):
+            record = message.record
+            fields = {
+                "ts": record["time"].isoformat(),
+                "level": record["level"].name,
+                "msg": str(record["message"]),
+            }
+            for k, v in record["extra"].items():
+                fields[k] = str(v)
+            with contextlib.suppress(Exception):
+                _redis_client.xadd(_REDIS_STREAM_KEY, fields, maxlen=10000, approximate=True)
+
+        logger.add(_redis_sink, level="DEBUG")
+        logger.info("Redis Streams sink enabled — publishing to {}", _REDIS_STREAM_KEY)
+    except ImportError:
+        logger.warning("REDIS_EVENTS_URL set but 'redis' package not installed")
+    except Exception as _redis_err:
+        logger.warning("Redis Streams sink failed to connect: {}", _redis_err)
+
+# ---------------------------------------------------------------------------
+# OTel tracing setup (optional — install with `uv sync --extra observability`)
+# ---------------------------------------------------------------------------
+try:
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+    provider = TracerProvider()
+    if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
+        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+
+        provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+        logger.info("OTel tracing enabled — exporting to OTLP endpoint")
+    trace.set_tracer_provider(provider)
+except ImportError:
+    pass
+
+try:
+    from traceloop.sdk import Traceloop
+
+    Traceloop.init(app_name="gpt4.1mini-gpt4.1-deepgram-elevenlabs-native")
+    logger.info("OpenLLMetry (Traceloop) auto-instrumentation enabled")
+except ImportError:
+    pass
+
+try:
+    from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+
+    HTTPXClientInstrumentor().instrument()
+    logger.info("httpx auto-instrumentation enabled")
+except ImportError:
+    pass
+
 # Server configuration
 SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
 PLIVO_AUTH_ID = os.getenv("PLIVO_AUTH_ID", "")
