@@ -1,0 +1,1030 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>xAI Voice Showcase Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #09090f;
+    --surface: rgba(255,255,255,0.04);
+    --border: rgba(255,255,255,0.08);
+    --text: #e4e4e7;
+    --text-dim: #a1a1aa;
+    --blue: #323DFE;
+    --cyan: #56CAF4;
+    --purple: #CD3EF9;
+    --green: #34d399;
+    --red: #f87171;
+    --orange: #fb923c;
+    --bot-accent: #56CAF4;
+    --bot-accent-dim: rgba(86,202,244,0.15);
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', system-ui, sans-serif;
+    line-height: 1.5;
+    min-height: 100vh;
+  }
+
+  h1, h2, h3 { font-family: 'Sora', sans-serif; }
+  code, .mono { font-family: 'JetBrains Mono', monospace; }
+
+  .app {
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    grid-template-rows: auto 1fr;
+    min-height: 100vh;
+  }
+
+  .header {
+    grid-column: 1 / -1;
+    padding: 20px 28px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+  .header h1 {
+    font-size: 18px;
+    font-weight: 700;
+    background: linear-gradient(135deg, var(--blue), var(--cyan));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .header .badge {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 9999px;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+  }
+
+  .sidebar {
+    border-right: 1px solid var(--border);
+    padding: 16px;
+    overflow-y: auto;
+  }
+  .sidebar h3 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin-bottom: 12px;
+  }
+
+  .session-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    transition: border-color 0.15s;
+  }
+  .session-card:hover { border-color: rgba(255,255,255,0.16); }
+  .session-card.active { border-color: var(--cyan); }
+  .session-card .provider-tag {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 4px;
+    margin-bottom: 4px;
+    color: #fff;
+  }
+  .session-card .provider-tag.xai { background: linear-gradient(135deg, #1a1a2e, #e94560); }
+  .session-card .provider-tag.elevenlabs { background: linear-gradient(135deg, #323DFE, #56CAF4); }
+  .session-card .provider-tag.cartesia { background: linear-gradient(135deg, #059669, #34D399); }
+  .session-card .provider-tag.openai { background: linear-gradient(135deg, #6366f1, #a78bfa); }
+  .session-card .provider-tag.ara { background: linear-gradient(135deg, #1a1a2e, #e94560); }
+  .session-card .provider-tag.eve { background: linear-gradient(135deg, #4c1d95, #a78bfa); }
+  .session-card .provider-tag.rex { background: linear-gradient(135deg, #7c2d12, #fb923c); }
+  .session-card .provider-tag.sal { background: linear-gradient(135deg, #059669, #34D399); }
+  .session-card .provider-tag.leo { background: linear-gradient(135deg, #164e63, #56CAF4); }
+  .session-card .meta { font-size: 12px; color: var(--text-dim); }
+  .session-card .meta .mono { font-size: 11px; }
+  .session-card .stats {
+    display: flex;
+    gap: 12px;
+    margin-top: 6px;
+    font-size: 12px;
+  }
+  .session-card .stats span { color: var(--text-dim); }
+  .session-card .stats strong { color: var(--text); }
+  .session-card .live-dot {
+    display: inline-block;
+    width: 6px; height: 6px;
+    background: var(--green);
+    border-radius: 50%;
+    margin-left: 4px;
+    animation: pulse 1.5s infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
+  .sidebar-check {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 4px;
+  }
+  .sidebar-check input[type="checkbox"] { accent-color: var(--cyan); }
+
+  .main { padding: 24px; overflow-y: auto; display: flex; flex-direction: column; }
+
+  .tabs { display: flex; gap: 4px; margin-bottom: 24px; }
+  .tab-btn {
+    font-family: 'Sora', sans-serif;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 6px 16px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .tab-btn:hover { color: var(--text); border-color: rgba(255,255,255,0.16); }
+  .tab-btn.active {
+    background: var(--surface);
+    color: var(--text);
+    border-color: var(--cyan);
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+  .card h2 {
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 16px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .stat-row { display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+  .stat-box {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 20px;
+    flex: 1;
+    min-width: 120px;
+  }
+  .stat-box .label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+  }
+  .stat-box .value {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 24px;
+    font-weight: 500;
+  }
+  .stat-box .value.blue { color: var(--cyan); }
+  .stat-box .value.purple { color: var(--purple); }
+  .stat-box .value.green { color: var(--green); }
+
+  .chart-wrap { position: relative; height: 280px; margin-bottom: 8px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th {
+    text-align: left; font-weight: 600; color: var(--text-dim);
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em;
+    padding: 8px 12px; border-bottom: 1px solid var(--border);
+  }
+  td { padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  .text-dim { color: var(--text-dim); }
+
+  .empty {
+    text-align: center; padding: 60px 20px; color: var(--text-dim);
+  }
+  .empty h2 { font-size: 16px; margin-bottom: 8px; color: var(--text); }
+  .empty p { font-size: 13px; max-width: 400px; margin: 0 auto; }
+
+  .del-btn {
+    background: none; border: none; color: var(--text-dim);
+    cursor: pointer; font-size: 14px; padding: 2px 6px; border-radius: 4px;
+    transition: color 0.15s, background 0.15s; margin-left: auto;
+  }
+  .del-btn:hover { color: var(--red); background: rgba(248,113,113,0.1); }
+
+  .replay-btn {
+    background: none; border: 1px solid var(--border); color: var(--text-dim);
+    cursor: pointer; font-size: 11px; padding: 2px 8px; border-radius: 4px;
+    transition: color 0.15s, border-color 0.15s; margin-left: 4px;
+    font-family: 'Sora', sans-serif; font-weight: 600;
+  }
+  .replay-btn:hover { color: var(--cyan); border-color: var(--cyan); }
+
+  /* ─── Inline waveform player ─── */
+  .voice-ara { --bot-accent: #e94560; --bot-accent-dim: rgba(233,69,96,0.15); }
+  .voice-eve { --bot-accent: #a78bfa; --bot-accent-dim: rgba(167,139,250,0.15); }
+  .voice-rex { --bot-accent: #fb923c; --bot-accent-dim: rgba(251,146,60,0.15); }
+  .voice-sal { --bot-accent: #34d399; --bot-accent-dim: rgba(52,211,153,0.15); }
+  .voice-leo { --bot-accent: #56CAF4; --bot-accent-dim: rgba(86,202,244,0.15); }
+
+  .player-section {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+  }
+
+  .player-header {
+    text-align: center;
+    margin-bottom: 16px;
+  }
+  .player-header h2 {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--bot-accent);
+    margin-bottom: 2px;
+  }
+  .player-header .scenario-tag {
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+
+  .waveform-wrap {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 12px;
+  }
+  .waveform-canvas {
+    width: 100%;
+    height: 180px;
+    border-radius: 10px;
+  }
+  .play-overlay {
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+  }
+  .play-btn-big {
+    width: 56px; height: 56px; border-radius: 50%;
+    border: 2px solid var(--bot-accent);
+    background: var(--bot-accent-dim);
+    color: var(--bot-accent);
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 22px;
+    transition: all 0.2s;
+    backdrop-filter: blur(8px);
+  }
+  .play-btn-big:hover { background: var(--bot-accent); color: var(--bg); }
+  .play-btn-big.hidden { display: none; }
+
+  .progress-row {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 16px;
+  }
+  .time-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px; color: var(--text-dim); white-space: nowrap;
+  }
+  .progress-track {
+    flex: 1; height: 4px;
+    background: rgba(255,255,255,0.08);
+    border-radius: 2px; overflow: hidden; cursor: pointer;
+  }
+  .progress-fill {
+    height: 100%; background: var(--bot-accent);
+    border-radius: 2px; width: 0%;
+    transition: width 0.1s linear;
+  }
+
+  .transcript-box {
+    flex: 1;
+    overflow-y: auto;
+    max-height: 40vh;
+  }
+  .transcript-line {
+    display: flex; gap: 10px; padding: 5px 0;
+    opacity: 0; transform: translateY(8px);
+    transition: opacity 0.3s ease, transform 0.3s ease;
+    font-size: 13px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .transcript-line.visible { opacity: 1; transform: translateY(0); }
+  .transcript-line .spk {
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.06em; padding: 2px 8px; border-radius: 4px;
+    white-space: nowrap; height: fit-content; margin-top: 1px; flex-shrink: 0;
+  }
+  .transcript-line .spk.caller { background: rgba(255,255,255,0.06); color: var(--text-dim); }
+  .transcript-line .spk.bot { background: var(--bot-accent-dim); color: var(--bot-accent); }
+  .transcript-line .ltxt { color: var(--text); flex: 1; }
+  .transcript-line.caller-line .ltxt { color: var(--text-dim); }
+  .transcript-line .typing-cursor {
+    display: inline-block; width: 2px; height: 13px;
+    background: var(--bot-accent); margin-left: 2px;
+    vertical-align: text-bottom; animation: blink 0.6s infinite;
+  }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="header">
+    <h1>xAI Voice Showcase</h1>
+    <span class="badge" id="session-count">0 sessions</span>
+  </div>
+
+  <div class="sidebar" id="sidebar">
+    <h3>Sessions</h3>
+    <div id="session-list"><p class="text-dim" style="font-size:12px">Loading...</p></div>
+  </div>
+
+  <div class="main">
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="live" onclick="switchTab('live')">Session</button>
+      <button class="tab-btn" data-tab="compare" onclick="switchTab('compare')">Compare</button>
+      <button class="tab-btn" data-tab="providers" onclick="switchTab('providers')">Voices</button>
+    </div>
+
+    <!-- Session detail — waveform player -->
+    <div id="tab-live">
+      <div class="empty" id="live-empty">
+        <h2>Select a session</h2>
+        <p>Click a session in the sidebar to listen and view the conversation transcript.</p>
+      </div>
+      <div id="live-content" style="display:none" class="player-section">
+        <div class="player-header" id="player-header">
+          <h2 id="player-voice">Ara</h2>
+          <div class="scenario-tag" id="player-scenario"></div>
+        </div>
+        <div class="stat-row" id="live-stats"></div>
+        <div class="waveform-wrap">
+          <canvas class="waveform-canvas" id="waveform-canvas"></canvas>
+          <div class="play-overlay">
+            <button class="play-btn-big" id="play-btn" onclick="togglePlay()">&#9654;</button>
+          </div>
+        </div>
+        <div class="progress-row">
+          <span class="time-label" id="time-cur">0:00</span>
+          <div class="progress-track" id="progress-track">
+            <div class="progress-fill" id="progress-fill"></div>
+          </div>
+          <span class="time-label" id="time-dur">0:00</span>
+        </div>
+        <div class="transcript-box" id="transcript"></div>
+      </div>
+    </div>
+
+    <!-- Compare selected sessions -->
+    <div id="tab-compare" style="display:none">
+      <div class="empty" id="compare-empty">
+        <h2>Compare Sessions</h2>
+        <p>Use checkboxes in the sidebar to select 2-5 sessions, then click Compare.</p>
+        <button class="tab-btn" style="margin-top:16px" onclick="runCompare()">Compare Selected</button>
+      </div>
+      <div id="compare-content" style="display:none">
+        <button class="tab-btn" style="margin-bottom:20px" onclick="runCompare()">Refresh</button>
+        <div class="card">
+          <h2>TTS TTFB Comparison</h2>
+          <div class="chart-wrap"><canvas id="compare-tts-chart"></canvas></div>
+        </div>
+        <div class="card">
+          <h2>Full Pipeline Breakdown (Avg)</h2>
+          <div class="chart-wrap"><canvas id="compare-pipeline-chart"></canvas></div>
+        </div>
+        <div class="card">
+          <h2>Summary</h2>
+          <div style="overflow-x:auto">
+            <table>
+              <thead><tr>
+                <th>Session</th><th>Voice</th><th>Turns</th>
+                <th>Avg Total</th><th>Avg STT</th><th>Avg LLM</th><th>Avg TTS</th>
+              </tr></thead>
+              <tbody id="compare-summary-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Voice aggregates -->
+    <div id="tab-providers" style="display:none">
+      <div class="empty" id="providers-loading"><h2>Loading voice data...</h2></div>
+      <div id="providers-content" style="display:none">
+        <div class="card">
+          <h2>Avg TTS TTFB by Voice</h2>
+          <div class="chart-wrap"><canvas id="prov-tts-chart"></canvas></div>
+        </div>
+        <div class="card">
+          <h2>Pipeline Breakdown by Voice</h2>
+          <div class="chart-wrap"><canvas id="prov-pipeline-chart"></canvas></div>
+        </div>
+        <div class="card">
+          <h2>Summary</h2>
+          <div style="overflow-x:auto">
+            <table>
+              <thead><tr>
+                <th>Voice</th><th>Scenario</th><th>Sessions</th>
+                <th>Avg Total</th><th>Avg STT</th><th>Avg LLM</th><th>Avg TTS</th>
+              </tr></thead>
+              <tbody id="prov-summary-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<audio id="audio" preload="auto" crossorigin="anonymous"></audio>
+
+<script>
+// ─── State ──────────────────────────────────────────────────────────
+let sessions = [];
+let selectedSessionId = null;
+let currentSession = null;
+let livePolling = null;
+let charts = {};
+let checkedSessionIds = new Set();
+
+// Audio
+let audioEl = document.getElementById('audio');
+let isPlaying = false;
+let animationFrame = null;
+let audioContext = null;
+let analyser = null;
+let dataArray = null;
+let sourceConnected = false;
+let sessionStartTime = 0;
+
+const VOICE_COLORS = {
+  ara: { accent: '#e94560', dim: 'rgba(233,69,96,0.15)' },
+  eve: { accent: '#a78bfa', dim: 'rgba(167,139,250,0.15)' },
+  rex: { accent: '#fb923c', dim: 'rgba(251,146,60,0.15)' },
+  sal: { accent: '#34d399', dim: 'rgba(52,211,153,0.15)' },
+  leo: { accent: '#56CAF4', dim: 'rgba(86,202,244,0.15)' },
+};
+
+const PROVIDER_COLORS = {
+  xai: { bg: 'rgba(233,69,96,0.8)', border: '#e94560' },
+  ara: { bg: 'rgba(233,69,96,0.8)', border: '#e94560' },
+  eve: { bg: 'rgba(167,139,250,0.8)', border: '#a78bfa' },
+  rex: { bg: 'rgba(251,146,60,0.8)', border: '#fb923c' },
+  sal: { bg: 'rgba(52,211,153,0.8)', border: '#34d399' },
+  leo: { bg: 'rgba(86,202,244,0.8)', border: '#56CAF4' },
+};
+
+const PROVIDER_LABELS = {
+  xai: 'xAI', ara: 'Ara', eve: 'Eve', rex: 'Rex', sal: 'Sal', leo: 'Leo',
+};
+
+const PALETTE = ['rgba(233,69,96,0.8)','rgba(86,202,244,0.8)','rgba(52,211,153,0.8)','rgba(139,92,246,0.8)','rgba(251,146,60,0.8)'];
+
+// ─── API ────────────────────────────────────────────────────────────
+async function fetchSessions() { return (await fetch('/api/sessions')).json(); }
+async function fetchSession(id) { return (await fetch(`/api/sessions/${id}`)).json(); }
+async function fetchCompare(ids) { return (await fetch(`/api/compare?ids=${ids.join(',')}`)).json(); }
+async function fetchProvidersSummary() { return (await fetch('/api/providers/summary')).json(); }
+
+function providerLabel(s) { return PROVIDER_LABELS[s.mode] || s.mode; }
+function providerColor(s, idx) { return PROVIDER_COLORS[s.mode] || { bg: PALETTE[idx % PALETTE.length], border: PALETTE[idx % PALETTE.length] }; }
+
+// ─── Tabs ───────────────────────────────────────────────────────────
+function switchTab(tab) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  document.getElementById('tab-live').style.display = tab === 'live' ? '' : 'none';
+  document.getElementById('tab-compare').style.display = tab === 'compare' ? '' : 'none';
+  document.getElementById('tab-providers').style.display = tab === 'providers' ? '' : 'none';
+  if (tab === 'providers') loadProviders();
+  // Stop playback when switching away
+  if (tab !== 'live' && isPlaying) { stopPlayback(); }
+}
+
+// ─── Sidebar ────────────────────────────────────────────────────────
+async function loadSessions() {
+  sessions = await fetchSessions();
+  document.getElementById('session-count').textContent = `${sessions.length} session${sessions.length !== 1 ? 's' : ''}`;
+  renderSidebar();
+}
+
+function renderSidebar() {
+  const el = document.getElementById('session-list');
+  if (!sessions.length) {
+    el.innerHTML = '<p class="text-dim" style="font-size:12px">No sessions yet. Run the bot to generate data.</p>';
+    return;
+  }
+  el.innerHTML = sessions.map(s => {
+    const label = providerLabel(s);
+    const isActive = s.session_id === selectedSessionId;
+    const isLive = !s.ended_at;
+    const turns = s.summary?.total_turns || 0;
+    const avg = s.summary?.avg_response_latency_ms || 0;
+    const ttsAvg = s.summary?.avg_tts_ttfb_ms;
+    const isChecked = checkedSessionIds.has(s.session_id);
+    const scenario = s.config?.scenario_label || '';
+    return `
+      <div class="session-card ${isActive ? 'active' : ''}" onclick="selectSession('${s.session_id}')">
+        <div class="sidebar-check" onclick="event.stopPropagation()">
+          <input type="checkbox" value="${s.session_id}"
+            ${isChecked ? 'checked' : ''}
+            onchange="toggleCheck('${s.session_id}', this.checked)">
+          <span class="provider-tag ${s.mode}">${label}</span>
+          ${isLive ? '<span class="live-dot"></span>' : ''}
+          <a class="replay-btn" href="/replay/${s.session_id}" target="_blank" title="Open Replay">Replay</a>
+          <button class="del-btn" title="Delete" onclick="deleteSession('${s.session_id}')">&#x2715;</button>
+        </div>
+        ${scenario ? `<div class="meta" style="font-size:11px;margin:2px 0">${scenario}</div>` : ''}
+        <div class="stats">
+          <span>${turns} turns</span>
+          <span>avg <strong class="mono">${avg}ms</strong></span>
+          ${ttsAvg != null ? `<span>tts <strong class="mono">${ttsAvg}ms</strong></span>` : ''}
+        </div>
+        <div class="meta mono">${s.session_id.slice(0,8)}...</div>
+      </div>`;
+  }).join('');
+}
+
+async function deleteSession(id) {
+  if (!confirm('Delete this session?')) return;
+  await fetch(`/api/sessions/${id}`, { method: 'DELETE' });
+  checkedSessionIds.delete(id);
+  if (selectedSessionId === id) {
+    selectedSessionId = null;
+    stopPlayback();
+    document.getElementById('live-empty').style.display = '';
+    document.getElementById('live-content').style.display = 'none';
+  }
+  await loadSessions();
+}
+
+function toggleCheck(id, checked) {
+  if (checked) checkedSessionIds.add(id);
+  else checkedSessionIds.delete(id);
+}
+
+// ─── Session Detail (Waveform Player) ───────────────────────────────
+async function selectSession(id) {
+  // Stop previous playback
+  stopPlayback();
+  resetAudioSource();
+
+  selectedSessionId = id;
+  renderSidebar();
+  switchTab('live');
+  if (livePolling) clearInterval(livePolling);
+
+  const s = await fetchSession(id);
+  if (!s) return;
+  currentSession = s;
+
+  document.getElementById('live-empty').style.display = 'none';
+  document.getElementById('live-content').style.display = '';
+
+  renderPlayer(s);
+}
+
+function renderPlayer(s) {
+  const config = s.config || {};
+  const voice = (config.voice || s.mode || 'unknown').toLowerCase();
+  const voiceName = config.voice || s.mode || 'Unknown';
+  const scenarioLabel = config.scenario_label || '';
+  const sum = s.summary || {};
+  const turns = s.turns || [];
+
+  // Apply voice color class to main area
+  const mainEl = document.querySelector('.main');
+  mainEl.className = 'main';
+  const voiceClass = voice in VOICE_COLORS ? `voice-${voice}` : '';
+  if (voiceClass) mainEl.classList.add(voiceClass);
+
+  // Header
+  document.getElementById('player-voice').textContent = voiceName;
+  document.getElementById('player-voice').style.color = VOICE_COLORS[voice]?.accent || 'var(--cyan)';
+  document.getElementById('player-scenario').textContent = scenarioLabel;
+
+  // Stats
+  document.getElementById('live-stats').innerHTML = `
+    <div class="stat-box">
+      <div class="label">Turns</div>
+      <div class="value blue">${sum.total_turns || 0}</div>
+    </div>
+    <div class="stat-box">
+      <div class="label">Avg Response</div>
+      <div class="value purple">${sum.avg_response_latency_ms || 0}<span style="font-size:14px">ms</span></div>
+    </div>
+    <div class="stat-box">
+      <div class="label">STT</div>
+      <div class="value" style="color:var(--orange)">${sum.avg_stt_ttfb_ms != null ? sum.avg_stt_ttfb_ms : '-'}<span style="font-size:14px">ms</span></div>
+    </div>
+    <div class="stat-box">
+      <div class="label">LLM</div>
+      <div class="value" style="color:var(--green)">${sum.avg_llm_ttfb_ms != null ? sum.avg_llm_ttfb_ms : '-'}<span style="font-size:14px">ms</span></div>
+    </div>
+    <div class="stat-box">
+      <div class="label">TTS</div>
+      <div class="value" style="color:var(--red)">${sum.avg_tts_ttfb_ms != null ? sum.avg_tts_ttfb_ms : '-'}<span style="font-size:14px">ms</span></div>
+    </div>
+  `;
+
+  // Session time range
+  sessionStartTime = Infinity;
+  for (const t of turns) {
+    if (t.user_started_at && t.user_started_at < sessionStartTime) sessionStartTime = t.user_started_at;
+    if (t.bot_started_at && t.bot_started_at < sessionStartTime) sessionStartTime = t.bot_started_at;
+  }
+  if (!isFinite(sessionStartTime)) sessionStartTime = 0;
+
+  // Audio
+  if (s.recording_url) {
+    audioEl.src = s.recording_url;
+    audioEl.load();
+    audioEl.onloadedmetadata = () => {
+      document.getElementById('time-dur').textContent = fmtTime(audioEl.duration);
+    };
+    audioEl.onended = () => {
+      isPlaying = false;
+      document.getElementById('play-btn').innerHTML = '&#9654;';
+      document.getElementById('play-btn').classList.remove('hidden');
+      cancelAnimationFrame(animationFrame);
+    };
+  }
+
+  // Build transcript
+  buildTranscript(s);
+
+  // Draw idle waveform
+  drawIdleWaveform();
+
+  // Reset progress
+  document.getElementById('progress-fill').style.width = '0%';
+  document.getElementById('time-cur').textContent = '0:00';
+  document.getElementById('play-btn').innerHTML = '&#9654;';
+  document.getElementById('play-btn').classList.remove('hidden');
+}
+
+// ─── Transcript ─────────────────────────────────────────────────────
+function buildTranscript(s) {
+  const container = document.getElementById('transcript');
+  container.innerHTML = '';
+  const seenUserTexts = new Set();
+  const voiceName = s.config?.voice || s.mode || 'Bot';
+
+  for (const t of (s.turns || [])) {
+    if (t.user_text && t.user_text.trim()) {
+      const norm = t.user_text.trim().toLowerCase();
+      if (!seenUserTexts.has(norm)) {
+        seenUserTexts.add(norm);
+        const line = document.createElement('div');
+        line.className = 'transcript-line caller-line';
+        line.dataset.showAt = t.user_started_at ? (t.user_started_at - sessionStartTime) : 0;
+        line.innerHTML = `<span class="spk caller">You</span><span class="ltxt">${escHtml(t.user_text.trim())}</span>`;
+        container.appendChild(line);
+      }
+    }
+    if (t.bot_text && t.bot_text.trim()) {
+      const line = document.createElement('div');
+      line.className = 'transcript-line bot-line';
+      line.dataset.showAt = t.bot_started_at ? (t.bot_started_at - sessionStartTime) : 0;
+      line.dataset.botText = t.bot_text.trim();
+      line.dataset.botStartAt = t.bot_started_at ? (t.bot_started_at - sessionStartTime) : 0;
+      line.dataset.botStopAt = t.bot_stopped_at ? (t.bot_stopped_at - sessionStartTime) : 0;
+      line.innerHTML = `<span class="spk bot">${escHtml(voiceName)}</span><span class="ltxt"></span>`;
+      container.appendChild(line);
+    }
+  }
+}
+
+// ─── Waveform ───────────────────────────────────────────────────────
+function initAudioContext() {
+  if (audioContext) return;
+  audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  analyser = audioContext.createAnalyser();
+  analyser.fftSize = 256;
+  analyser.smoothingTimeConstant = 0.8;
+  dataArray = new Uint8Array(analyser.frequencyBinCount);
+}
+
+function connectSource() {
+  if (sourceConnected) return;
+  initAudioContext();
+  const source = audioContext.createMediaElementSource(audioEl);
+  source.connect(analyser);
+  analyser.connect(audioContext.destination);
+  sourceConnected = true;
+}
+
+function resetAudioSource() {
+  // We can't disconnect a MediaElementSource, so we need to create a new audio element
+  if (sourceConnected) {
+    const oldAudio = audioEl;
+    oldAudio.pause();
+    oldAudio.src = '';
+    const newAudio = document.createElement('audio');
+    newAudio.id = 'audio';
+    newAudio.preload = 'auto';
+    newAudio.crossOrigin = 'anonymous';
+    oldAudio.replaceWith(newAudio);
+    audioEl = newAudio;
+    sourceConnected = false;
+    audioContext = null;
+    analyser = null;
+    dataArray = null;
+  }
+}
+
+function drawIdleWaveform() {
+  const canvas = document.getElementById('waveform-canvas');
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = canvas.offsetWidth * dpr;
+  canvas.height = canvas.offsetHeight * dpr;
+  ctx.scale(dpr, dpr);
+  const w = canvas.offsetWidth, h = canvas.offsetHeight;
+  const barCount = 80;
+  const barWidth = Math.max(2, (w / barCount) * 0.6);
+  const gap = w / barCount;
+  const accent = getComputedStyle(document.querySelector('.main')).getPropertyValue('--bot-accent').trim() || '#56CAF4';
+  ctx.clearRect(0, 0, w, h);
+  for (let i = 0; i < barCount; i++) {
+    const x = i * gap + gap / 2 - barWidth / 2;
+    const barH = 4 + Math.random() * 8;
+    ctx.fillStyle = accent;
+    ctx.globalAlpha = 0.2;
+    ctx.beginPath();
+    ctx.roundRect(x, h / 2 - barH / 2, barWidth, barH, 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawWaveform() {
+  if (!analyser) return;
+  const canvas = document.getElementById('waveform-canvas');
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const targetW = canvas.offsetWidth * dpr, targetH = canvas.offsetHeight * dpr;
+  if (canvas.width !== targetW || canvas.height !== targetH) {
+    canvas.width = targetW; canvas.height = targetH;
+    ctx.scale(dpr, dpr);
+  }
+  const w = canvas.offsetWidth, h = canvas.offsetHeight;
+  analyser.getByteFrequencyData(dataArray);
+  const barCount = 80;
+  const barWidth = Math.max(2, (w / barCount) * 0.6);
+  const gap = w / barCount;
+  const accent = getComputedStyle(document.querySelector('.main')).getPropertyValue('--bot-accent').trim() || '#56CAF4';
+  ctx.clearRect(0, 0, w, h);
+  for (let i = 0; i < barCount; i++) {
+    const binIndex = Math.floor((i / barCount) * dataArray.length);
+    const value = dataArray[binIndex] || 0;
+    const normalized = value / 255;
+    const minH = 3, maxH = h * 0.8;
+    const barH = minH + normalized * (maxH - minH);
+    const x = i * gap + gap / 2 - barWidth / 2;
+    const y = h / 2 - barH / 2;
+    ctx.fillStyle = accent;
+    ctx.globalAlpha = 0.15 + normalized * 0.85;
+    ctx.beginPath();
+    ctx.roundRect(x, y, barWidth, barH, 2);
+    ctx.fill();
+    if (normalized > 0.5) {
+      ctx.globalAlpha = normalized * 0.15;
+      ctx.shadowColor = accent; ctx.shadowBlur = 8;
+      ctx.beginPath();
+      ctx.roundRect(x - 1, y - 1, barWidth + 2, barH + 2, 3);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ─── Playback ───────────────────────────────────────────────────────
+function togglePlay() {
+  if (!currentSession?.recording_url) return;
+  if (isPlaying) {
+    stopPlayback();
+  } else {
+    connectSource();
+    if (audioContext.state === 'suspended') audioContext.resume();
+    audioEl.play();
+    isPlaying = true;
+    document.getElementById('play-btn').classList.add('hidden');
+    tick();
+  }
+}
+
+function stopPlayback() {
+  if (isPlaying) {
+    audioEl.pause();
+    isPlaying = false;
+    document.getElementById('play-btn').innerHTML = '&#9654;';
+    document.getElementById('play-btn').classList.remove('hidden');
+    cancelAnimationFrame(animationFrame);
+  }
+}
+
+function tick() {
+  if (!isPlaying) return;
+  const cur = audioEl.currentTime;
+  const dur = audioEl.duration || 1;
+  document.getElementById('progress-fill').style.width = `${(cur / dur) * 100}%`;
+  document.getElementById('time-cur').textContent = fmtTime(cur);
+  drawWaveform();
+  const sessDur = getSessionDuration();
+  const sessTime = sessDur > 0 ? (cur / dur) * sessDur : cur;
+  updateTranscript(sessTime);
+  animationFrame = requestAnimationFrame(tick);
+}
+
+function getSessionDuration() {
+  let max = 0;
+  for (const t of (currentSession?.turns || [])) {
+    if (t.bot_stopped_at) { const r = t.bot_stopped_at - sessionStartTime; if (r > max) max = r; }
+    if (t.user_stopped_at) { const r = t.user_stopped_at - sessionStartTime; if (r > max) max = r; }
+  }
+  return max;
+}
+
+function updateTranscript(sessTime) {
+  const lines = document.querySelectorAll('.transcript-line');
+  for (const line of lines) {
+    const showAt = parseFloat(line.dataset.showAt) || 0;
+    if (sessTime >= showAt) {
+      if (!line.classList.contains('visible')) {
+        line.classList.add('visible');
+        line.scrollIntoView({ behavior: 'smooth', block: 'end' });
+      }
+      if (line.classList.contains('bot-line') && line.dataset.botText) {
+        const textEl = line.querySelector('.ltxt');
+        const full = line.dataset.botText;
+        const bStart = parseFloat(line.dataset.botStartAt) || 0;
+        const bStop = parseFloat(line.dataset.botStopAt) || bStart + 3;
+        const dur = bStop - bStart;
+        if (dur > 0 && sessTime < bStop) {
+          const p = Math.min((sessTime - bStart) / dur, 1);
+          const n = Math.floor(p * full.length);
+          textEl.innerHTML = escHtml(full.substring(0, n)) + '<span class="typing-cursor"></span>';
+        } else {
+          textEl.textContent = full;
+        }
+      }
+    }
+  }
+}
+
+// Seek
+document.getElementById('progress-track').addEventListener('click', (e) => {
+  if (!currentSession?.recording_url || !audioEl.duration) return;
+  const rect = e.currentTarget.getBoundingClientRect();
+  const pct = (e.clientX - rect.left) / rect.width;
+  audioEl.currentTime = pct * audioEl.duration;
+  document.getElementById('progress-fill').style.width = `${pct * 100}%`;
+  document.getElementById('time-cur').textContent = fmtTime(audioEl.currentTime);
+  if (!isPlaying) {
+    const sessDur = getSessionDuration();
+    const sessTime = (audioEl.currentTime / audioEl.duration) * sessDur;
+    updateTranscript(sessTime);
+  }
+});
+
+// ─── Compare ────────────────────────────────────────────────────────
+async function runCompare() {
+  const checked = [...checkedSessionIds];
+  if (checked.length < 2) { alert('Select at least 2 sessions.'); return; }
+  if (checked.length > 5) { alert('Select at most 5 sessions.'); return; }
+  const data = await fetchCompare(checked);
+  document.getElementById('compare-empty').style.display = 'none';
+  document.getElementById('compare-content').style.display = '';
+  renderCompare(data);
+}
+
+function renderCompare(data) {
+  const ctx1 = document.getElementById('compare-tts-chart');
+  if (charts.compareTts) charts.compareTts.destroy();
+  charts.compareTts = new Chart(ctx1, {
+    type: 'bar',
+    data: {
+      labels: data.map(s => `${providerLabel(s)} (${s.session_id.slice(0,6)})`),
+      datasets: [{ label: 'Avg TTS TTFB (ms)', data: data.map(s => s.summary?.avg_tts_ttfb_ms || 0),
+        backgroundColor: data.map((s,i) => providerColor(s,i).bg),
+        borderColor: data.map((s,i) => providerColor(s,i).border), borderWidth: 1, borderRadius: 6 }]
+    },
+    options: { ...chartOpts('ms'), plugins: { ...chartOpts('ms').plugins, legend: { display: false } } },
+  });
+
+  const ctx2 = document.getElementById('compare-pipeline-chart');
+  if (charts.comparePipeline) charts.comparePipeline.destroy();
+  charts.comparePipeline = new Chart(ctx2, {
+    type: 'bar',
+    data: {
+      labels: data.map(s => `${providerLabel(s)} (${s.session_id.slice(0,6)})`),
+      datasets: [
+        { label: 'STT', data: data.map(s => s.summary?.avg_stt_ttfb_ms || 0), backgroundColor: 'rgba(251,146,60,0.8)', borderRadius: 2 },
+        { label: 'LLM', data: data.map(s => s.summary?.avg_llm_ttfb_ms || 0), backgroundColor: 'rgba(52,211,153,0.8)', borderRadius: 2 },
+        { label: 'TTS', data: data.map(s => s.summary?.avg_tts_ttfb_ms || 0), backgroundColor: 'rgba(248,113,113,0.8)', borderRadius: 2 },
+      ]
+    },
+    options: { ...chartOpts('ms'), scales: { ...chartOpts('ms').scales, x: { ...chartOpts('ms').scales.x, stacked: true }, y: { ...chartOpts('ms').scales.y, stacked: true } } },
+  });
+
+  document.getElementById('compare-summary-body').innerHTML = data.map(s => {
+    const sum = s.summary || {};
+    return `<tr>
+      <td class="mono">${s.session_id.slice(0,8)}</td>
+      <td><span class="provider-tag ${s.mode}" style="font-size:11px">${providerLabel(s)}</span></td>
+      <td class="mono">${sum.total_turns || 0}</td>
+      <td class="mono">${sum.avg_response_latency_ms || 0}ms</td>
+      <td class="mono">${sum.avg_stt_ttfb_ms != null ? sum.avg_stt_ttfb_ms + 'ms' : '-'}</td>
+      <td class="mono">${sum.avg_llm_ttfb_ms != null ? sum.avg_llm_ttfb_ms + 'ms' : '-'}</td>
+      <td class="mono" style="color:var(--red)">${sum.avg_tts_ttfb_ms != null ? sum.avg_tts_ttfb_ms + 'ms' : '-'}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ─── Voices Tab ─────────────────────────────────────────────────────
+async function loadProviders() {
+  const data = await fetchProvidersSummary();
+  if (!data.length) return;
+  document.getElementById('providers-loading').style.display = 'none';
+  document.getElementById('providers-content').style.display = '';
+  renderProviders(data);
+}
+
+function renderProviders(data) {
+  const labels = data.map(d => d.label);
+  const colors = data.map(d => (PROVIDER_COLORS[d.provider] || { bg: '#888' }).bg);
+  const borders = data.map(d => (PROVIDER_COLORS[d.provider] || { border: '#888' }).border);
+
+  const ctx1 = document.getElementById('prov-tts-chart');
+  if (charts.provTts) charts.provTts.destroy();
+  charts.provTts = new Chart(ctx1, {
+    type: 'bar',
+    data: { labels, datasets: [{ label: 'Avg TTS TTFB (ms)', data: data.map(d => d.avg_tts_ttfb_ms || 0), backgroundColor: colors, borderColor: borders, borderWidth: 1, borderRadius: 6 }] },
+    options: { ...chartOpts('ms'), plugins: { ...chartOpts('ms').plugins, legend: { display: false } } },
+  });
+
+  const ctx2 = document.getElementById('prov-pipeline-chart');
+  if (charts.provPipeline) charts.provPipeline.destroy();
+  charts.provPipeline = new Chart(ctx2, {
+    type: 'bar',
+    data: { labels, datasets: [
+      { label: 'STT', data: data.map(d => d.avg_stt_ttfb_ms || 0), backgroundColor: 'rgba(251,146,60,0.8)', borderRadius: 2 },
+      { label: 'LLM', data: data.map(d => d.avg_llm_ttfb_ms || 0), backgroundColor: 'rgba(52,211,153,0.8)', borderRadius: 2 },
+      { label: 'TTS', data: data.map(d => d.avg_tts_ttfb_ms || 0), backgroundColor: 'rgba(248,113,113,0.8)', borderRadius: 2 },
+    ] },
+    options: { ...chartOpts('ms'), scales: { ...chartOpts('ms').scales, x: { ...chartOpts('ms').scales.x, stacked: true }, y: { ...chartOpts('ms').scales.y, stacked: true } } },
+  });
+
+  document.getElementById('prov-summary-body').innerHTML = data.map(d => `
+    <tr>
+      <td><span class="provider-tag ${d.provider}" style="font-size:11px">${d.label}</span></td>
+      <td class="text-dim" style="font-size:12px">${d.scenario || '-'}</td>
+      <td class="mono">${d.session_count}</td>
+      <td class="mono">${d.avg_response_latency_ms != null ? d.avg_response_latency_ms + 'ms' : '-'}</td>
+      <td class="mono">${d.avg_stt_ttfb_ms != null ? d.avg_stt_ttfb_ms + 'ms' : '-'}</td>
+      <td class="mono">${d.avg_llm_ttfb_ms != null ? d.avg_llm_ttfb_ms + 'ms' : '-'}</td>
+      <td class="mono" style="color:var(--red)">${d.avg_tts_ttfb_ms != null ? d.avg_tts_ttfb_ms + 'ms' : '-'}</td>
+    </tr>`).join('');
+}
+
+// ─── Utils ──────────────────────────────────────────────────────────
+function chartOpts(unit) {
+  return {
+    responsive: true, maintainAspectRatio: false,
+    plugins: { legend: { labels: { color: '#a1a1aa', font: { family: 'Inter', size: 12 } } }, tooltip: { backgroundColor: '#18181b', titleColor: '#e4e4e7', bodyColor: '#e4e4e7', borderColor: 'rgba(255,255,255,0.1)', borderWidth: 1 } },
+    scales: { x: { ticks: { color: '#a1a1aa' }, grid: { color: 'rgba(255,255,255,0.05)' } }, y: { beginAtZero: true, ticks: { color: '#a1a1aa', callback: v => `${v}${unit}` }, grid: { color: 'rgba(255,255,255,0.05)' } } },
+  };
+}
+
+function fmtTime(secs) {
+  if (!isFinite(secs)) return '0:00';
+  const m = Math.floor(secs / 60);
+  const s = Math.floor(secs % 60);
+  return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+// ─── Init ───────────────────────────────────────────────────────────
+loadSessions();
+setInterval(loadSessions, 5000);
+</script>
+</body>
+</html>
