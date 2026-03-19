@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>xAI Voice Replay</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #09090f;
+    --surface: rgba(255,255,255,0.04);
+    --border: rgba(255,255,255,0.08);
+    --text: #e4e4e7;
+    --text-dim: #a1a1aa;
+    --bot-accent: #56CAF4;
+    --bot-accent-dim: rgba(86,202,244,0.15);
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', system-ui, sans-serif;
+    line-height: 1.5;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    overflow: hidden;
+  }
+
+  h1, h2, h3 { font-family: 'Sora', sans-serif; }
+  .mono { font-family: 'JetBrains Mono', monospace; }
+
+  /* ─── Voice colors ─── */
+  .voice-ara { --bot-accent: #e94560; --bot-accent-dim: rgba(233,69,96,0.15); }
+  .voice-eve { --bot-accent: #a78bfa; --bot-accent-dim: rgba(167,139,250,0.15); }
+  .voice-rex { --bot-accent: #fb923c; --bot-accent-dim: rgba(251,146,60,0.15); }
+  .voice-sal { --bot-accent: #34d399; --bot-accent-dim: rgba(52,211,153,0.15); }
+  .voice-leo { --bot-accent: #56CAF4; --bot-accent-dim: rgba(86,202,244,0.15); }
+
+  /* ─── Header ─── */
+  .header {
+    width: 100%;
+    padding: 32px 24px 12px;
+    text-align: center;
+    flex-shrink: 0;
+  }
+  .header .brand {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+  }
+  .header h1 {
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--bot-accent);
+    margin-bottom: 4px;
+  }
+  .header .scenario {
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+
+  /* ─── Waveform center area ─── */
+  .waveform-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    max-width: 700px;
+    padding: 0 24px;
+    position: relative;
+  }
+
+  .waveform-canvas {
+    width: 100%;
+    height: 200px;
+    border-radius: 12px;
+  }
+
+  /* Play button overlaid on waveform */
+  .play-overlay {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+  }
+  .play-btn {
+    width: 64px;
+    height: 64px;
+    border-radius: 50%;
+    border: 2px solid var(--bot-accent);
+    background: var(--bot-accent-dim);
+    color: var(--bot-accent);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 24px;
+    transition: all 0.2s;
+    backdrop-filter: blur(8px);
+  }
+  .play-btn:hover { background: var(--bot-accent); color: var(--bg); }
+  .play-btn.hidden { display: none; }
+
+  /* Progress + time */
+  .progress-row {
+    width: 100%;
+    max-width: 700px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 16px 24px 0;
+    flex-shrink: 0;
+  }
+  .time-display {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
+  .progress-bar-bg {
+    flex: 1;
+    height: 4px;
+    background: rgba(255,255,255,0.08);
+    border-radius: 2px;
+    overflow: hidden;
+    cursor: pointer;
+  }
+  .progress-bar-fill {
+    height: 100%;
+    background: var(--bot-accent);
+    border-radius: 2px;
+    width: 0%;
+    transition: width 0.1s linear;
+  }
+
+  /* ─── Transcript area (bottom) ─── */
+  .transcript-area {
+    width: 100%;
+    max-width: 700px;
+    flex-shrink: 0;
+    padding: 16px 24px 28px;
+    max-height: 30vh;
+    overflow-y: auto;
+  }
+
+  .transcript-line {
+    display: flex;
+    gap: 10px;
+    padding: 6px 0;
+    opacity: 0;
+    transform: translateY(8px);
+    transition: opacity 0.3s ease, transform 0.3s ease;
+    font-size: 14px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .transcript-line.visible {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  .transcript-line .speaker-tag {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 2px 8px;
+    border-radius: 4px;
+    white-space: nowrap;
+    height: fit-content;
+    margin-top: 2px;
+    flex-shrink: 0;
+  }
+  .transcript-line .speaker-tag.caller {
+    background: rgba(255,255,255,0.06);
+    color: var(--text-dim);
+  }
+  .transcript-line .speaker-tag.bot {
+    background: var(--bot-accent-dim);
+    color: var(--bot-accent);
+  }
+  .transcript-line .line-text {
+    color: var(--text);
+    flex: 1;
+  }
+  .transcript-line.caller-line .line-text {
+    color: var(--text-dim);
+  }
+  .transcript-line .typing-cursor {
+    display: inline-block;
+    width: 2px;
+    height: 13px;
+    background: var(--bot-accent);
+    margin-left: 2px;
+    vertical-align: text-bottom;
+    animation: blink 0.6s infinite;
+  }
+  @keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header" id="header">
+  <div class="brand">xAI Grok TTS</div>
+  <h1 id="voice-name">Loading...</h1>
+  <div class="scenario" id="scenario-label"></div>
+</div>
+
+<div class="waveform-area">
+  <canvas class="waveform-canvas" id="waveform-canvas"></canvas>
+  <div class="play-overlay">
+    <button class="play-btn" id="play-btn" onclick="togglePlay()">&#9654;</button>
+  </div>
+</div>
+
+<div class="progress-row">
+  <span class="time-display" id="time-display">0:00</span>
+  <div class="progress-bar-bg" id="progress-bg">
+    <div class="progress-bar-fill" id="progress-fill"></div>
+  </div>
+  <span class="time-display" id="time-total">0:00</span>
+</div>
+
+<div class="transcript-area" id="transcript"></div>
+
+<audio id="audio" preload="auto" crossorigin="anonymous"></audio>
+
+<script>
+// ─── State ──────────────────────────────────────────────────────────
+let session = null;
+let turns = [];
+let audioEl = document.getElementById('audio');
+let isPlaying = false;
+let sessionStartTime = 0;
+let animationFrame = null;
+
+// Web Audio API for waveform
+let audioContext = null;
+let analyser = null;
+let dataArray = null;
+let sourceConnected = false;
+
+const VOICE_CLASSES = {
+  ara: 'voice-ara', eve: 'voice-eve', rex: 'voice-rex',
+  sal: 'voice-sal', leo: 'voice-leo',
+};
+
+// ─── Load session ───────────────────────────────────────────────────
+async function loadSession() {
+  const pathParts = window.location.pathname.split('/');
+  const sessionId = pathParts[pathParts.length - 1];
+
+  const resp = await fetch(`/api/sessions/${sessionId}`);
+  if (!resp.ok) {
+    document.getElementById('transcript').innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-dim)">Session not found</div>';
+    return;
+  }
+
+  session = await resp.json();
+  turns = session.turns || [];
+
+  const config = session.config || {};
+  const voice = (config.voice || session.mode || 'unknown').toLowerCase();
+  const voiceName = (config.voice || session.mode || 'Unknown');
+  const scenarioLabel = config.scenario_label || '';
+
+  // Apply voice color
+  document.body.classList.add(VOICE_CLASSES[voice] || 'voice-leo');
+
+  // Header
+  document.getElementById('voice-name').textContent = voiceName;
+  document.getElementById('scenario-label').textContent = scenarioLabel;
+  document.title = `${voiceName} — xAI Voice Replay`;
+
+  // Find session start time
+  sessionStartTime = Infinity;
+  for (const t of turns) {
+    if (t.user_started_at && t.user_started_at < sessionStartTime) sessionStartTime = t.user_started_at;
+    if (t.bot_started_at && t.bot_started_at < sessionStartTime) sessionStartTime = t.bot_started_at;
+  }
+  if (!isFinite(sessionStartTime)) sessionStartTime = 0;
+
+  // Build transcript lines (deduplicated)
+  buildTranscript();
+
+  // Setup audio
+  if (session.recording_url) {
+    audioEl.src = session.recording_url;
+    audioEl.addEventListener('loadedmetadata', () => {
+      document.getElementById('time-total').textContent = fmtTime(audioEl.duration);
+    });
+    audioEl.addEventListener('ended', () => {
+      isPlaying = false;
+      document.getElementById('play-btn').innerHTML = '&#9654;';
+      document.getElementById('play-btn').classList.remove('hidden');
+      cancelAnimationFrame(animationFrame);
+    });
+  }
+
+  // Draw idle waveform
+  drawIdleWaveform();
+}
+
+// ─── Build transcript (deduplicated) ────────────────────────────────
+function buildTranscript() {
+  const container = document.getElementById('transcript');
+  container.innerHTML = '';
+
+  const seenUserTexts = new Set();
+  const voiceName = session.config?.voice || session.mode || 'Bot';
+
+  for (const t of turns) {
+    // User line (skip duplicates and empties)
+    if (t.user_text && t.user_text.trim()) {
+      const normalized = t.user_text.trim().toLowerCase();
+      if (!seenUserTexts.has(normalized)) {
+        seenUserTexts.add(normalized);
+        const line = document.createElement('div');
+        line.className = 'transcript-line caller-line';
+        line.dataset.showAt = t.user_started_at ? (t.user_started_at - sessionStartTime) : 0;
+        line.innerHTML = `<span class="speaker-tag caller">You</span><span class="line-text">${escHtml(t.user_text.trim())}</span>`;
+        container.appendChild(line);
+      }
+    }
+
+    // Bot line (skip empties)
+    if (t.bot_text && t.bot_text.trim()) {
+      const line = document.createElement('div');
+      line.className = 'transcript-line bot-line';
+      line.dataset.showAt = t.bot_started_at ? (t.bot_started_at - sessionStartTime) : 0;
+      line.dataset.botText = t.bot_text.trim();
+      line.dataset.botStartAt = t.bot_started_at ? (t.bot_started_at - sessionStartTime) : 0;
+      line.dataset.botStopAt = t.bot_stopped_at ? (t.bot_stopped_at - sessionStartTime) : 0;
+      line.innerHTML = `<span class="speaker-tag bot">${escHtml(voiceName)}</span><span class="line-text"></span>`;
+      container.appendChild(line);
+    }
+  }
+}
+
+// ─── Web Audio Waveform ─────────────────────────────────────────────
+function initAudioContext() {
+  if (audioContext) return;
+  audioContext = new (window.AudioContext || window.webkitAudioContext)();
+  analyser = audioContext.createAnalyser();
+  analyser.fftSize = 256;
+  analyser.smoothingTimeConstant = 0.8;
+  dataArray = new Uint8Array(analyser.frequencyBinCount);
+}
+
+function connectSource() {
+  if (sourceConnected) return;
+  initAudioContext();
+  const source = audioContext.createMediaElementSource(audioEl);
+  source.connect(analyser);
+  analyser.connect(audioContext.destination);
+  sourceConnected = true;
+}
+
+function drawIdleWaveform() {
+  const canvas = document.getElementById('waveform-canvas');
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = canvas.offsetWidth * dpr;
+  canvas.height = canvas.offsetHeight * dpr;
+  ctx.scale(dpr, dpr);
+
+  const w = canvas.offsetWidth;
+  const h = canvas.offsetHeight;
+  const barCount = 80;
+  const barWidth = Math.max(2, (w / barCount) * 0.6);
+  const gap = w / barCount;
+
+  const accent = getComputedStyle(document.body).getPropertyValue('--bot-accent').trim() || '#56CAF4';
+
+  ctx.clearRect(0, 0, w, h);
+  for (let i = 0; i < barCount; i++) {
+    const x = i * gap + gap / 2 - barWidth / 2;
+    const barH = 4 + Math.random() * 8;
+    ctx.fillStyle = accent;
+    ctx.globalAlpha = 0.2;
+    ctx.beginPath();
+    ctx.roundRect(x, h / 2 - barH / 2, barWidth, barH, 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawWaveform() {
+  if (!analyser) return;
+
+  const canvas = document.getElementById('waveform-canvas');
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+
+  // Resize if needed
+  const targetW = canvas.offsetWidth * dpr;
+  const targetH = canvas.offsetHeight * dpr;
+  if (canvas.width !== targetW || canvas.height !== targetH) {
+    canvas.width = targetW;
+    canvas.height = targetH;
+    ctx.scale(dpr, dpr);
+  }
+
+  const w = canvas.offsetWidth;
+  const h = canvas.offsetHeight;
+
+  analyser.getByteFrequencyData(dataArray);
+
+  const barCount = 80;
+  const barWidth = Math.max(2, (w / barCount) * 0.6);
+  const gap = w / barCount;
+
+  const accent = getComputedStyle(document.body).getPropertyValue('--bot-accent').trim() || '#56CAF4';
+
+  ctx.clearRect(0, 0, w, h);
+
+  for (let i = 0; i < barCount; i++) {
+    // Map bar index to frequency bin
+    const binIndex = Math.floor((i / barCount) * dataArray.length);
+    const value = dataArray[binIndex] || 0;
+    const normalized = value / 255;
+
+    const minH = 3;
+    const maxH = h * 0.8;
+    const barH = minH + normalized * (maxH - minH);
+
+    const x = i * gap + gap / 2 - barWidth / 2;
+    const y = h / 2 - barH / 2;
+
+    // Glow for active bars
+    const alpha = 0.15 + normalized * 0.85;
+    ctx.fillStyle = accent;
+    ctx.globalAlpha = alpha;
+
+    ctx.beginPath();
+    ctx.roundRect(x, y, barWidth, barH, 2);
+    ctx.fill();
+
+    // Subtle glow effect for loud bars
+    if (normalized > 0.5) {
+      ctx.globalAlpha = normalized * 0.15;
+      ctx.shadowColor = accent;
+      ctx.shadowBlur = 8;
+      ctx.beginPath();
+      ctx.roundRect(x - 1, y - 1, barWidth + 2, barH + 2, 3);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ─── Playback ───────────────────────────────────────────────────────
+function togglePlay() {
+  if (!session) return;
+
+  if (session.recording_url) {
+    if (isPlaying) {
+      audioEl.pause();
+      isPlaying = false;
+      document.getElementById('play-btn').innerHTML = '&#9654;';
+      document.getElementById('play-btn').classList.remove('hidden');
+      cancelAnimationFrame(animationFrame);
+    } else {
+      connectSource();
+      if (audioContext.state === 'suspended') audioContext.resume();
+      audioEl.play();
+      isPlaying = true;
+      document.getElementById('play-btn').classList.add('hidden');
+      tick();
+    }
+  } else {
+    if (!isPlaying) startSyntheticPlayback();
+  }
+}
+
+function tick() {
+  if (!isPlaying) return;
+  const currentTime = audioEl.currentTime;
+  const duration = audioEl.duration || 1;
+
+  // Progress
+  document.getElementById('progress-fill').style.width = `${(currentTime / duration) * 100}%`;
+  document.getElementById('time-display').textContent = fmtTime(currentTime);
+
+  // Waveform from actual audio data
+  drawWaveform();
+
+  // Transcript sync
+  const sessionDuration = getSessionDuration();
+  const sessionTime = sessionDuration > 0 ? (currentTime / duration) * sessionDuration : currentTime;
+  updateTranscript(sessionTime);
+
+  animationFrame = requestAnimationFrame(tick);
+}
+
+function getSessionDuration() {
+  let maxTime = 0;
+  for (const t of turns) {
+    if (t.bot_stopped_at) {
+      const rel = t.bot_stopped_at - sessionStartTime;
+      if (rel > maxTime) maxTime = rel;
+    }
+    if (t.user_stopped_at) {
+      const rel = t.user_stopped_at - sessionStartTime;
+      if (rel > maxTime) maxTime = rel;
+    }
+  }
+  return maxTime;
+}
+
+function updateTranscript(sessionTime) {
+  const lines = document.querySelectorAll('.transcript-line');
+  for (const line of lines) {
+    const showAt = parseFloat(line.dataset.showAt) || 0;
+
+    if (sessionTime >= showAt) {
+      if (!line.classList.contains('visible')) {
+        line.classList.add('visible');
+        line.scrollIntoView({ behavior: 'smooth', block: 'end' });
+      }
+
+      // Typing animation for bot lines
+      if (line.classList.contains('bot-line') && line.dataset.botText) {
+        const textEl = line.querySelector('.line-text');
+        const fullText = line.dataset.botText;
+        const botStart = parseFloat(line.dataset.botStartAt) || 0;
+        const botStop = parseFloat(line.dataset.botStopAt) || botStart + 3;
+        const speakDuration = botStop - botStart;
+
+        if (speakDuration > 0 && sessionTime < botStop) {
+          const progress = Math.min((sessionTime - botStart) / speakDuration, 1);
+          const charCount = Math.floor(progress * fullText.length);
+          textEl.innerHTML = escHtml(fullText.substring(0, charCount)) + '<span class="typing-cursor"></span>';
+        } else {
+          textEl.textContent = fullText;
+        }
+      }
+    }
+  }
+}
+
+// ─── Synthetic playback (no recording) ──────────────────────────────
+function startSyntheticPlayback() {
+  isPlaying = true;
+  document.getElementById('play-btn').classList.add('hidden');
+  const sessionDuration = getSessionDuration();
+  const startedAt = performance.now();
+
+  function syntheticTick() {
+    if (!isPlaying) return;
+    const elapsed = (performance.now() - startedAt) / 1000;
+    document.getElementById('progress-fill').style.width = sessionDuration > 0 ? `${(elapsed / sessionDuration) * 100}%` : '0%';
+    document.getElementById('time-display').textContent = fmtTime(elapsed);
+    updateTranscript(elapsed);
+    if (elapsed < sessionDuration) {
+      animationFrame = requestAnimationFrame(syntheticTick);
+    } else {
+      updateTranscript(sessionDuration + 10);
+      isPlaying = false;
+      document.getElementById('play-btn').innerHTML = '&#9654;';
+      document.getElementById('play-btn').classList.remove('hidden');
+    }
+  }
+  syntheticTick();
+}
+
+// ─── Seek ───────────────────────────────────────────────────────────
+document.getElementById('progress-bg').addEventListener('click', (e) => {
+  if (!session?.recording_url || !audioEl.duration) return;
+  const rect = e.currentTarget.getBoundingClientRect();
+  const pct = (e.clientX - rect.left) / rect.width;
+  audioEl.currentTime = pct * audioEl.duration;
+  document.getElementById('progress-fill').style.width = `${pct * 100}%`;
+  document.getElementById('time-display').textContent = fmtTime(audioEl.currentTime);
+  if (!isPlaying) {
+    const sessionDuration = getSessionDuration();
+    const sessionTime = (audioEl.currentTime / audioEl.duration) * sessionDuration;
+    updateTranscript(sessionTime);
+  }
+});
+
+// ─── Utils ──────────────────────────────────────────────────────────
+function fmtTime(secs) {
+  if (!isFinite(secs)) return '0:00';
+  const m = Math.floor(secs / 60);
+  const s = Math.floor(secs % 60);
+  return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// ─── Init ───────────────────────────────────────────────────────────
+loadSession();
+</script>
+</body>
+</html>
