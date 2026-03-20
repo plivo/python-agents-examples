@@ -174,7 +174,8 @@ class SileroVADProcessor:
     when the user has finished a turn.
     """
 
-    def __init__(self):
+    def __init__(self, call_id: str = ""):
+        self._call_id = call_id
         self._model = load_silero_vad(onnx=True)
         self._buffer = np.array([], dtype=np.float32)
         self._is_speaking = False
@@ -219,7 +220,9 @@ class SileroVADProcessor:
                     self._is_speaking = True
                     self._silence_frames = 0
                     speech_started = True
-                    logger.debug(f"VAD: speech started (prob={speech_prob:.2f})")
+                    logger.bind(call_id=self._call_id).debug(
+                        f"VAD: speech started (prob={speech_prob:.2f})"
+                    )
             else:
                 if speech_prob < VAD_END_THRESHOLD:
                     self._silence_frames += 1
@@ -227,7 +230,9 @@ class SileroVADProcessor:
                         self._is_speaking = False
                         self._silence_frames = 0
                         speech_ended = True
-                        logger.debug(f"VAD: speech ended (prob={speech_prob:.2f})")
+                        logger.bind(call_id=self._call_id).debug(
+                            f"VAD: speech ended (prob={speech_prob:.2f})"
+                        )
                 else:
                     self._silence_frames = 0
 

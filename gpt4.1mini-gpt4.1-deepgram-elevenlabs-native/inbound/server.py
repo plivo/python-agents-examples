@@ -248,7 +248,9 @@ async def answer_webhook(
         except Exception:
             pass
 
-    logger.info(f"Incoming call: CallUUID={call_uuid}, From={from_number}, To={to_number}")
+    logger.bind(call_id=call_uuid).info(
+        f"Incoming call: CallUUID={call_uuid}, From={from_number}, To={to_number}"
+    )
 
     body_data = {
         "call_uuid": call_uuid,
@@ -283,8 +285,9 @@ async def hangup_webhook(request: Request) -> Response:
     """Plivo hangup webhook - called when a call ends."""
     try:
         form_data = await request.form()
-        logger.info(
-            f"Call ended: CallUUID={form_data.get('CallUUID')}, "
+        call_uuid = str(form_data.get("CallUUID", ""))
+        logger.bind(call_id=call_uuid).info(
+            f"Call ended: CallUUID={call_uuid}, "
             f"Duration={form_data.get('Duration')}s, "
             f"HangupCause={form_data.get('HangupCause')}"
         )
@@ -327,13 +330,14 @@ async def websocket_endpoint(
 ) -> None:
     """WebSocket endpoint for bidirectional audio streaming with Plivo."""
     await websocket.accept()
-    logger.info("WebSocket connection accepted")
 
     call_data = {}
+    call_id = "unknown"
     if body:
         try:
             call_data = json.loads(base64.b64decode(body).decode())
-            logger.info(f"Call metadata: {call_data}")
+            call_id = call_data.get("call_uuid", "unknown")
+            logger.bind(call_id=call_id).info(f"Call metadata: {call_data}")
         except Exception as e:
             logger.warning(f"Failed to decode call metadata: {e}")
 
@@ -342,14 +346,18 @@ async def websocket_endpoint(
         start_message = json.loads(start_data)
 
         if start_message.get("event") != "start":
-            logger.error(f"Expected start event, got: {start_message.get('event')}")
+            logger.bind(call_id=call_id).error(
+                f"Expected start event, got: {start_message.get('event')}"
+            )
             await websocket.close()
             return
 
         start_info = start_message.get("start", {})
         call_id = start_info.get("callId", call_data.get("call_uuid", "unknown"))
         stream_id = start_info.get("streamId")
-        logger.info(f"Plivo stream started: callId={call_id}, streamId={stream_id}")
+        logger.bind(call_id=call_id).info(
+            f"Plivo stream started: callId={call_id}, streamId={stream_id}"
+        )
 
         await run_agent(
             websocket=websocket,
@@ -362,9 +370,9 @@ async def websocket_endpoint(
         )
 
     except WebSocketDisconnect:
-        logger.info("WebSocket disconnected")
+        logger.bind(call_id=call_id).info("WebSocket disconnected")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.bind(call_id=call_id).error(f"WebSocket error: {e}")
     finally:
         with contextlib.suppress(Exception):
             await websocket.close()
