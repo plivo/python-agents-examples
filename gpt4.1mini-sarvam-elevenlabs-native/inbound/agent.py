@@ -65,7 +65,7 @@ def _traced(span_name: str):
             if not _tracer:
                 return await fn(self, *args, **kwargs)
             with _tracer.start_as_current_span(
-                span_name, attributes={"call_id": self.call_id[:8]}
+                span_name, attributes={"call_id": self.call_id}
             ):
                 return await fn(self, *args, **kwargs)
 
@@ -83,7 +83,8 @@ class SarvamStreamingSTT:
     turn processing.
     """
 
-    def __init__(self):
+    def __init__(self, call_id: str = ""):
+        self._call_id = call_id
         self._ws = None
         self._session: aiohttp.ClientSession | None = None
         self._running = False
@@ -116,7 +117,7 @@ class SarvamStreamingSTT:
 
         headers = {"Api-Subscription-Key": SARVAM_API_KEY}
         self._ws = await self._session.ws_connect(url, headers=headers)
-        logger.info("Connected to Sarvam streaming STT")
+        logger.bind(call_id=self._call_id).info("Connected to Sarvam streaming STT")
         self._receive_task = asyncio.create_task(self._receive_loop())
 
     async def _receive_loop(self) -> None:
@@ -130,17 +131,17 @@ class SarvamStreamingSTT:
                         transcript = data.get("data", {}).get("transcript", "")
                         if transcript.strip():
                             self._transcript_parts.append(transcript)
-                            logger.debug(f"Sarvam STT: '{transcript}'")
+                            logger.bind(call_id=self._call_id).debug(f"Sarvam STT: '{transcript}'")
                             if self.on_transcript is not None:
                                 self.on_transcript.put_nowait(transcript)
                     elif msg_type == "error":
-                        logger.error(f"Sarvam STT error: {data}")
+                        logger.bind(call_id=self._call_id).error(f"Sarvam STT error: {data}")
                 elif msg.type == aiohttp.WSMsgType.ERROR:
-                    logger.error(f"Sarvam WebSocket error: {msg.data}")
+                    logger.bind(call_id=self._call_id).error(f"Sarvam WebSocket error: {msg.data}")
                     break
         except Exception as e:
             if self._running:
-                logger.error(f"Sarvam receive error: {e}")
+                logger.bind(call_id=self._call_id).error(f"Sarvam receive error: {e}")
 
     async def send_audio(self, pcm_8k: bytes) -> None:
         """Send PCM16 8kHz audio to Sarvam."""
@@ -296,11 +297,11 @@ class VoiceAgent:
 
         self._running = False
         self._send_queue: asyncio.Queue[bytes] = asyncio.Queue()
-        self._vad = SileroVADProcessor()
+        self._vad = SileroVADProcessor(call_id=call_id)
         self._is_playing = False  # True while Plivo is playing audio to caller
         self._barged_in = False  # True after first speech_started until speech_ended
         self._speech_ended_pending = False  # VAD ended but no transcript yet
-        self._stt = SarvamStreamingSTT()
+        self._stt = SarvamStreamingSTT(call_id=call_id)
         self._transcript_queue: asyncio.Queue[str] = asyncio.Queue()
         self._stt.on_transcript = self._transcript_queue
         self._turn_lock = asyncio.Lock()
@@ -335,8 +336,8 @@ class VoiceAgent:
         if LOG_LEVEL == "quiet":
             return
         elapsed = round(time.monotonic() - self._session_start, 2)
-        logger.bind(call_id=self.call_id[:8], elapsed_s=elapsed, stage=stage).info(
-            f"[{self.call_id[:8]}] [{elapsed:7.2f}s] [{stage}] {msg}"
+        logger.bind(call_id=self.call_id, elapsed_s=elapsed, stage=stage).info(
+            f"[{self.call_id}] [{elapsed:7.2f}s] [{stage}] {msg}"
         )
 
     def _logv(self, stage: str, msg: str) -> None:
@@ -344,16 +345,16 @@ class VoiceAgent:
         if LOG_LEVEL != "verbose":
             return
         elapsed = round(time.monotonic() - self._session_start, 2)
-        logger.bind(call_id=self.call_id[:8], elapsed_s=elapsed, stage=stage).debug(
-            f"[{self.call_id[:8]}] [{elapsed:7.2f}s] [{stage}] {msg}"
+        logger.bind(call_id=self.call_id, elapsed_s=elapsed, stage=stage).debug(
+            f"[{self.call_id}] [{elapsed:7.2f}s] [{stage}] {msg}"
         )
 
     def _loge(self, stage: str, msg: str) -> None:
         """Log errors — always visible regardless of LOG_LEVEL."""
         self._error_count += 1
         elapsed = round(time.monotonic() - self._session_start, 2)
-        logger.bind(call_id=self.call_id[:8], elapsed_s=elapsed, stage=stage).error(
-            f"[{self.call_id[:8]}] [{elapsed:7.2f}s] [{stage}] {msg}"
+        logger.bind(call_id=self.call_id, elapsed_s=elapsed, stage=stage).error(
+            f"[{self.call_id}] [{elapsed:7.2f}s] [{stage}] {msg}"
         )
 
     def _emit_turn_complete(self, barge_in: bool = False) -> None:
@@ -375,7 +376,7 @@ class VoiceAgent:
             playback_ms=playback_ms,
             barge_in=barge_in,
         ).info(
-            f"[{self.call_id[:8]}] turn {self._turn_count} complete"
+            f"[{self.call_id}] turn {self._turn_count} complete"
             f"{' (barge-in)' if barge_in else ''}"
         )
 
@@ -737,7 +738,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
         self.system_prompt = self._build_system_prompt()
         # Session start always logs (even in quiet mode)
         logger.info(
-            f"[{self.call_id[:8]}] [  0.00s] [session] "
+            f"[{self.call_id}] [  0.00s] [session] "
             f"started (from={self.from_number}, to={self.to_number}, log={LOG_LEVEL})"
         )
         logger.bind(
@@ -748,7 +749,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
             to_number=self.to_number,
             sip_headers=self.sip_headers,
         ).info(
-            f"[{self.call_id[:8]}] [  0.00s] [session] "
+            f"[{self.call_id}] [  0.00s] [session] "
             f"call answered (sip_headers={self.sip_headers})"
         )
 
@@ -795,7 +796,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                 rx_bytes=self._plivo_rx_bytes,
                 tx_chunks=self._plivo_tx_chunks,
             ).info(
-                f"[{self.call_id[:8]}] [{duration:7.1f}s] [session] "
+                f"[{self.call_id}] [{duration:7.1f}s] [session] "
                 f"ended — {self._turn_count} turns, "
                 f"{self._barge_in_count} barge-ins, "
                 f"TTFS avg={avg_ttfs}ms, "

@@ -139,8 +139,9 @@ class SmartTurnProcessor:
     _MAX_AUDIO_SECS = 8
     _SAMPLE_RATE = 16000
 
-    def __init__(self, stop_secs: float = SMART_TURN_STOP_SECS):
-        self._vad = SileroVADProcessor()
+    def __init__(self, stop_secs: float = SMART_TURN_STOP_SECS, call_id: str = ""):
+        self._call_id = call_id
+        self._vad = SileroVADProcessor(call_id=call_id)
         self._audio_buffer: list[np.ndarray] = []
         self._speech_active = False
         self._silence_start: float | None = None
@@ -170,7 +171,9 @@ class SmartTurnProcessor:
 
         # Safety fallback: if silence exceeds stop_secs, force complete
         if self._silence_start and (time.monotonic() - self._silence_start) >= self._stop_secs:
-            logger.debug("Smart-turn: forced complete (silence timeout)")
+            logger.bind(call_id=self._call_id).debug(
+                "Smart-turn: forced complete (silence timeout)"
+            )
             return True
 
         if _SMART_TURN_SESSION is None or _SMART_TURN_EXTRACTOR is None:
@@ -179,7 +182,7 @@ class SmartTurnProcessor:
         audio = np.concatenate(self._audio_buffer)
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(self._executor, self._predict, audio)
-        logger.debug(
+        logger.bind(call_id=self._call_id).debug(
             f"Smart-turn: prediction={result['prediction']} "
             f"probability={result['probability']:.3f}"
         )
@@ -238,7 +241,8 @@ class DeepgramSTT:
     interim_results=true provides partial transcripts for barge-in awareness.
     """
 
-    def __init__(self):
+    def __init__(self, call_id: str = ""):
+        self._call_id = call_id
         self._ws = None
         self._session: aiohttp.ClientSession | None = None
         self._running = False
@@ -273,7 +277,7 @@ class DeepgramSTT:
 
         headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
         self._ws = await self._session.ws_connect(url, headers=headers)
-        logger.info("Connected to Deepgram STT")
+        logger.bind(call_id=self._call_id).info("Connected to Deepgram STT")
         self._receive_task = asyncio.create_task(self._receive_loop())
 
     async def _receive_loop(self) -> None:
@@ -290,13 +294,17 @@ class DeepgramSTT:
                             transcript = alternatives[0].get("transcript", "")
                             if transcript.strip() and is_final:
                                 self._transcript_parts.append(transcript)
-                                logger.debug(f"STT final: '{transcript}'")
+                                logger.bind(call_id=self._call_id).debug(
+                                    f"STT final: '{transcript}'"
+                                )
                 elif msg.type == aiohttp.WSMsgType.ERROR:
-                    logger.error(f"Deepgram WebSocket error: {msg.data}")
+                    logger.bind(call_id=self._call_id).error(
+                        f"Deepgram WebSocket error: {msg.data}"
+                    )
                     break
         except Exception as e:
             if self._running:
-                logger.error(f"Deepgram receive error: {e}")
+                logger.bind(call_id=self._call_id).error(f"Deepgram receive error: {e}")
 
     async def send_audio(self, pcm_audio: bytes) -> None:
         """Send PCM audio to Deepgram."""
@@ -680,8 +688,8 @@ class VoiceAgent:
 
         self._running = False
         self._send_queue: asyncio.Queue[bytes] = asyncio.Queue()
-        self._smart_turn = SmartTurnProcessor()
-        self._deepgram = DeepgramSTT()
+        self._smart_turn = SmartTurnProcessor(call_id=call_id)
+        self._deepgram = DeepgramSTT(call_id=call_id)
         self._playback_end_time: float = 0.0  # estimated Plivo playback end
         self._conversation_history: list[dict[str, Any]] = []
         self._current_tts_task: asyncio.Task | None = None
@@ -737,7 +745,7 @@ class VoiceAgent:
             playback_ms=playback_ms,
             barge_in=barge_in,
         ).info(
-            f"[{self.call_id[:8]}] turn {self._turn_count} complete"
+            f"[{self.call_id}] turn {self._turn_count} complete"
             f"{' (barge-in)' if barge_in else ''}"
         )
 
@@ -762,17 +770,23 @@ class VoiceAgent:
         if LOG_LEVEL == "quiet":
             return
         elapsed = time.monotonic() - self._session_start
-        logger.info(f"[{self.call_id[:8]}] [{elapsed:7.2f}s] [{stage}] {msg}")
+        logger.bind(call_id=self.call_id, elapsed_s=elapsed, stage=stage).info(
+            f"[{self.call_id}] [{elapsed:7.2f}s] [{stage}] {msg}"
+        )
 
     def _logv(self, stage: str, msg: str) -> None:
         if LOG_LEVEL != "verbose":
             return
         elapsed = time.monotonic() - self._session_start
-        logger.debug(f"[{self.call_id[:8]}] [{elapsed:7.2f}s] [{stage}] {msg}")
+        logger.bind(call_id=self.call_id, elapsed_s=elapsed, stage=stage).debug(
+            f"[{self.call_id}] [{elapsed:7.2f}s] [{stage}] {msg}"
+        )
 
     def _loge(self, stage: str, msg: str) -> None:
         elapsed = time.monotonic() - self._session_start
-        logger.error(f"[{self.call_id[:8]}] [{elapsed:7.2f}s] [{stage}] {msg}")
+        logger.bind(call_id=self.call_id, elapsed_s=elapsed, stage=stage).error(
+            f"[{self.call_id}] [{elapsed:7.2f}s] [{stage}] {msg}"
+        )
 
     # — Tool Definitions —
 
@@ -1422,7 +1436,7 @@ You can use the caller's phone number for SMS or lookups without asking."""
         self._running = True
         self.system_prompt = self._build_system_prompt()
         logger.info(
-            f"[{self.call_id[:8]}] [  0.00s] [session] "
+            f"[{self.call_id}] [  0.00s] [session] "
             f"started (from={self.from_number}, to={self.to_number}, log={LOG_LEVEL})"
         )
         logger.bind(
@@ -1433,7 +1447,7 @@ You can use the caller's phone number for SMS or lookups without asking."""
             to_number=self.to_number,
             sip_headers=self.sip_headers,
         ).info(
-            f"[{self.call_id[:8]}] [  0.00s] [session] "
+            f"[{self.call_id}] [  0.00s] [session] "
             f"call answered (sip_headers={self.sip_headers})"
         )
 
@@ -1478,7 +1492,7 @@ You can use the caller's phone number for SMS or lookups without asking."""
                 rx_bytes=self._plivo_rx_bytes,
                 tx_chunks=self._plivo_tx_chunks,
             ).info(
-                f"[{self.call_id[:8]}] [{duration:7.1f}s] [session] "
+                f"[{self.call_id}] [{duration:7.1f}s] [session] "
                 f"ended — {self._turn_count} turns, "
                 f"{self._barge_in_count} barge-ins, "
                 f"rx={self._plivo_rx_bytes}B, tx={self._plivo_tx_chunks} chunks"

@@ -200,7 +200,7 @@ async def outbound_initiate(
             record.call_id, "ringing",
             plivo_request_uuid=request_uuid,
         )
-        logger.info(
+        logger.bind(call_id=record.call_id).info(
             f"Outbound call initiated: call_id={record.call_id}, "
             f"to={to_number}, request_uuid={request_uuid}"
         )
@@ -213,7 +213,7 @@ async def outbound_initiate(
         }
 
     except Exception as e:
-        logger.error(f"Failed to initiate outbound call: {e}")
+        logger.bind(call_id=record.call_id).error(f"Failed to initiate outbound call: {e}")
         call_manager.update_status(record.call_id, "failed", outcome="failed")
         return {"error": str(e), "call_id": record.call_id}
 
@@ -253,7 +253,9 @@ async def outbound_answer_webhook(
         except Exception:
             pass
 
-    logger.info(f"Outbound call answered: call_id={call_id}, CallUUID={call_uuid}, To={to_number}")
+    logger.bind(call_id=call_id).info(
+        f"Outbound call answered: call_id={call_id}, CallUUID={call_uuid}, To={to_number}"
+    )
 
     # Update call record
     if call_id:
@@ -301,7 +303,7 @@ async def outbound_hangup_webhook(request: Request) -> Response:
         duration = int(form_data.get("Duration", 0) or 0)
         hangup_cause = str(form_data.get("HangupCause", ""))
 
-        logger.info(
+        logger.bind(call_id=call_uuid).info(
             f"Outbound call ended: CallUUID={call_uuid}, "
             f"Duration={duration}s, HangupCause={hangup_cause}"
         )
@@ -317,7 +319,9 @@ async def outbound_hangup_webhook(request: Request) -> Response:
                     hangup_cause=hangup_cause,
                     outcome=outcome,
                 )
-                logger.info(f"Outbound call {record.call_id} completed: outcome={outcome}")
+                logger.bind(call_id=record.call_id).info(
+                    f"Outbound call {record.call_id} completed: outcome={outcome}"
+                )
                 break
     except Exception as e:
         logger.warning(f"Error parsing outbound hangup webhook: {e}")
@@ -368,10 +372,10 @@ async def outbound_hangup_call(call_id: str) -> dict:
             ended_at=datetime.utcnow(),
             outcome="success",
         )
-        logger.info(f"Programmatically ended outbound call {call_id}")
+        logger.bind(call_id=call_id).info(f"Programmatically ended outbound call {call_id}")
         return {"call_id": call_id, "status": "completed"}
     except Exception as e:
-        logger.error(f"Failed to end call {call_id}: {e}")
+        logger.bind(call_id=call_id).error(f"Failed to end call {call_id}: {e}")
         return {"error": str(e)}
 
 
@@ -411,13 +415,14 @@ async def websocket_endpoint(
 ) -> None:
     """WebSocket endpoint for bidirectional audio streaming with Plivo."""
     await websocket.accept()
-    logger.info("WebSocket connection accepted")
 
     call_data = {}
+    call_id = "unknown"
     if body:
         try:
             call_data = json.loads(base64.b64decode(body).decode())
-            logger.info(f"Call metadata: {call_data}")
+            call_id = call_data.get("call_uuid", "unknown")
+            logger.bind(call_id=call_id).info(f"Call metadata: {call_data}")
         except Exception as e:
             logger.warning(f"Failed to decode call metadata: {e}")
 
@@ -426,14 +431,18 @@ async def websocket_endpoint(
         start_message = json.loads(start_data)
 
         if start_message.get("event") != "start":
-            logger.error(f"Expected start event, got: {start_message.get('event')}")
+            logger.bind(call_id=call_id).error(
+                f"Expected start event, got: {start_message.get('event')}"
+            )
             await websocket.close()
             return
 
         start_info = start_message.get("start", {})
         call_id = start_info.get("callId", call_data.get("call_uuid", "unknown"))
         stream_id = start_info.get("streamId")
-        logger.info(f"Plivo stream started: callId={call_id}, streamId={stream_id}")
+        logger.bind(call_id=call_id).info(
+            f"Plivo stream started: callId={call_id}, streamId={stream_id}"
+        )
 
         # Load outbound prompt and initial message from call record
         system_prompt = None
@@ -444,9 +453,13 @@ async def websocket_endpoint(
             if record:
                 system_prompt = record.system_prompt
                 initial_message = record.initial_message
-                logger.info(f"Outbound call detected: call_id={outbound_call_id}")
+                logger.bind(call_id=outbound_call_id).info(
+                    f"Outbound call detected: call_id={outbound_call_id}"
+                )
             else:
-                logger.warning(f"Outbound call record not found: {outbound_call_id}")
+                logger.bind(call_id=outbound_call_id).warning(
+                    f"Outbound call record not found: {outbound_call_id}"
+                )
 
         await run_agent(
             websocket=websocket,
@@ -461,9 +474,9 @@ async def websocket_endpoint(
         )
 
     except WebSocketDisconnect:
-        logger.info("WebSocket disconnected")
+        logger.bind(call_id=call_id).info("WebSocket disconnected")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.bind(call_id=call_id).error(f"WebSocket error: {e}")
     finally:
         with contextlib.suppress(Exception):
             await websocket.close()
