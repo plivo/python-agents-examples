@@ -228,7 +228,7 @@ The text between H1 (`#`) and the first H2 (`##`) in each README is displayed as
 
 ### Format
 
-Plain text only — **no tables, no bullet lists, no diagrams** between H1 and first H2. Write a dense paragraph (≤5 lines) that traces the full pipeline from telephony input to audio output, naming every component along the way. Include:
+Text and bullet lists only — **no tables, no diagrams, no code blocks** between H1 and first H2. Write a dense description (≤5 lines) that traces the full pipeline from telephony input to audio output, naming every component along the way. Include:
 
 - Orchestration approach (native/framework)
 - Each component: service name, model/engine, protocol (WS/HTTP), audio format, sample rate, region
@@ -239,7 +239,7 @@ Plain text only — **no tables, no bullet lists, no diagrams** between H1 and f
 ### Rules
 
 - No vague descriptions ("production-ready", "best-in-class") — every word should be a technical fact
-- No tables or structured formatting — the hosting app renders this as a text description
+- No tables, diagrams, or code blocks — the hosting app doesn't render them properly. Bullet lists are fine
 - Do not include observed latency — that belongs in the detailed sections below
 - The rest of the README (after the first H2) can use tables, diagrams, and full detail
 
