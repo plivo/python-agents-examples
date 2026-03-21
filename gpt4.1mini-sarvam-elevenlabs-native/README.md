@@ -1,16 +1,6 @@
 # GPT-4.1 Mini + Sarvam STT + ElevenLabs TTS — Native Voice Agent
 
-Native orchestration (raw WebSockets + asyncio, no framework). Barge-in cancels in-flight LLM/TTS, drains queue, sends `clearAudio`.
-
-| Stage | Service | Model | Protocol | Format | Region |
-|-------|---------|-------|----------|--------|--------|
-| **Telephony** | Plivo | — | WebSocket | μ-law 8kHz, 160B/20ms chunks | US |
-| **STT** | Sarvam.ai | `saaras:v3` | WebSocket streaming | PCM16 8kHz (no resample) | India |
-| **LLM** | OpenAI | `gpt-4.1-mini` | HTTP (non-streaming) | 300 max tokens, 5 tools | US |
-| **TTS** | ElevenLabs | `eleven_flash_v2_5` | WebSocket `stream-input` | sentence-chunked → PCM16 24kHz | US |
-| **VAD** | Silero | ONNX v5 | Local | 512 samples/32ms at 16kHz | Local |
-
-**VAD tuning:** start=**0.85** (echo registers 0.51–0.74, real speech 0.93+), end=0.35, min silence=500ms.
+Native orchestration (raw WebSockets + asyncio, no framework). Plivo μ-law 8kHz (160B/20ms chunks) feeds into Sarvam.ai `saaras:v3` streaming STT over WebSocket at 8kHz PCM (hosted in India, no resample needed) and local Silero VAD (ONNX v5, 512 samples/32ms at 16kHz). LLM is OpenAI `gpt-4.1-mini` via HTTP (non-streaming, 300 max tokens, 5 tool functions). TTS is ElevenLabs `eleven_flash_v2_5` via WebSocket `stream-input` — text sent in sentence chunks, audio returned as PCM16 24kHz, resampled to 8kHz μ-law for Plivo. VAD start threshold set to 0.85 to reject echo (agent playback registers 0.51–0.74, real speech 0.93+), end threshold 0.35, 500ms min silence. Barge-in cancels in-flight LLM/TTS tasks, drains the send queue, and sends `clearAudio` to Plivo.
 
 ## Pipeline Architecture
 

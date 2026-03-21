@@ -228,17 +228,20 @@ The text between H1 (`#`) and the first H2 (`##`) in each README is displayed as
 
 ### Format
 
-1. **One-line summary**: orchestration approach + barge-in behavior (what gets cancelled, what event is sent)
-2. **Pipeline table** with columns: Stage, Service, Model, Protocol, Format, Region — one row per component (Telephony, STT, LLM, TTS, VAD)
-3. **VAD tuning line**: threshold values with empirical echo vs speech probability ranges
+Plain text only — **no tables, no bullet lists, no diagrams** between H1 and first H2. Write a dense paragraph (≤5 lines) that traces the full pipeline from telephony input to audio output, naming every component along the way. Include:
+
+- Orchestration approach (native/framework)
+- Each component: service name, model/engine, protocol (WS/HTTP), audio format, sample rate, region
+- VAD: engine, frame size, threshold values with empirical tuning rationale (echo vs speech probability ranges)
+- Barge-in: what gets cancelled and what event is sent
+- Any notable audio conversions (resample or no-resample)
 
 ### Rules
 
 - No vague descriptions ("production-ready", "best-in-class") — every word should be a technical fact
-- Include model names, threshold values, sample rates, max tokens, chunk sizes, regions
-- The table is the primary representation — scannable and dense
-- The rest of the README (after the first H2) can have full detail: architecture diagrams, tables, setup instructions, etc.
-- Do not include observed latency in the description — that belongs in the detailed sections below
+- No tables or structured formatting — the hosting app renders this as a text description
+- Do not include observed latency — that belongs in the detailed sections below
+- The rest of the README (after the first H2) can use tables, diagrams, and full detail
 
 ## Slash Commands (Phase Workflow)
 
