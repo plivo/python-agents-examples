@@ -222,6 +222,24 @@ Run: `uv run pytest tests/test_integration.py -v -k "unit"` (offline)
 - `gemini-live-native-no-vad/` — alternative native pattern (SDK-based, server-side VAD, no client-side VAD)
 - `gemini-live-pipecat/inbound/agent.py` — framework Pipeline reference
 
+## README Demo Description (Required)
+
+The text between H1 (`#`) and the first H2 (`##`) in each README is displayed as the demo description in the hosting app. It must be **5 lines or fewer** but pack maximum technical detail. Use `gpt4.1mini-sarvam-elevenlabs-native/README.md` as the reference.
+
+### Format
+
+1. **One-line summary**: orchestration approach + barge-in behavior (what gets cancelled, what event is sent)
+2. **Pipeline table** with columns: Stage, Service, Model, Protocol, Format, Region — one row per component (Telephony, STT, LLM, TTS, VAD)
+3. **VAD tuning line**: threshold values with empirical echo vs speech probability ranges
+
+### Rules
+
+- No vague descriptions ("production-ready", "best-in-class") — every word should be a technical fact
+- Include model names, threshold values, sample rates, max tokens, chunk sizes, regions
+- The table is the primary representation — scannable and dense
+- The rest of the README (after the first H2) can have full detail: architecture diagrams, tables, setup instructions, etc.
+- Do not include observed latency in the description — that belongs in the detailed sections below
+
 ## Slash Commands (Phase Workflow)
 
 ```
