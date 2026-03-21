@@ -29,6 +29,7 @@ import sys
 import time
 import uuid
 
+import aiohttp
 import httpx
 import plivo
 import pytest
@@ -374,7 +375,7 @@ class TestSarvamIntegration:
 
 
 class TestElevenLabsIntegration:
-    """Integration tests for ElevenLabs API."""
+    """Integration tests for ElevenLabs WebSocket TTS API."""
 
     @pytest.fixture
     def elevenlabs_configured(self):
@@ -383,27 +384,94 @@ class TestElevenLabsIntegration:
             pytest.skip("ELEVENLABS_API_KEY not configured")
 
     @pytest.mark.asyncio
-    async def test_elevenlabs_tts(self, elevenlabs_configured):
-        """Test basic ElevenLabs text-to-speech."""
+    async def test_elevenlabs_websocket_tts(self, elevenlabs_configured):
+        """Test ElevenLabs WebSocket text-to-speech streaming."""
         voice_id = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
-        url = (
-            f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-            f"?output_format=pcm_24000"
+        model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5")
+        ws_url = (
+            f"wss://api.elevenlabs.io/v1/text-to-speech"
+            f"/{voice_id}/stream-input"
+            f"?model_id={model_id}"
+            f"&output_format=pcm_24000"
         )
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                url,
-                headers={
-                    "xi-api-key": ELEVENLABS_API_KEY,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "text": "Hello, this is a test.",
-                    "model_id": "eleven_flash_v2_5",
-                },
-            )
-            assert response.status_code == 200
-            assert len(response.content) > 1000, "TTS audio too short"
+        audio_chunks = []
+        async with aiohttp.ClientSession() as session, session.ws_connect(
+            ws_url, timeout=30.0
+        ) as ws:
+            # BOS message
+            await ws.send_json({
+                "text": " ",
+                "voice_settings": {"stability": 0.5, "similarity_boost": 0.8},
+                "xi_api_key": ELEVENLABS_API_KEY,
+            })
+            # Send text in two sentence chunks
+            await ws.send_json({"text": "Hello, this is a test. "})
+            await ws.send_json({"text": "How are you doing today? "})
+            # EOS — flush
+            await ws.send_json({"text": ""})
+
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    audio_b64 = data.get("audio")
+                    if audio_b64:
+                        audio_chunks.append(base64.b64decode(audio_b64))
+                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    break
+
+        total_bytes = sum(len(c) for c in audio_chunks)
+        assert len(audio_chunks) > 0, "No audio chunks received"
+        assert total_bytes > 1000, f"TTS audio too short ({total_bytes} bytes)"
+
+    @pytest.mark.asyncio
+    async def test_elevenlabs_websocket_sentence_chunking(self, elevenlabs_configured):
+        """Test that sentence-chunked input produces audio progressively."""
+        voice_id = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
+        model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5")
+        ws_url = (
+            f"wss://api.elevenlabs.io/v1/text-to-speech"
+            f"/{voice_id}/stream-input"
+            f"?model_id={model_id}"
+            f"&output_format=pcm_24000"
+        )
+        first_audio_time = None
+        t0 = time.monotonic()
+        total_bytes = 0
+
+        async with aiohttp.ClientSession() as session, session.ws_connect(
+            ws_url, timeout=30.0
+        ) as ws:
+            await ws.send_json({
+                "text": " ",
+                "voice_settings": {"stability": 0.5, "similarity_boost": 0.8},
+                "xi_api_key": ELEVENLABS_API_KEY,
+            })
+            # Send three sentences with small delays to simulate LLM streaming
+            for sentence in [
+                "Welcome to our customer support line. ",
+                "We are happy to help you today. ",
+                "Please tell me how I can assist you. ",
+            ]:
+                await ws.send_json({"text": sentence})
+                await asyncio.sleep(0.05)
+            await ws.send_json({"text": ""})
+
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    audio_b64 = data.get("audio")
+                    if audio_b64:
+                        if first_audio_time is None:
+                            first_audio_time = time.monotonic()
+                        total_bytes += len(base64.b64decode(audio_b64))
+                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    break
+
+        assert first_audio_time is not None, "No audio received"
+        ttfb_ms = (first_audio_time - t0) * 1000
+        # WebSocket TTFB should be reasonable (under 5s even on slow connections)
+        assert ttfb_ms < 5000, f"TTFB too high: {ttfb_ms:.0f}ms"
+        assert total_bytes > 2000, f"Audio too short for 3 sentences ({total_bytes} bytes)"
 
 
 # =============================================================================

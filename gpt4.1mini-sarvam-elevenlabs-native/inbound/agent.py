@@ -634,53 +634,85 @@ class VoiceAgent:
 
     @_traced("tts")
     async def _synthesize_with_elevenlabs(self, text: str) -> None:
-        """Stream text through ElevenLabs TTS and queue audio for Plivo."""
-        import httpx
+        """Stream text through ElevenLabs WebSocket TTS and queue audio for Plivo.
 
+        Uses the ElevenLabs text-to-speech WebSocket API for lower latency:
+        text is sent in sentence chunks so audio generation starts before the
+        full text is delivered, reducing time-to-first-byte.
+        """
         if not text.strip():
             return
 
         self._logv("tts", f"requesting synthesis ({len(text)} chars)")
         t0 = time.monotonic()
 
+        ws_url = (
+            f"wss://api.elevenlabs.io/v1/text-to-speech"
+            f"/{ELEVENLABS_VOICE_ID}/stream-input"
+            f"?model_id={ELEVENLABS_MODEL_ID}"
+            f"&output_format=pcm_24000"
+        )
+
         try:
-            url = (
-                f"https://api.elevenlabs.io/v1/text-to-speech"
-                f"/{ELEVENLABS_VOICE_ID}/stream"
-                f"?output_format=pcm_24000"
-            )
-            async with httpx.AsyncClient(timeout=30.0) as client, client.stream(
-                "POST",
-                url,
-                headers={
-                    "xi-api-key": ELEVENLABS_API_KEY,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "text": text,
-                    "model_id": ELEVENLABS_MODEL_ID,
-                },
-            ) as response:
-                response.raise_for_status()
+            async with aiohttp.ClientSession() as session, session.ws_connect(
+                ws_url, timeout=30.0
+            ) as ws:
+                # Send BOS (beginning of stream) message with config
+                bos_message = {
+                    "text": " ",
+                    "voice_settings": {
+                        "stability": 0.5,
+                        "similarity_boost": 0.8,
+                    },
+                    "xi_api_key": ELEVENLABS_API_KEY,
+                }
+                await ws.send_json(bos_message)
+
+                # Split text into sentence chunks for progressive synthesis
+                import re
+
+                sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+                for sentence in sentences:
+                    if not sentence.strip():
+                        continue
+                    await ws.send_json({"text": sentence + " "})
+
+                # Send EOS (end of stream) — flush remaining audio
+                await ws.send_json({"text": ""})
+
+                # Receive audio chunks until the server closes
                 first_chunk_time = None
                 chunk_count = 0
                 total_bytes = 0
-                async for chunk in response.aiter_bytes(chunk_size=4800):
-                    if not self._running or not self._is_playing:
-                        self._log(
-                            "tts",
-                            f"interrupted after {chunk_count} chunks "
-                            f"(running={self._running}, responding={self._is_playing})",
-                        )
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        data = json.loads(msg.data)
+                        audio_b64 = data.get("audio")
+                        if audio_b64:
+                            pcm_24k = base64.b64decode(audio_b64)
+                            if not self._running or not self._is_playing:
+                                self._log(
+                                    "tts",
+                                    f"interrupted after {chunk_count} chunks "
+                                    f"(running={self._running}, "
+                                    f"responding={self._is_playing})",
+                                )
+                                break
+                            if first_chunk_time is None:
+                                first_chunk_time = time.monotonic()
+                                ttfb = (first_chunk_time - t0) * 1000
+                                self._logv(
+                                    "tts", f"first chunk (TTFB: {ttfb:.0f}ms)"
+                                )
+                            plivo_audio = elevenlabs_to_plivo(pcm_24k)
+                            await self._send_queue.put(plivo_audio)
+                            chunk_count += 1
+                            total_bytes += len(plivo_audio)
+                    elif msg.type in (
+                        aiohttp.WSMsgType.CLOSED,
+                        aiohttp.WSMsgType.ERROR,
+                    ):
                         break
-                    if first_chunk_time is None:
-                        first_chunk_time = time.monotonic()
-                        ttfb = (first_chunk_time - t0) * 1000
-                        self._logv("tts", f"first chunk (TTFB: {ttfb:.0f}ms)")
-                    plivo_audio = elevenlabs_to_plivo(chunk)
-                    await self._send_queue.put(plivo_audio)
-                    chunk_count += 1
-                    total_bytes += len(plivo_audio)
 
                 total_time = (time.monotonic() - t0) * 1000
                 audio_duration = total_bytes / 8000  # μ-law 8kHz = 1 byte per sample

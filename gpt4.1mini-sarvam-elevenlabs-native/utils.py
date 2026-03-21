@@ -33,7 +33,7 @@ VAD_SAMPLE_RATE = 16000  # Silero VAD operates at 16kHz
 
 # Silero VAD configuration
 VAD_CHUNK_SAMPLES = 512  # 32ms at 16kHz (Silero expects 512 samples at 16kHz)
-VAD_START_THRESHOLD = 0.5  # Speech probability to trigger speech start
+VAD_START_THRESHOLD = 0.85  # Speech probability to trigger speech start
 VAD_END_THRESHOLD = 0.35  # Speech probability below this to consider silence
 VAD_MIN_SILENCE_MS = 500  # Minimum silence duration (ms) to trigger speech end
 VAD_PRE_SPEECH_PAD_MS = 150  # Audio to keep before speech start for context
