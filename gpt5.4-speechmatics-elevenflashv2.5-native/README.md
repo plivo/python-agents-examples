@@ -211,7 +211,7 @@ Tasks coordinate via `asyncio.Queue` (send queue), `asyncio.Event` flags (`_is_p
 ## Quick Start
 
 ```bash
-cd gpt5.2-speechmatics-elevenflashv2.5-native
+cd gpt5.4-speechmatics-elevenflashv2.5-native
 uv sync
 cp .env.example .env
 # Edit .env with your credentials
@@ -318,17 +318,17 @@ uv run pytest tests/test_multiturn_voice.py -v -s
 
 ```bash
 # Build image
-docker build -t gpt5.2-speechmatics-elevenflashv2.5 .
+docker build -t gpt5.4-speechmatics-elevenflashv2.5 .
 
 # Run with .env file
-docker run -p 8000:8000 --env-file .env gpt5.2-speechmatics-elevenflashv2.5
+docker run -p 8000:8000 --env-file .env gpt5.4-speechmatics-elevenflashv2.5
 
 # Run inbound only
-docker run -p 8000:8000 --env-file .env gpt5.2-speechmatics-elevenflashv2.5 \
+docker run -p 8000:8000 --env-file .env gpt5.4-speechmatics-elevenflashv2.5 \
   python -m inbound.server
 
 # Run outbound only
-docker run -p 8000:8000 --env-file .env gpt5.2-speechmatics-elevenflashv2.5 \
+docker run -p 8000:8000 --env-file .env gpt5.4-speechmatics-elevenflashv2.5 \
   python -m outbound.server
 ```
 

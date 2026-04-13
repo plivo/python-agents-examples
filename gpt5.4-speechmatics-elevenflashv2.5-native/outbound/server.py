@@ -98,7 +98,7 @@ except ImportError:
 try:
     from traceloop.sdk import Traceloop
 
-    Traceloop.init(app_name="gpt5.2-speechmatics-elevenflashv2.5-native")
+    Traceloop.init(app_name="gpt5.4-speechmatics-elevenflashv2.5-native")
     logger.info("OpenLLMetry (Traceloop) auto-instrumentation enabled")
 except ImportError:
     pass
@@ -138,7 +138,7 @@ async def health_check() -> dict:
     phone = normalize_phone_number(PLIVO_PHONE_NUMBER)
     return {
         "status": "ok",
-        "service": "gpt5.2-speechmatics-elevenflashv2.5-voice-agent-outbound",
+        "service": "gpt5.4-speechmatics-elevenflashv2.5-voice-agent-outbound",
         "phone_number": f"+{phone}" if phone else "not configured",
     }
 

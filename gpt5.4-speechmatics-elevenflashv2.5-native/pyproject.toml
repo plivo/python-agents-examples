@@ -1,5 +1,5 @@
 [project]
-name = "gpt5.2-speechmatics-elevenflashv2.5-plivo-voice-agent"
+name = "gpt5.4-speechmatics-elevenflashv2.5-plivo-voice-agent"
 version = "0.1.0"
 description = "Voice agent using OpenAI GPT 5.4-mini (LLM), Speechmatics (STT), ElevenLabs (TTS) with Plivo telephony and Silero VAD"
 readme = "README.md"

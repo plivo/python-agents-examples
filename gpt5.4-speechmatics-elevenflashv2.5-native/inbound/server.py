@@ -97,7 +97,7 @@ except ImportError:
 try:
     from traceloop.sdk import Traceloop
 
-    Traceloop.init(app_name="gpt5.2-speechmatics-elevenflashv2.5-native")
+    Traceloop.init(app_name="gpt5.4-speechmatics-elevenflashv2.5-native")
     logger.info("OpenLLMetry (Traceloop) auto-instrumentation enabled")
 except ImportError:
     pass
@@ -147,7 +147,7 @@ def configure_plivo_webhooks() -> bool:
     try:
         client = plivo.RestClient(auth_id=PLIVO_AUTH_ID, auth_token=PLIVO_AUTH_TOKEN)
 
-        app_name = "GPT5.2_Speechmatics_ElevenLabs_Voice_Agent"
+        app_name = "GPT54_Speechmatics_ElevenLabs_Agent"
         answer_url = f"{PUBLIC_URL}/answer"
         hangup_url = f"{PUBLIC_URL}/hangup"
 
@@ -212,7 +212,7 @@ async def health_check() -> dict:
     phone = normalize_phone_number(PLIVO_PHONE_NUMBER)
     return {
         "status": "ok",
-        "service": "gpt5.2-speechmatics-elevenflashv2.5-voice-agent-inbound",
+        "service": "gpt5.4-speechmatics-elevenflashv2.5-voice-agent-inbound",
         "phone_number": f"+{phone}" if phone else "not configured",
     }
 
