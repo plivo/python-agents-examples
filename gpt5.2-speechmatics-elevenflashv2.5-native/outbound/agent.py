@@ -307,7 +307,7 @@ class SpeechmaticsSTT:
 
 # Agent configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
 SPEECHMATICS_API_KEY = os.getenv("SPEECHMATICS_API_KEY", "")
 SPEECHMATICS_PROFILE = os.getenv("SPEECHMATICS_PROFILE", "adaptive")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
@@ -851,7 +851,7 @@ class VoiceAgent:
                         "model": OPENAI_MODEL,
                         "messages": messages,
                         "tools": self._build_tools(),
-                        "max_tokens": 300,
+                        "max_completion_tokens": 300,
                         "stream": True,
                     },
                 ) as response,
@@ -956,7 +956,7 @@ class VoiceAgent:
                         json={
                             "model": OPENAI_MODEL,
                             "messages": messages,
-                            "max_tokens": 300,
+                            "max_completion_tokens": 300,
                         },
                     )
                     resp2.raise_for_status()

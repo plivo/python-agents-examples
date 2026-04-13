@@ -334,9 +334,9 @@ class TestOpenAIIntegration:
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": "gpt-5.2-mini",
+                    "model": "gpt-5.2",
                     "messages": [{"role": "user", "content": "Say hello briefly."}],
-                    "max_tokens": 50,
+                    "max_completion_tokens": 50,
                     "stream": True,
                 },
             ) as response,
@@ -366,10 +366,8 @@ class TestSpeechmaticsIntegration:
     @pytest.mark.asyncio
     async def test_speechmatics_websocket_connection(self, speechmatics_configured):
         """Test connecting to Speechmatics WebSocket and completing a recognition session."""
-        ws_url = (
-            f"wss://preview.rt.speechmatics.com/v2/agent"
-            f"/{SPEECHMATICS_PROFILE}?api_key={SPEECHMATICS_API_KEY}"
-        )
+        ws_url = f"wss://preview.rt.speechmatics.com/v2/agent/{SPEECHMATICS_PROFILE}"
+        headers = {"Authorization": f"Bearer {SPEECHMATICS_API_KEY}"}
 
         start_recognition = {
             "message": "StartRecognition",
@@ -387,7 +385,9 @@ class TestSpeechmaticsIntegration:
         recognition_started = False
         end_of_transcript = False
 
-        async with websockets.connect(ws_url, close_timeout=10) as ws:
+        async with websockets.connect(
+            ws_url, additional_headers=headers, close_timeout=10
+        ) as ws:
             await ws.send(json.dumps(start_recognition))
 
             # Wait for RecognitionStarted
