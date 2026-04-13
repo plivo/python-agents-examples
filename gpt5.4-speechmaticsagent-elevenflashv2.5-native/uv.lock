@@ -750,7 +750,7 @@ wheels = [
 ]
 
 [[package]]
-name = "gpt5-4-speechmatics-elevenflashv2-5-plivo-voice-agent"
+name = "gpt5-4-speechmaticsagent-elevenflashv2-5-plivo-voice-agent"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
