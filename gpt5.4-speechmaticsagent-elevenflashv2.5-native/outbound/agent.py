@@ -1380,22 +1380,36 @@ You can use the caller's phone number for SMS or callbacks without asking."""
         self._speech_ended_pending = False
 
     async def _watch_transcripts(self) -> None:
-        """Watch for STT transcripts that arrive after speech_ended.
+        """Watch for STT transcripts and EndOfUtterance to commit turns.
 
-        Convergence gate: if VAD fired speech_ended but STT hadn't
-        delivered yet, this task picks up the transcript when it arrives
-        and commits the turn.
+        Convergence gate with two trigger paths:
+        1. Transcript arrives while VAD speech_ended is pending -> commit
+        2. EndOfUtterance fires with accumulated transcript -> commit
+           (Speechmatics may detect turn-end before local VAD)
         """
         try:
             while self._running:
+                # Wait for either a transcript or EndOfUtterance signal
+                eot_event = self._stt.on_end_of_turn
+                transcript_ready = False
+                eot_fired = False
+
+                # Poll both sources with short timeout
                 try:
                     await asyncio.wait_for(
-                        self._transcript_queue.get(), timeout=0.2
+                        self._transcript_queue.get(), timeout=0.15
                     )
+                    transcript_ready = True
                 except TimeoutError:
-                    continue
-                # Transcript arrived -- check if VAD is waiting
-                if self._speech_ended_pending:
+                    pass
+
+                # Check if EndOfUtterance fired
+                if eot_event is not None and eot_event.is_set():
+                    eot_fired = True
+                    eot_event.clear()
+
+                # Path 1: transcript arrived while VAD is waiting
+                if transcript_ready and self._speech_ended_pending:
                     transcript = self._stt.latest_transcript
                     if transcript.strip():
                         self._log(
@@ -1404,6 +1418,21 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                             "committing turn",
                         )
                         self._commit_turn(transcript)
+                        continue
+
+                # Path 2: EndOfUtterance with accumulated transcript
+                # Speechmatics detected turn-end -- commit if we have text
+                if eot_fired:
+                    transcript = self._stt.latest_transcript
+                    if transcript.strip():
+                        self._log(
+                            "stt",
+                            f"EndOfUtterance with transcript -- "
+                            f"committing turn: '{transcript[:80]}'",
+                        )
+                        self._speech_ended_pending = False
+                        self._commit_turn(transcript)
+                        continue
         except asyncio.CancelledError:
             pass
 
