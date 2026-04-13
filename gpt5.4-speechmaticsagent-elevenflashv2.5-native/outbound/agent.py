@@ -175,39 +175,46 @@ class SpeechmaticsSTT:
                     data = json.loads(msg.data)
                     msg_type = data.get("message", "")
 
-                    if msg_type == "AddPartialSegment":
+                    if msg_type in ("AddPartialTranscript", "AddPartialSegment"):
                         # Partial transcript -- log at verbose level
-                        segments = data.get("segments", [])
-                        if segments:
-                            partial = segments[0].get("text", "")
+                        partial = data.get("transcript", "")
+                        if not partial:
+                            segments = data.get("segments", [])
+                            if segments:
+                                partial = segments[0].get("text", "")
+                        if partial:
                             logger.bind(call_id=self._call_id).debug(
                                 f"Speechmatics partial: '{partial}'"
                             )
 
-                    elif msg_type == "AddSegment":
-                        # Final segment -- accumulate transcript
-                        segments = data.get("segments", [])
-                        for seg in segments:
-                            text = seg.get("text", "").strip()
-                            is_eou = seg.get("is_eou", False)
-                            if text:
-                                self._transcript_parts.append(text)
-                                logger.bind(call_id=self._call_id).debug(
-                                    f"Speechmatics segment: '{text}' (eou={is_eou})"
-                                )
-                                if self.on_transcript is not None:
-                                    self.on_transcript.put_nowait(text)
+                    elif msg_type in ("AddTranscript", "AddSegment"):
+                        # Final transcript -- accumulate
+                        text = data.get("transcript", "").strip()
+                        if not text:
+                            segments = data.get("segments", [])
+                            for seg in segments:
+                                t = seg.get("text", "").strip()
+                                if t:
+                                    text = t
+                                    break
+                        if text:
+                            self._transcript_parts.append(text)
+                            logger.bind(call_id=self._call_id).info(
+                                f"Speechmatics transcript: '{text}'"
+                            )
+                            if self.on_transcript is not None:
+                                self.on_transcript.put_nowait(text)
 
-                    elif msg_type == "EndOfTurn":
+                    elif msg_type in ("EndOfUtterance", "EndOfTurn"):
                         logger.bind(call_id=self._call_id).info(
-                            "Speechmatics EndOfTurn"
+                            f"Speechmatics {msg_type}"
                         )
                         if self.on_end_of_turn is not None:
                             self.on_end_of_turn.set()
 
-                    elif msg_type == "StartOfTurn":
+                    elif msg_type in ("StartOfTurn", "StartOfUtterance"):
                         logger.bind(call_id=self._call_id).debug(
-                            "Speechmatics StartOfTurn"
+                            f"Speechmatics {msg_type}"
                         )
 
                     elif msg_type == "SpeechStarted":
@@ -218,6 +225,11 @@ class SpeechmaticsSTT:
                     elif msg_type == "SpeechEnded":
                         logger.bind(call_id=self._call_id).debug(
                             "Speechmatics SpeechEnded"
+                        )
+
+                    elif msg_type == "Diagnostics":
+                        logger.bind(call_id=self._call_id).debug(
+                            "Speechmatics Diagnostics"
                         )
 
                     elif msg_type == "EndOfTurnPrediction":
