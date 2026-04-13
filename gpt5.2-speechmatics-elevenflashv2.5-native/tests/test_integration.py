@@ -1,5 +1,5 @@
 """
-Integration tests for GPT 5.2 Mini + Speechmatics + ElevenLabs Voice Agent.
+Integration tests for GPT 5.4 Mini + Speechmatics + ElevenLabs Voice Agent.
 
 Test Levels:
 1. Unit Tests - Test individual components (audio conversion, phone normalization)
@@ -322,7 +322,7 @@ class TestOpenAIIntegration:
 
     @pytest.mark.asyncio
     async def test_openai_streaming_chat_completion(self, openai_configured):
-        """Test OpenAI streaming chat completion with GPT 5.2 mini."""
+        """Test OpenAI streaming chat completion with GPT 5.4 Mini."""
         chunks = []
         async with (
             httpx.AsyncClient(timeout=30.0) as client,
@@ -334,7 +334,7 @@ class TestOpenAIIntegration:
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": "gpt-5.2",
+                    "model": "gpt-5.4-mini",
                     "messages": [{"role": "user", "content": "Say hello briefly."}],
                     "max_completion_tokens": 50,
                     "stream": True,
@@ -351,7 +351,7 @@ class TestOpenAIIntegration:
 
         assert len(chunks) > 0, "No streaming chunks received"
         full_text = "".join(chunks)
-        assert len(full_text) > 0, "Empty response from GPT 5.2 mini"
+        assert len(full_text) > 0, "Empty response from GPT 5.4 Mini"
 
 
 class TestSpeechmaticsIntegration:

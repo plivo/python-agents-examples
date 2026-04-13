@@ -118,8 +118,8 @@ PLIVO_PHONE_NUMBER = os.getenv("PLIVO_PHONE_NUMBER", "")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "")
 
 app = FastAPI(
-    title="GPT-5.2 + Speechmatics + ElevenLabs Voice Agent (Inbound)",
-    description="Inbound voice agent: GPT-5.2 + Speechmatics STT + ElevenLabs TTS + Plivo",
+    title="GPT-5.4 Mini + Speechmatics + ElevenLabs Voice Agent (Inbound)",
+    description="Inbound voice agent: GPT-5.4 Mini + Speechmatics STT + ElevenLabs TTS + Plivo",
     version="0.1.0",
 )
 
@@ -382,7 +382,7 @@ async def websocket_endpoint(
 def main() -> None:
     """Run the inbound server."""
     logger.info(
-        f"Starting GPT-5.2 + Speechmatics + ElevenLabs Inbound Agent on port {SERVER_PORT}"
+        f"Starting GPT-5.4 Mini + Speechmatics + ElevenLabs Inbound Agent on port {SERVER_PORT}"
     )
 
     if PLIVO_PHONE_NUMBER and PUBLIC_URL:

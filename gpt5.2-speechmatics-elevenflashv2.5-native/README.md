@@ -1,6 +1,6 @@
-# GPT-5.2 Mini + Speechmatics STT + ElevenLabs TTS -- Native Voice Agent
+# GPT-5.4 Mini + Speechmatics STT + ElevenLabs TTS -- Native Voice Agent
 
-Native orchestration (raw WebSockets + asyncio, no framework). Plivo mu-law 8kHz (160B/20ms chunks) feeds Speechmatics Voice Agent API (`adaptive` profile) over WebSocket at 8kHz PCM s16le binary frames (no resample needed) and local Silero VAD (ONNX v5, 512 samples/32ms at 16kHz). LLM is OpenAI `gpt-5.2-mini` via HTTP SSE streaming (sentence-buffered output for progressive TTS). TTS is ElevenLabs `eleven_flash_v2_5` via WebSocket `stream-input` -- text sent in sentence chunks, audio returned as PCM16 24kHz, resampled to 8kHz mu-law for Plivo. VAD start threshold 0.85 to reject echo (agent playback registers 0.51-0.74, real speech 0.93+), end threshold 0.35, 500ms min silence. Barge-in cancels in-flight LLM/TTS tasks, drains the send queue, and sends `clearAudio` to Plivo.
+Native orchestration (raw WebSockets + asyncio, no framework). Plivo mu-law 8kHz (160B/20ms chunks) feeds Speechmatics Voice Agent API (`adaptive` profile) over WebSocket at 8kHz PCM s16le binary frames (no resample needed) and local Silero VAD (ONNX v5, 512 samples/32ms at 16kHz). LLM is OpenAI `gpt-5.4-mini` via HTTP SSE streaming (sentence-buffered output for progressive TTS). TTS is ElevenLabs `eleven_flash_v2_5` via WebSocket `stream-input` -- text sent in sentence chunks, audio returned as PCM16 24kHz, resampled to 8kHz mu-law for Plivo. VAD start threshold 0.85 to reject echo (agent playback registers 0.51-0.74, real speech 0.93+), end threshold 0.35, 500ms min silence. Barge-in cancels in-flight LLM/TTS tasks, drains the send queue, and sends `clearAudio` to Plivo.
 
 ## Architecture
 
@@ -9,8 +9,8 @@ Native orchestration (raw WebSockets + asyncio, no framework). Plivo mu-law 8kHz
 │  Phone   │──────▶│   Plivo    │──────▶│                    Voice Agent                           │
 │  (PSTN)  │◀──────│  Gateway   │◀──────│                                                          │
 └──────────┘       └────────────┘       │  ┌──────────┐  ┌────────────────┐  ┌─────────────────┐  │
-                    μ-law 8kHz          │  │ Silero   │  │ Speechmatics   │  │  OpenAI GPT-5.2 │  │
-                    bidirectional       │  │ VAD      │  │ Voice Agent    │  │  mini (HTTP SSE)│  │
+                    μ-law 8kHz          │  │ Silero   │  │ Speechmatics   │  │ OpenAI GPT-5.4  │  │
+                    bidirectional       │  │ VAD      │  │ Voice Agent    │  │  Mini (HTTP SSE)│  │
                     WebSocket           │  │ (local)  │  │ (WebSocket)    │  │                 │  │
                                         │  └────┬─────┘  └──────┬─────────┘  └────────┬────────┘  │
                                         │       │               │                     │           │
@@ -33,7 +33,7 @@ Native orchestration (raw WebSockets + asyncio, no framework). Plivo mu-law 8kHz
 |-----------|---------|----------|----------------|--------|
 | **Telephony** | Plivo | WebSocket (μ-law 8kHz) | — | US (Plivo PSTN gateway) |
 | **STT** | Speechmatics | WebSocket streaming | Voice Agent API `adaptive` profile | EU (`preview.rt.speechmatics.com`) |
-| **LLM** | OpenAI | HTTP SSE streaming | `gpt-5.2-mini` | US (`api.openai.com`) |
+| **LLM** | OpenAI | HTTP SSE streaming | `gpt-5.4-mini` | US (`api.openai.com`) |
 | **TTS** | ElevenLabs | WebSocket streaming | `eleven_flash_v2_5` | US (`api.elevenlabs.io`) |
 | **VAD** | Silero | Local (ONNX) | `silero_vad` v5 | Local (no network) |
 | **Turn detection** | Custom | — | Debounced frame counter + EndOfTurn | Local |
@@ -145,12 +145,12 @@ Audio is forwarded to STT continuously — even during agent playback. This ensu
 4. **Audio**: send raw PCM binary frames (no encoding, no framing)
 5. **EndOfStream**: send `{"message": "EndOfStream", "last_seq_no": 0}` to close gracefully
 
-## LLM: OpenAI GPT-5.2 Mini
+## LLM: OpenAI GPT-5.4 Mini
 
 The LLM is called via **HTTP streaming chat completions** (SSE) with sentence-level buffering to start TTS before the full response arrives:
 
 - **Endpoint**: `https://api.openai.com/v1/chat/completions`
-- **Model**: `gpt-5.2-mini`
+- **Model**: `gpt-5.4-mini`
 - **Streaming**: `stream=True` — tokens are buffered and flushed at sentence boundaries (`[.!?]`)
 - **Function calling**: 5 tools (order status, SMS, callback, transfer, end call)
 
@@ -231,7 +231,7 @@ uv run python -m outbound.server
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `OPENAI_API_KEY` | OpenAI API key | Required |
-| `OPENAI_MODEL` | LLM model | `gpt-5.2-mini` |
+| `OPENAI_MODEL` | LLM model | `gpt-5.4-mini` |
 | `SPEECHMATICS_API_KEY` | Speechmatics API key | Required |
 | `SPEECHMATICS_PROFILE` | Voice Agent profile | `adaptive` |
 | `ELEVENLABS_API_KEY` | ElevenLabs API key | Required |

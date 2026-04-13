@@ -1,7 +1,7 @@
-"""Outbound voice agent -- GPT-5.2 mini + Speechmatics STT + ElevenLabs TTS + call state management.
+"""Outbound voice agent -- GPT-5.4 Mini + Speechmatics STT + ElevenLabs TTS + call state management.
 
 Uses a pipeline architecture:
-  Plivo audio -> Speechmatics STT -> GPT-5.2 mini -> ElevenLabs TTS -> Plivo audio
+  Plivo audio -> Speechmatics STT -> GPT-5.4 Mini -> ElevenLabs TTS -> Plivo audio
 
 Loads the outbound system prompt and provides run_agent() for handling
 outbound call WebSocket sessions, plus CallManager for tracking call lifecycle.
@@ -307,7 +307,7 @@ class SpeechmaticsSTT:
 
 # Agent configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
 SPEECHMATICS_API_KEY = os.getenv("SPEECHMATICS_API_KEY", "")
 SPEECHMATICS_PROFILE = os.getenv("SPEECHMATICS_PROFILE", "adaptive")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
@@ -565,7 +565,7 @@ async def transfer_call(department: str, reason: str) -> dict[str, Any]:
 
 
 class VoiceAgent:
-    """Voice conversation session: Plivo + Speechmatics STT + GPT-5.2 mini + ElevenLabs TTS."""
+    """Voice conversation session: Plivo + Speechmatics STT + GPT-5.4 Mini + ElevenLabs TTS."""
 
     def __init__(
         self,
@@ -820,7 +820,7 @@ class VoiceAgent:
 
     @_traced("llm")
     async def _generate_llm_response(self, user_text: str) -> str:
-        """Send conversation to GPT-5.2 mini via streaming SSE and return text response.
+        """Send conversation to GPT-5.4 Mini via streaming SSE and return text response.
 
         Streams the response token-by-token. Buffers text to sentence
         boundaries for progressive TTS synthesis.
