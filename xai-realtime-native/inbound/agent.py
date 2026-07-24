@@ -16,8 +16,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import plivo
 from dotenv import load_dotenv
 from loguru import logger
+
+from utils import normalize_phone_number
 
 load_dotenv()
 
@@ -26,6 +29,15 @@ XAI_API_KEY = os.getenv("XAI_API_KEY", "")
 XAI_REALTIME_MODEL = os.getenv("XAI_REALTIME_MODEL", "")
 XAI_VOICE = os.getenv("XAI_VOICE", "Sal")
 XAI_REALTIME_URL = "wss://api.x.ai/v1/realtime"
+PLIVO_AUTH_ID = os.getenv("PLIVO_AUTH_ID", "")
+PLIVO_AUTH_TOKEN = os.getenv("PLIVO_AUTH_TOKEN", "")
+PLIVO_PHONE_NUMBER = os.getenv("PLIVO_PHONE_NUMBER", "")
+TRANSFER_XML_URL = os.getenv(
+    "TRANSFER_XML_URL",
+    "https://s3.amazonaws.com/static.plivo.com/answer.xml",
+)
+TRANSFER_XML_METHOD = os.getenv("TRANSFER_XML_METHOD", "GET")
+TRANSFER_PSTN_NUMBER = os.getenv("TRANSFER_PSTN_NUMBER", "")
 
 if TYPE_CHECKING:
     from fastapi import WebSocket
@@ -38,8 +50,21 @@ SYSTEM_PROMPT = (Path(__file__).parent / "system_prompt.md").read_text().strip()
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", SYSTEM_PROMPT)
 
 # =============================================================================
-# Tool Functions — replace these with your actual implementations
+# Tool Functions
 # =============================================================================
+
+
+def _get_plivo_client() -> plivo.RestClient:
+    if not PLIVO_AUTH_ID or not PLIVO_AUTH_TOKEN:
+        raise RuntimeError("PLIVO_AUTH_ID and PLIVO_AUTH_TOKEN must be configured")
+    return plivo.RestClient(auth_id=PLIVO_AUTH_ID, auth_token=PLIVO_AUTH_TOKEN)
+
+
+def _get_sms_source_number() -> str:
+    source_number = normalize_phone_number(PLIVO_PHONE_NUMBER)
+    if not source_number:
+        raise RuntimeError("PLIVO_PHONE_NUMBER must be configured for SMS")
+    return source_number
 
 
 async def check_order_status(order_number: str | None, email: str | None) -> dict[str, Any]:
@@ -76,17 +101,41 @@ async def check_order_status(order_number: str | None, email: str | None) -> dic
 
 
 async def send_sms(phone_number: str, message: str) -> dict[str, Any]:
-    """Send SMS to customer. Replace with your actual implementation."""
+    """Send a real SMS using the configured Plivo number."""
     logger.info(f"Sending SMS to {phone_number}: {message[:50]}...")
 
     if not phone_number:
         return {"status": "error", "message": "Phone number required"}
+    if not message.strip():
+        return {"status": "error", "message": "Message content required"}
+
+    source_number = _get_sms_source_number()
+    destination_number = normalize_phone_number(phone_number)
+    if not destination_number:
+        return {"status": "error", "message": "Invalid destination phone number"}
+
+    client = _get_plivo_client()
+    response = client.messages.create(
+        src=source_number,
+        dst=destination_number,
+        text=message,
+    )
+
+    if isinstance(response, dict):
+        message_uuid = response.get("message_uuid", [])
+        api_message = response.get("message", "message queued")
+    else:
+        message_uuid = getattr(response, "message_uuid", [])
+        api_message = getattr(response, "message", "message queued")
 
     return {
         "status": "sent",
-        "phone_number": phone_number,
+        "phone_number": f"+{destination_number}",
+        "from_number": f"+{source_number}",
         "message_preview": message[:50] + "..." if len(message) > 50 else message,
-        "confirmation_id": f"SMS{random.randint(100000, 999999)}",
+        "message_uuid": message_uuid,
+        "provider": "plivo",
+        "provider_message": api_message,
     }
 
 
@@ -109,15 +158,30 @@ async def schedule_callback(
     }
 
 
-async def transfer_call(department: str, reason: str) -> dict[str, Any]:
-    """Transfer call to human agent. Replace with your actual implementation."""
-    logger.info(f"Transferring to {department}: {reason}")
+async def transfer_call(call_uuid: str, department: str, reason: str) -> dict[str, Any]:
+    """Transfer the live call to the configured Plivo XML URL."""
+    logger.info(f"Transferring call {call_uuid} to {department}: {reason}")
+
+    if not call_uuid:
+        return {"status": "error", "message": "Active call UUID required for transfer"}
+
+    client = _get_plivo_client()
+    client.calls.transfer(
+        call_uuid=call_uuid,
+        legs="aleg",
+        aleg_url=TRANSFER_XML_URL,
+        aleg_method=TRANSFER_XML_METHOD,
+    )
 
     return {
         "status": "transferring",
         "department": department,
         "reason": reason,
-        "estimated_wait": "less than 2 minutes",
+        "transfer_xml_url": TRANSFER_XML_URL,
+        "transfer_xml_method": TRANSFER_XML_METHOD,
+        "transfer_pstn_number": TRANSFER_PSTN_NUMBER,
+        "call_uuid": call_uuid,
+        "provider": "plivo",
     }
 
 
@@ -259,6 +323,7 @@ class XAIRealtimeAgent:
                 )
             elif name == "transfer_call":
                 result = await transfer_call(
+                    call_uuid=self.call_id,
                     department=args.get("department", "support"),
                     reason=args.get("reason", "Customer requested transfer"),
                 )

@@ -1,72 +1,60 @@
 # xAI Realtime + Plivo Voice Agent (Native)
 
-Real-time voice agent using the xAI realtime API for speech-to-speech conversations over Plivo telephony. This variant keeps the audio path as simple as possible: it forwards Plivo's mu-law 8 kHz audio straight to xAI and back with no transcoding, and relies on server-side VAD for turn detection.
-
-For a variant that transcodes audio and uses local VAD, see the other xAI example variants in this repository.
-
-## How this variant differs
-
-| | reference variant | this example |
-| --- | --- | --- |
-| Audio path | Transcodes audio and uses extra processing | mu-law 8 kHz passthrough (`audio/pcmu`) |
-| Turn detection | Client-side/local VAD | Realtime server-side VAD (`server_vad`) |
-| Extra dependencies | numpy, scipy, torch, silero-vad | none |
-
-The trade-off: fewer moving parts and lower latency, against the fine-grained control a local VAD gives you.
+Native speech-to-speech voice agent using the xAI realtime API with Plivo telephony and server-side turn detection.
 
 ## Features
 
-- Speech-to-speech using the xAI realtime API (no separate STT/TTS)
-- mu-law 8 kHz passthrough — no audio conversion
-- Server-side turn detection
-- Barge-in — the caller can interrupt the agent mid-response
-- Function calling (order status, SMS, callbacks, transfers, call control)
-- Auto-configuration of Plivo webhooks on startup
-- Inbound and outbound calls
+- **Speech-to-Speech**: Native audio using the xAI realtime API (no separate STT/TTS)
+- **Server-Side VAD**: Turn detection handled by the realtime API
+- **Barge-in Support**: Callers can interrupt the agent mid-response with immediate audio clearing
+- **Multi-turn Conversations**: Maintains context across the call
+- **Function Calling**: Order status, SMS, callbacks, transfers, and call control
+- **Auto-Configuration**: Automatically configures Plivo webhooks on startup
+- **No Orchestration**: Direct API integration without frameworks
+- **Inbound and Outbound**: Supports both receiving and placing calls
 
 ## Prerequisites
 
 - Python 3.10+
 - [uv](https://docs.astral.sh/uv/) package manager
 - xAI API key with realtime API access
-- Plivo account with a phone number
+- Plivo account with voice-enabled phone numbers
 - ngrok (for local development)
 
-## Quick start
+## Quick Start
 
-1. Install dependencies.
+### 1. Install dependencies
 
 ```sh
 cd xai-realtime-native
 uv sync
 ```
 
-2. Copy the environment template.
+### 2. Configure environment
 
 ```sh
 cp .env.example .env
 ```
 
-3. Edit `.env` with your credentials:
+Edit `.env` with your credentials:
 
 ```sh
 XAI_API_KEY=your_xai_api_key
 PLIVO_AUTH_ID=your_plivo_auth_id
 PLIVO_AUTH_TOKEN=your_plivo_auth_token
 PLIVO_PHONE_NUMBER=+1234567890
-PLIVO_TEST_NUMBER=+1234567891
 PUBLIC_URL=https://your-ngrok-url.ngrok-free.app
 ```
 
-4. Start ngrok.
+### 3. Start ngrok
 
 ```sh
 ngrok http 8000
 ```
 
-Copy the ngrok URL into `PUBLIC_URL`.
+Copy the ngrok URL to `PUBLIC_URL` in your `.env` file.
 
-5. Run the server.
+### 4. Run the server
 
 ```sh
 # Inbound (receives calls)
@@ -76,63 +64,155 @@ uv run python -m inbound.server
 uv run python -m outbound.server
 ```
 
-The inbound server auto-configures your Plivo number's answer webhook on startup. Call the number to talk to the agent. To place an outbound call:
+The inbound server will:
+1. Start on port 8000
+2. Auto-configure Plivo webhooks for your phone number
+3. Display `Ready! Call +1234567890 to test`
+
+### 5. Make a test call
+
+#### Inbound
+Call your Plivo phone number and start talking to the agent.
+
+#### Outbound
+With the outbound server running:
 
 ```sh
 curl -X POST "http://localhost:8000/outbound/call?phone_number=+1234567890"
 ```
 
-## How it works
+## Project Structure
 
-```
-Phone call ──▶ Plivo ──▶ FastAPI server ──▶ xAI realtime API
-           ◀──       ◀──               ◀──
-```
-
-1. Plivo hits `/answer` and receives `<Stream>` XML pointing at the server's WebSocket.
-2. Plivo streams the call audio (mu-law 8 kHz) over the WebSocket.
-3. The server forwards each mu-law payload to xAI as `input_audio_buffer.append`, unchanged.
-4. xAI streams mu-law audio back, which the server relays to Plivo as `playAudio`.
-5. On xAI's `input_audio_buffer.speech_started`, the server sends `clearAudio` to Plivo so the agent stops immediately for barge-in.
-
-## Project structure
-
-```
+```text
 xai-realtime-native/
+├── utils.py               # Phone normalization helpers
 ├── inbound/
+│   ├── agent.py           # XAIRealtimeAgent + tools + run_agent for inbound calls
+│   ├── server.py          # Standalone inbound FastAPI app
+│   └── system_prompt.md   # Inbound call system prompt
 ├── outbound/
-├── tests/
-├── utils.py
-├── pyproject.toml
-├── Dockerfile
-└── .env.example
+│   ├── agent.py           # XAIRealtimeAgent + tools + CallManager for outbound
+│   ├── server.py          # Standalone outbound FastAPI app
+│   └── system_prompt.md   # Outbound call system prompt
+├── tests/                 # Integration and live-call tests
+├── pyproject.toml         # Project dependencies
+├── .env.example           # Environment variable template
+└── README.md              # This file
 ```
+
+## How It Works
+
+```text
+┌─────────┐     ┌─────────────┐     ┌─────────────┐
+│  Phone  │────▶│   Plivo     │────▶│   Server    │
+│  Call   │◀────│  (PSTN)     │◀────│  (FastAPI)  │
+└─────────┘     └─────────────┘     └──────┬──────┘
+                                           │
+                     WebSocket (μ-law 8kHz)│
+                                           ▼
+                                    ┌─────────────┐
+                                    │   Agent     │
+                                    │ (Realtime   │
+                                    │   bridge)   │
+                                    │             │
+                                    │     xAI     │
+                                    │  Realtime   │
+                                    └─────────────┘
+```
+
+1. **Incoming or Outbound Call**: Plivo receives or places the call and hits your webhook
+2. **WebSocket Setup**: Server returns XML to establish a bidirectional stream
+3. **Audio Streaming**: Plivo streams μ-law 8kHz audio via WebSocket
+4. **Realtime Session**: Server opens a separate WebSocket to the xAI realtime API
+5. **Turn Detection**: xAI server-side VAD detects when the caller starts and stops speaking
+6. **AI Processing**: xAI generates streaming audio responses
+7. **Barge-in**: If the caller speaks during playback, the server clears Plivo audio immediately
+8. **Response Streaming**: Agent forwards model audio back to Plivo as `playAudio`
+
+## Audio Formats
+
+| Stage | Format | Sample Rate |
+|-------|--------|-------------|
+| Plivo → Agent | μ-law | 8 kHz |
+| Agent → xAI | `audio/pcmu` | 8 kHz |
+| xAI → Agent | `audio/pcmu` | 8 kHz |
+| Agent → Plivo | μ-law | 8 kHz |
+
+## Turn Detection
+
+This example uses **server-side turn detection** from the xAI realtime API.
+
+### What that means
+
+- the agent forwards telephony audio directly to xAI
+- xAI decides when speech starts and stops
+- xAI emits interruption signals like `input_audio_buffer.speech_started`
+- the server reacts by sending `clearAudio` to Plivo for barge-in
+
+### Tradeoff
+
+- **Pros**: simpler architecture, fewer moving parts, no local VAD model
+- **Cons**: less control over turn timing than a client-side VAD pipeline
+
+## Function Calling
+
+The agent includes these tool functions in each `agent.py`:
+
+| Function | Description | Current state |
+|----------|-------------|---------------|
+| `check_order_status` | Look up order by number or email | Demo data |
+| `send_sms` | Send text message to customer | Real Plivo SMS API |
+| `schedule_callback` | Schedule callback from specialist | Demo data |
+| `transfer_call` | Transfer to human agent | Real Plivo call transfer |
+| `end_call` | End the conversation gracefully | Real call-control behavior |
+
+### Tool behavior notes
+
+- `send_sms` uses `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN`, and `PLIVO_PHONE_NUMBER` to send a real SMS through Plivo.
+- `transfer_call` uses the Plivo Call Transfer API to redirect the live call to the configured XML target.
+- `check_order_status` and `schedule_callback` are still placeholders and should be replaced with your own backend logic.
+
+To add a new tool, define the function and add its schema to `_build_tools()`.
 
 ## Configuration
 
-| Variable | Description |
-| --- | --- |
-| `XAI_API_KEY` | xAI API key |
-| `XAI_REALTIME_MODEL` | Optional model name appended to the realtime URL when explicitly set |
-| `XAI_VOICE` | Voice name (default `Sal`) |
-| `PLIVO_AUTH_ID` / `PLIVO_AUTH_TOKEN` | Plivo credentials |
-| `PLIVO_PHONE_NUMBER` | Number to auto-configure on startup |
-| `PLIVO_TEST_NUMBER` | Second Plivo number used by live-call tests |
-| `PUBLIC_URL` | Public HTTPS URL for webhooks (ngrok in development) |
-| `SERVER_PORT` | Server port (default 8000) |
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `XAI_API_KEY` | xAI API key | Required |
+| `PLIVO_AUTH_ID` | Plivo Auth ID | Required |
+| `PLIVO_AUTH_TOKEN` | Plivo Auth Token | Required |
+| `PLIVO_PHONE_NUMBER` | Your Plivo phone number | Required |
+| `PUBLIC_URL` | Public URL for webhooks (ngrok) | Required |
+| `TRANSFER_XML_URL` | XML URL used by `transfer_call` | `https://s3.amazonaws.com/static.plivo.com/answer.xml` |
+| `TRANSFER_XML_METHOD` | HTTP method for the transfer XML request | `GET` |
+| `TRANSFER_PSTN_NUMBER` | Single PSTN transfer target label or placeholder | unset |
+| `SERVER_PORT` | Server port | `8000` |
+| `XAI_REALTIME_MODEL` | Optional realtime model override | unset |
+| `XAI_VOICE` | Voice name | `Sal` |
+| `DEFAULT_COUNTRY_CODE` | ISO 3166-1 alpha-2 code for phone parsing | `US` |
+| `SYSTEM_PROMPT` | Override the default system prompt | TechFlow agent |
 
-## Tests
+`PLIVO_PHONE_NUMBER` is the live voice and SMS source number for this example. In our setup, use a US Plivo number as the outbound caller ID and SMS source.
 
-Run the offline unit and local integration checks:
+## Testing
+
+This xAI variant currently has one practical test path: local and API-level checks. The dedicated live-call test files are placeholders and should not be presented as a ready validation path yet.
+
+### Run unit and local integration tests
 
 ```sh
+uv sync --group dev
 uv run --group dev python -m pytest tests/test_integration.py -v -k "unit or local"
 ```
 
-Run the live API or telephony checks only after you set the required credentials:
+### Live-call coverage status
 
-```sh
-uv run --group dev python -m pytest tests/test_e2e_live.py -v
-uv run --group dev python -m pytest tests/test_live_call.py -v -s
-uv run --group dev python -m pytest tests/test_outbound_call.py -v -s
-```
+- `tests/test_e2e_live.py` is available for API-level validation.
+- `tests/test_live_call.py` and `tests/test_outbound_call.py` are still scaffolds for future live-call automation.
+- For now, validate inbound and outbound telephony manually by running the servers and placing real calls.
+
+## Known Notes
+
+- This example was live-tested on July 24, 2026 for both inbound and outbound call paths.
+- Outbound caller ID is typically a US Plivo number.
+- Inbound testing can use a separate India number if that is how your account is configured.
