@@ -260,6 +260,12 @@ async def check_order_status(order_number: str | None, email: str | None) -> dic
 
 async def send_sms(phone_number: str, message: str) -> dict[str, Any]:
     """Send a real SMS using the configured Plivo number."""
+    # Example prompt:
+    # "Send an SMS to +919448678165 saying your order has been shipped."
+    #
+    # If you have fixed contacts, store their numbers in environment variables or
+    # config and reference those values from your agent instructions instead of
+    # repeating the raw numbers in every prompt.
     logger.info(f"Sending SMS to {phone_number}: {message[:50]}...")
 
     if not phone_number:
