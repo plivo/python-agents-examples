@@ -204,8 +204,11 @@ uv run --group dev python -m pytest tests/test_integration.py -v -k "unit or loc
 - `tests/test_live_call.py` and `tests/test_outbound_call.py` are still scaffolds for future live-call automation.
 - For now, validate inbound and outbound telephony manually by running the servers and placing real calls.
 
-## Known Notes
+## Troubleshooting
 
-- This example was live-tested on July 24, 2026 for both inbound and outbound call paths.
-- Outbound caller ID is typically a US Plivo number.
-- Inbound testing can use a separate India number if that is how your account is configured.
+- **No audio from agent**: Check `XAI_API_KEY`, `PLIVO_AUTH_ID`, and `PLIVO_AUTH_TOKEN`, and confirm the call answered path reached your server.
+- **WebSocket bridge never starts**: Make sure `PUBLIC_URL` matches your active ngrok tunnel and that Plivo can reach `/answer` and `/ws`.
+- **Call connects but there is silence**: Confirm the bridge is using `audio/x-mulaw;rate=8000` on the Plivo side and `audio/pcmu` on the xAI side.
+- **Barge-in is not working**: Ensure the Plivo WebSocket continues delivering caller audio during playback so xAI can emit `input_audio_buffer.speech_started`.
+- **Slow turn detection**: This example uses xAI server-side VAD, so interruption and end-of-turn timing depend on the realtime model rather than local VAD tuning.
+- **Outbound call uses the wrong caller ID**: Set `PLIVO_PHONE_NUMBER` to the correct Plivo number before starting `outbound.server`.
