@@ -40,12 +40,6 @@ XAI_REALTIME_URL = "wss://api.x.ai/v1/realtime"
 PLIVO_AUTH_ID = os.getenv("PLIVO_AUTH_ID", "")
 PLIVO_AUTH_TOKEN = os.getenv("PLIVO_AUTH_TOKEN", "")
 PLIVO_PHONE_NUMBER = os.getenv("PLIVO_PHONE_NUMBER", "")
-TRANSFER_XML_URL = os.getenv(
-    "TRANSFER_XML_URL",
-    "https://s3.amazonaws.com/static.plivo.com/answer.xml",
-)
-TRANSFER_XML_METHOD = os.getenv("TRANSFER_XML_METHOD", "GET")
-TRANSFER_PSTN_NUMBER = os.getenv("TRANSFER_PSTN_NUMBER", "")
 
 if TYPE_CHECKING:
     from fastapi import WebSocket
@@ -322,30 +316,15 @@ async def schedule_callback(
     }
 
 
-async def transfer_call(call_uuid: str, department: str, reason: str) -> dict[str, Any]:
-    """Transfer the live call to the configured Plivo XML URL."""
-    logger.info(f"Transferring call {call_uuid} to {department}: {reason}")
-
-    if not call_uuid:
-        return {"status": "error", "message": "Active call UUID required for transfer"}
-
-    client = _get_plivo_client()
-    client.calls.transfer(
-        call_uuid=call_uuid,
-        legs="aleg",
-        aleg_url=TRANSFER_XML_URL,
-        aleg_method=TRANSFER_XML_METHOD,
-    )
+async def transfer_call(department: str, reason: str) -> dict[str, Any]:
+    """Transfer call to human agent. Replace with your actual implementation."""
+    logger.info(f"Transferring to {department}: {reason}")
 
     return {
         "status": "transferring",
         "department": department,
         "reason": reason,
-        "transfer_xml_url": TRANSFER_XML_URL,
-        "transfer_xml_method": TRANSFER_XML_METHOD,
-        "transfer_pstn_number": TRANSFER_PSTN_NUMBER,
-        "call_uuid": call_uuid,
-        "provider": "plivo",
+        "estimated_wait": "less than 2 minutes",
     }
 
 
@@ -487,7 +466,6 @@ class XAIRealtimeAgent:
                 )
             elif name == "transfer_call":
                 result = await transfer_call(
-                    call_uuid=self.call_id,
                     department=args.get("department", "support"),
                     reason=args.get("reason", "Customer requested transfer"),
                 )

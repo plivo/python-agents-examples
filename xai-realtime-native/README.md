@@ -158,19 +158,15 @@ This example uses **server-side turn detection** from the xAI realtime API.
 
 The agent includes these tool functions in each `agent.py`:
 
-| Function | Description | Current state |
-|----------|-------------|---------------|
-| `check_order_status` | Look up order by number or email | Demo data |
-| `send_sms` | Send text message to customer | Real Plivo SMS API |
-| `schedule_callback` | Schedule callback from specialist | Demo data |
-| `transfer_call` | Transfer to human agent | Real Plivo call transfer |
-| `end_call` | End the conversation gracefully | Real call-control behavior |
+| Function | Description |
+|----------|-------------|
+| `check_order_status` | Look up order by number or email |
+| `send_sms` | Send text message to customer |
+| `schedule_callback` | Schedule callback from specialist |
+| `transfer_call` | Transfer to human agent |
+| `end_call` | End the conversation gracefully |
 
-### Tool behavior notes
-
-- `send_sms` uses `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN`, and `PLIVO_PHONE_NUMBER` to send a real SMS through Plivo.
-- `transfer_call` uses the Plivo Call Transfer API to redirect the live call to the configured XML target.
-- `check_order_status` and `schedule_callback` are still placeholders and should be replaced with your own backend logic.
+`send_sms` is wired to the Plivo SMS API, so you can use it directly to try the live SMS flow with your configured `PLIVO_PHONE_NUMBER`.
 
 To add a new tool, define the function and add its schema to `_build_tools()`.
 
@@ -183,9 +179,6 @@ To add a new tool, define the function and add its schema to `_build_tools()`.
 | `PLIVO_AUTH_TOKEN` | Plivo Auth Token | Required |
 | `PLIVO_PHONE_NUMBER` | Your Plivo phone number | Required |
 | `PUBLIC_URL` | Public URL for webhooks (ngrok) | Required |
-| `TRANSFER_XML_URL` | XML URL used by `transfer_call` | `https://s3.amazonaws.com/static.plivo.com/answer.xml` |
-| `TRANSFER_XML_METHOD` | HTTP method for the transfer XML request | `GET` |
-| `TRANSFER_PSTN_NUMBER` | Single PSTN transfer target label or placeholder | unset |
 | `SERVER_PORT` | Server port | `8000` |
 | `XAI_REALTIME_MODEL` | Optional realtime model override | unset |
 | `XAI_VOICE` | Voice name | `Sal` |
