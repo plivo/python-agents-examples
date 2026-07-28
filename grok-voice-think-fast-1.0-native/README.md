@@ -189,20 +189,45 @@ To add a new tool, define the function and add its schema to `_build_tools()`.
 
 ## Testing
 
-This xAI variant currently has one practical test path: local and API-level checks. The dedicated live-call test files are placeholders and should not be presented as a ready validation path yet.
-
-### Run unit and local integration tests
+The test suite includes unit tests, local integration tests, and end-to-end live-call tests. The live-call tests skip automatically when live infrastructure or credentials are not configured, so the suite is safe to run anywhere.
 
 ```sh
+# Install dev dependencies
 uv sync --group dev
-uv run --group dev python -m pytest tests/test_integration.py -v -k "unit or local"
+
+# Run all tests
+uv run --group dev python -m pytest tests/ -v
+
+# Run specific test levels
+uv run --group dev python -m pytest tests/test_integration.py -v       # Unit + local integration
+uv run --group dev python -m pytest tests/test_e2e_live.py -v -s        # API-level check against the xAI realtime API
+uv run --group dev python -m pytest tests/test_live_call.py -v -s       # Inbound live call via Plivo
+uv run --group dev python -m pytest tests/test_outbound_call.py -v -s   # Outbound live call via Plivo
+uv run --group dev python -m pytest tests/test_multiturn_voice.py -v -s # Multi-turn conversation
 ```
 
-### Live-call coverage status
+**Requirements for live-call tests:**
+- Valid Plivo credentials and a Plivo number in `.env`
+- Valid xAI API key in `.env`
+- `PLIVO_DEST_NUMBER` for outbound tests and `PLIVO_TEST_NUMBER` for the inbound test
+- ngrok binary available on PATH
+- `faster-whisper` (dev dependency, for transcription verification)
 
-- `tests/test_e2e_live.py` is available for API-level validation.
-- `tests/test_live_call.py` and `tests/test_outbound_call.py` are still scaffolds for future live-call automation.
-- For now, validate inbound and outbound telephony manually by running the servers and placing real calls.
+## Deployment
+
+### Docker
+
+```sh
+# Build the image
+docker build -t grok-voice-agent .
+
+# Run the inbound server (default)
+docker run -p 8000:8000 --env-file .env grok-voice-agent
+
+# Run the outbound server
+docker run -p 8000:8000 --env-file .env grok-voice-agent \
+  uv run python -m outbound.server
+```
 
 ## Troubleshooting
 
