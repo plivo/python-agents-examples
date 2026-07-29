@@ -1,4 +1,4 @@
-# Grok Voice (Think Fast 1.0) + Plivo Voice Agent (Native)
+# Grok Voice 4.5 + Plivo Voice Agent (Native)
 
 Native speech-to-speech voice agent using the xAI realtime API with the `grok-voice-think-fast-1.0` model, Plivo telephony, and server-side turn detection.
 
