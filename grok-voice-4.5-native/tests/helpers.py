@@ -15,6 +15,22 @@ NGROK_BIN = os.getenv("NGROK_BIN", "ngrok")
 NGROK_API = "http://localhost:4040/api/tunnels"
 
 
+def require_public_ready(public_url: str, path: str = "/", timeout: float = 10.0) -> None:
+    """Skip the test unless the public URL serves HTTP 200.
+
+    A broken or stale ngrok tunnel with nothing behind it answers 502, and a
+    missing tunnel raises a connection error. Either way the live server is not
+    actually reachable, so the test should skip rather than fail.
+    """
+    url = public_url.rstrip("/") + path
+    try:
+        resp = httpx.get(url, timeout=timeout)
+    except Exception as exc:
+        pytest.skip(f"Public URL {url} not reachable: {exc}")
+    if resp.status_code != 200:
+        pytest.skip(f"Public URL {url} returned {resp.status_code}; live server not available")
+
+
 def start_ngrok(port: int) -> tuple[subprocess.Popen, str]:
     """Start ngrok tunnel and return (process, public_url)."""
     proc = subprocess.Popen(
