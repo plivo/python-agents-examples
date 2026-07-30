@@ -34,7 +34,7 @@ load_dotenv()
 
 # Agent configuration
 XAI_API_KEY = os.getenv("XAI_API_KEY", "")
-XAI_REALTIME_MODEL = os.getenv("XAI_REALTIME_MODEL", "grok-voice-think-fast-1.0")
+XAI_REALTIME_MODEL = os.getenv("XAI_REALTIME_MODEL", "grok-voice-latest")
 XAI_VOICE = os.getenv("XAI_VOICE", "Sal")
 XAI_REALTIME_URL = "wss://api.x.ai/v1/realtime"
 PLIVO_AUTH_ID = os.getenv("PLIVO_AUTH_ID", "")

@@ -1,6 +1,6 @@
 # Grok Voice 4.5 + Plivo Voice Agent (Native)
 
-Native speech-to-speech voice agent using the xAI realtime API with the `grok-voice-think-fast-1.0` model, Plivo telephony, and server-side turn detection.
+Native speech-to-speech voice agent using the xAI realtime API with Grok Voice 4.5, Plivo telephony, and server-side turn detection.
 
 ## Features
 
@@ -180,7 +180,7 @@ To add a new tool, define the function and add its schema to `_build_tools()`.
 | `PLIVO_PHONE_NUMBER` | Your Plivo phone number | Required |
 | `PUBLIC_URL` | Public URL for webhooks (ngrok) | Required |
 | `SERVER_PORT` | Server port | `8000` |
-| `XAI_REALTIME_MODEL` | Realtime voice model (`grok-voice-latest` tracks the newest) | `grok-voice-think-fast-1.0` |
+| `XAI_REALTIME_MODEL` | Realtime voice model (Grok Voice 4.5) | `grok-voice-latest` |
 | `XAI_VOICE` | Voice name | `Sal` |
 | `DEFAULT_COUNTRY_CODE` | ISO 3166-1 alpha-2 code for phone parsing | `US` |
 | `SYSTEM_PROMPT` | Override the default system prompt | TechFlow agent |
