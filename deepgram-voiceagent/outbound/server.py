@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import atexit
 import base64
 import contextlib
 import functools
@@ -26,7 +28,12 @@ from outbound.agent import (
     determine_outcome,
     run_agent,
 )
-from utils import normalize_phone_number
+from utils import (
+    TunnelError,
+    normalize_phone_number,
+    start_quick_tunnel,
+    stop_tunnel,
+)
 
 load_dotenv()
 
@@ -525,13 +532,42 @@ async def websocket_endpoint(
 # =============================================================================
 
 
+def _start_tunnel() -> None:
+    """``--tunnel``: expose SERVER_PORT via a Cloudflare quick tunnel and use it as PUBLIC_URL."""
+    global PUBLIC_URL
+    try:
+        url, proc = start_quick_tunnel(SERVER_PORT)
+    except TunnelError as e:
+        logger.error(f"--tunnel: {e}")
+        raise SystemExit(1) from e
+    atexit.register(stop_tunnel, proc)
+    PUBLIC_URL = url
+    logger.info(f"Tunnel up: {url} -> http://localhost:{SERVER_PORT}")
+
+
 def main() -> None:
     """Run the outbound server."""
+    parser = argparse.ArgumentParser(description="Deepgram Voice Agent outbound server")
+    parser.add_argument(
+        "--tunnel",
+        action="store_true",
+        help="expose the server via a free Cloudflare quick tunnel (requires cloudflared) "
+        "and use it as PUBLIC_URL for Plivo answer/hangup callbacks",
+    )
+    args = parser.parse_args()
+
     logger.info(f"Starting Deepgram Voice Agent Outbound Agent on port {SERVER_PORT}")
 
     # Verify the Deepgram agent settings once, before accepting calls
     if not check_saved_agent_config():
         raise SystemExit(1)
+
+    if args.tunnel:
+        _start_tunnel()
+    logger.info(
+        f"Place a call: curl -X POST 'http://localhost:{SERVER_PORT}/outbound/call"
+        "?phone_number=<E.164 number>'"
+    )
     uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT, log_level="info")
 
 

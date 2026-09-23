@@ -26,61 +26,68 @@ Plivo bidirectional audio streaming bridged over raw `websockets` + asyncio (no 
 - [uv](https://docs.astral.sh/uv/) package manager
 - A Deepgram API key with Voice Agent API access ([console.deepgram.com](https://console.deepgram.com))
 - A Plivo account with a phone number
-- ngrok, for local development
+- For a local run, `cloudflared` for `--tunnel` (or ngrok); for hosting, Docker
 
 ## Quick Start
 
-### 1. Install dependencies
+Deepgram has no telephony, so a small bridge server has to sit between Plivo and Deepgram. That server is this example. Plivo just needs a public URL to reach it.
 
-```bash
-cd deepgram-voiceagent
-uv sync
+```
+Caller ──► Plivo ══ WebSocket ══► this server (bridge) ══ WebSocket ══► Deepgram Voice Agent
+                                        ▲
+                         reachable at PUBLIC_URL (tunnel or host)
 ```
 
-### 2. Configure environment
+| | Option A: one command (local) | Option B: Docker (any host) |
+|---|---|---|
+| **Use for** | Trying it on your laptop | Running on a server |
+| **Public URL** | Created for you (free Cloudflare quick tunnel) | Your host's HTTPS URL |
+| **Needs** | `uv`, `cloudflared` | Docker, a host that allows long-lived WebSockets |
+| **Plivo number setup** | Automatic | Automatic when `PUBLIC_URL` is set |
+
+For both options, first put four values in `.env`:
 
 ```bash
-cp .env.example .env
+git clone https://github.com/plivo/python-agents-examples && cd python-agents-examples/deepgram-voiceagent
+cp .env.example .env   # set DEEPGRAM_API_KEY, PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN, PLIVO_PHONE_NUMBER
 ```
 
-Edit `.env`:
+### Option A: one command, local
 
 ```bash
-DEEPGRAM_API_KEY=your_deepgram_api_key
-PLIVO_AUTH_ID=your_plivo_auth_id
-PLIVO_AUTH_TOKEN=your_plivo_auth_token
-PLIVO_PHONE_NUMBER=+1234567890
-PUBLIC_URL=https://your-ngrok-url.ngrok-free.app
+brew install cloudflared               # once (Linux/Windows: see Cloudflare's cloudflared downloads page)
+uv run python -m inbound.server --tunnel
 ```
 
-### 3. Start ngrok
+What `--tunnel` does:
+
+1. Starts `cloudflared tunnel --url http://localhost:$SERVER_PORT`. The quick tunnel needs no Cloudflare account.
+2. Uses the `https://<random>.trycloudflare.com` URL as `PUBLIC_URL`.
+3. Points your Plivo number at it. The server creates or updates the `Deepgram_VoiceAgent` Plivo application.
+4. Logs `Ready! Call +<number>` once the URL answers, which usually takes about 10 to 20 s.
+
+Call the number. Ctrl+C stops the server and the tunnel. The URL changes on every run and the number is re-pointed each time.
+
+For outbound calls, run `uv run python -m outbound.server --tunnel`, then:
 
 ```bash
-ngrok http 8000
+curl -X POST -G "http://localhost:8000/outbound/call" \
+  --data-urlencode "phone_number=+1234567890" \
+  --data-urlencode "opening_reason=you requested a demo"
 ```
 
-Copy the HTTPS URL into `PUBLIC_URL`.
-
-### 4. Run the server
+### Option B: Docker
 
 ```bash
-# Inbound (receive calls) — auto-configures the Plivo answer/hangup webhooks
-uv run python -m inbound.server
-
-# Outbound (place calls) — no number auto-config; answer/hangup URLs are set per call
-uv run python -m outbound.server
+docker build -t deepgram-voiceagent .
+docker run --env-file .env -e PUBLIC_URL=https://your-host.example.com -p 8000:8000 deepgram-voiceagent
 ```
 
-### 5. Make a test call
+The container listens on port 8000 and configures the Plivo number from `PUBLIC_URL` on startup. For outbound calls, append `uv run python -m outbound.server` to `docker run`. See [Deployment](#deployment) for suitable hosts.
 
-- **Inbound**: call your Plivo number. The greeting plays right after the Deepgram handshake.
-- **Outbound**:
+### Other ways to expose the server
 
-  ```bash
-  curl -X POST -G "http://localhost:8000/outbound/call" \
-    --data-urlencode "phone_number=+1234567890" \
-    --data-urlencode "opening_reason=you requested a demo"
-  ```
+Without `--tunnel`, any tunnel works. For example, run `ngrok http 8000`, set `PUBLIC_URL` to its HTTPS URL, then `uv run python -m inbound.server`.
 
 ## Project Structure
 
@@ -96,7 +103,7 @@ deepgram-voiceagent/
 │   ├── agent.py            # Same agent + OutboundCallRecord, CallManager, build_outbound_prompt()
 │   ├── server.py           # FastAPI: /outbound/call, /outbound/answer, /ws, status, hangup, campaign
 │   └── system_prompt.md    # Outbound prompt ({{opening_reason}}, {{objective}}, {{context}})
-├── utils.py                # μ-law codec, resample_audio, plivo_to_deepgram/deepgram_to_plivo (pass-through), normalize_phone_number
+├── utils.py                # μ-law codec, resample_audio, plivo_to_deepgram/deepgram_to_plivo (pass-through), normalize_phone_number, --tunnel helpers
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py
@@ -466,22 +473,34 @@ From the repo root:
 
 ## Deployment
 
-### Docker
+Use any host that runs containers and keeps WebSocket connections open for the length of a call:
+
+| Host | Works? | Notes |
+|---|---|---|
+| Fly.io, Render, Railway, a VM or Kubernetes | ✅ | Long-lived WebSockets supported |
+| Google Cloud Run | ✅ | Raise the request timeout (max 60 min) above your longest call |
+| Vercel/Netlify functions, AWS Lambda | ❌ | No long-lived WebSocket server |
 
 ```bash
 docker build -t deepgram-voiceagent .
 
-# Inbound (default)
-docker run -p 8000:8000 --env-file .env deepgram-voiceagent
+# Inbound (default): configures the Plivo number from PUBLIC_URL on startup
+docker run -p 8000:8000 --env-file .env -e PUBLIC_URL=https://your-host.example.com deepgram-voiceagent
 
 # Outbound
-docker run -p 8000:8000 --env-file .env deepgram-voiceagent \
+docker run -p 8000:8000 --env-file .env -e PUBLIC_URL=https://your-host.example.com deepgram-voiceagent \
   uv run python -m outbound.server
 ```
 
-The image (default `python:3.12-slim`) runs `uv sync --locked --no-install-project --no-dev --extra streaming`, so the Redis sink is available; the `observability` extra is not installed. A different base image can be passed with `--build-arg BASE_IMAGE=...`.
+The image is based on `python:3.12-slim` by default; pass `--build-arg BASE_IMAGE=...` to change it. It runs `uv sync --locked --no-install-project --no-dev --extra streaming`, so the Redis sink is available but the `observability` extra is not installed. The image does not include `cloudflared`, so `--tunnel` is for local runs only.
 
 ## Troubleshooting
+
+### `--tunnel`: "cloudflared not found" or no "Ready!" line
+
+- **"cloudflared not found on PATH":** install it (`brew install cloudflared` on macOS) and run again.
+- **"Could not reach … from this machine" but Plivo calls work:** your local DNS (often a VPN) is slow to resolve new `trycloudflare.com` hostnames. Plivo resolves the URL on its own network, so calls can still work.
+- **Calls fail too:** restart with `--tunnel` to get a new URL, or use ngrok or a deployed host instead. Quick tunnels are meant for development and have no uptime guarantee.
 
 ### 401 / handshake rejected
 

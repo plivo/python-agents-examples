@@ -1376,6 +1376,131 @@ def make_outbound_agent(**kwargs: Any):
     return agent, dg_ws
 
 
+class TestUnitQuickTunnel:
+    """``--tunnel`` helpers (utils.start_quick_tunnel & friends) with a fake cloudflared."""
+
+    SAMPLE_LINE = (
+        "2026-09-23T10:00:00Z INF |  https://quiet-river-demo-42.trycloudflare.com"
+        "                                  |"
+    )
+
+    @staticmethod
+    def _fake_cloudflared(tmp_path, body: str):
+        script = tmp_path / "cloudflared"
+        script.write_text(f"#!/bin/sh\n{body}\n")
+        script.chmod(0o755)
+        return str(script)
+
+    def test_parse_tunnel_url(self):
+        from utils import parse_tunnel_url
+
+        assert parse_tunnel_url(self.SAMPLE_LINE) == (
+            "https://quiet-river-demo-42.trycloudflare.com"
+        )
+        assert parse_tunnel_url("INF Registered tunnel connection connIndex=0") == ""
+
+    def test_missing_cloudflared_raises_with_install_hint(self, monkeypatch):
+        import utils
+
+        monkeypatch.setattr(utils.shutil, "which", lambda _name: None)
+        with pytest.raises(utils.TunnelError, match="brew install cloudflared"):
+            utils.start_quick_tunnel(8000)
+
+    def test_start_returns_url_and_stop_terminates(self, monkeypatch, tmp_path):
+        import utils
+
+        fake = self._fake_cloudflared(
+            tmp_path,
+            'echo "starting" >&2\n'
+            'echo "INF |  https://abc-def-1.trycloudflare.com  |" >&2\n'
+            "exec sleep 30",
+        )
+        monkeypatch.setattr(utils.shutil, "which", lambda _name: fake)
+        url, proc = utils.start_quick_tunnel(8123, timeout_s=5)
+        try:
+            assert url == "https://abc-def-1.trycloudflare.com"
+            assert proc.poll() is None
+            assert proc.args[-2:] == ["--url", "http://localhost:8123"]
+        finally:
+            utils.stop_tunnel(proc)
+        assert proc.poll() is not None
+        utils.stop_tunnel(proc)  # idempotent
+
+    def test_no_url_times_out_and_cleans_up(self, monkeypatch, tmp_path):
+        import utils
+
+        fake = self._fake_cloudflared(tmp_path, "exec sleep 30")
+        monkeypatch.setattr(utils.shutil, "which", lambda _name: fake)
+        spawned = []
+        real_popen = utils.subprocess.Popen
+
+        def tracking_popen(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            spawned.append(proc)
+            return proc
+
+        monkeypatch.setattr(utils.subprocess, "Popen", tracking_popen)
+        with pytest.raises(utils.TunnelError, match="did not report a public URL"):
+            utils.start_quick_tunnel(8000, timeout_s=0.5)
+        assert spawned and spawned[0].poll() is not None
+
+    def test_process_exiting_early_raises(self, monkeypatch, tmp_path):
+        import utils
+
+        fake = self._fake_cloudflared(tmp_path, 'echo "ERR failed to request tunnel" >&2')
+        monkeypatch.setattr(utils.shutil, "which", lambda _name: fake)
+        with pytest.raises(utils.TunnelError):
+            utils.start_quick_tunnel(8000, timeout_s=5)
+
+    def test_wait_until_reachable_gives_up(self):
+        from utils import wait_until_reachable
+
+        assert not wait_until_reachable("http://127.0.0.1:9/", timeout_s=0.3, interval_s=0.1)
+
+    @pytest.mark.parametrize("module", ["inbound.server", "outbound.server"])
+    def test_start_tunnel_sets_public_url(self, monkeypatch, module):
+        import importlib
+
+        server = importlib.import_module(module)
+        monkeypatch.setattr(server, "PUBLIC_URL", "")
+        monkeypatch.setattr(
+            server, "start_quick_tunnel", lambda port: ("https://t-1.trycloudflare.com", None)
+        )
+        registered = []
+        monkeypatch.setattr(server.atexit, "register", lambda *a: registered.append(a))
+        server._start_tunnel()
+        assert server.PUBLIC_URL == "https://t-1.trycloudflare.com"
+        assert registered and registered[0][0] is server.stop_tunnel
+
+    @pytest.mark.parametrize("module", ["inbound.server", "outbound.server"])
+    def test_start_tunnel_failure_exits(self, monkeypatch, module):
+        import importlib
+
+        import utils
+
+        server = importlib.import_module(module)
+
+        def boom(port):
+            raise utils.TunnelError("cloudflared not found on PATH")
+
+        monkeypatch.setattr(server, "start_quick_tunnel", boom)
+        with pytest.raises(SystemExit):
+            server._start_tunnel()
+
+    async def test_answer_uses_tunnel_url_for_stream(self, monkeypatch):
+        """After --tunnel sets PUBLIC_URL, /answer streams to the tunnel's wss:// URL."""
+        from inbound import server
+
+        monkeypatch.setattr(server, "PUBLIC_URL", "https://t-2.trycloudflare.com")
+        transport = httpx.ASGITransport(app=server.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/answer", data={"CallUUID": "c-1", "From": "+15551230000", "To": "+15557654321"}
+            )
+        assert resp.status_code == 200
+        assert "wss://t-2.trycloudflare.com/ws?body=" in resp.text
+
+
 class TestUnitSavedAgentConfig:
     """Saved-mode Settings, build_agent_config() and the saved-mode handshake."""
 

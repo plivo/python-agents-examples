@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import atexit
 import base64
 import contextlib
 import functools
 import json
 import os
 import sys
+import threading
 
 import plivo
 import uvicorn
@@ -19,7 +22,13 @@ from loguru import logger
 from plivo import plivoxml
 
 from inbound.agent import check_saved_agent_config, run_agent
-from utils import normalize_phone_number
+from utils import (
+    TunnelError,
+    normalize_phone_number,
+    start_quick_tunnel,
+    stop_tunnel,
+    wait_until_reachable,
+)
 
 load_dotenv()
 
@@ -400,19 +409,60 @@ async def websocket_endpoint(
 # =============================================================================
 
 
+def _start_tunnel() -> None:
+    """``--tunnel``: expose SERVER_PORT via a Cloudflare quick tunnel and use it as PUBLIC_URL."""
+    global PUBLIC_URL
+    try:
+        url, proc = start_quick_tunnel(SERVER_PORT)
+    except TunnelError as e:
+        logger.error(f"--tunnel: {e}")
+        raise SystemExit(1) from e
+    atexit.register(stop_tunnel, proc)
+    PUBLIC_URL = url
+    logger.info(f"Tunnel up: {url} -> http://localhost:{SERVER_PORT}")
+
+
+def _announce_when_reachable(phone: str) -> None:
+    """Log the 'call now' line only once PUBLIC_URL actually reaches this server."""
+    if wait_until_reachable(f"{PUBLIC_URL}/"):
+        logger.info(f"Ready! Call +{phone} to talk to the agent (Ctrl+C to stop)")
+    else:
+        logger.warning(
+            f"Could not reach {PUBLIC_URL} from this machine within 60s. Plivo resolves it "
+            "independently, so calls may still work; if they don't, restart with --tunnel"
+        )
+
+
 def main() -> None:
     """Run the inbound server."""
+    parser = argparse.ArgumentParser(description="Deepgram Voice Agent inbound server")
+    parser.add_argument(
+        "--tunnel",
+        action="store_true",
+        help="expose the server via a free Cloudflare quick tunnel (requires cloudflared) "
+        "and use it as PUBLIC_URL; no ngrok or PUBLIC_URL needed",
+    )
+    args = parser.parse_args()
+
     logger.info(f"Starting Deepgram Voice Agent Inbound Agent on port {SERVER_PORT}")
 
     # Verify the Deepgram agent settings once, before accepting calls
     if not check_saved_agent_config():
         raise SystemExit(1)
 
+    if args.tunnel:
+        _start_tunnel()
+
     if PLIVO_PHONE_NUMBER and PUBLIC_URL:
         logger.info("Configuring Plivo webhooks...")
         phone = normalize_phone_number(PLIVO_PHONE_NUMBER)
         if configure_plivo_webhooks():
-            logger.info(f"Ready! Call +{phone} to test")
+            if args.tunnel:
+                threading.Thread(
+                    target=_announce_when_reachable, args=(phone,), daemon=True
+                ).start()
+            else:
+                logger.info(f"Ready! Call +{phone} to test")
         else:
             logger.warning("Plivo auto-configuration failed. Configure manually.")
     else:
