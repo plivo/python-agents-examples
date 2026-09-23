@@ -150,6 +150,20 @@ Three concurrent asyncio tasks, following the canonical `FIRST_COMPLETED` patter
 7. **Function call**: `FunctionCallRequest{functions:[{id, name, arguments, client_side}]}` → `_handle_function_call(name, arguments)` for each `client_side` entry (10s timeout) → `FunctionCallResponse{id, name, content}`.
 8. **Hangup**: `end_call` sets a pending hangup with a 15s deadline; the LLM then speaks its goodbye → `AgentAudioDone` → checkpoint → `playedStream` → `_finish_hangup()` → `hangup_callback()` (Plivo `calls.delete`) → tasks stop → `session_end`.
 
+## What Runs When
+
+| When | File | What it does |
+|---|---|---|
+| Module import | `inbound/agent.py`, `outbound/agent.py` | `load_dotenv()`, read the `DEEPGRAM_*` config, load `system_prompt.md`, define `FUNCTION_DEFINITIONS` and `build_agent_config()`. No network calls. |
+| Server start: `uv run python -m inbound.server` | `inbound/server.py` → `main()` | Logging sinks (text/JSON/file/Redis) and optional OTel are set up when the module loads. Then `check_saved_agent_config()` runs (see [Startup check](#startup-check)), then `configure_plivo_webhooks()` creates or updates the Plivo application and assigns `PLIVO_PHONE_NUMBER` when `PUBLIC_URL` is set, then uvicorn starts. |
+| Server start: `uv run python -m outbound.server` | `outbound/server.py` → `main()` | Same startup check, then uvicorn. There is no number auto-config, because answer and hangup URLs are passed per call. |
+| `POST /outbound/call` | `outbound/server.py` | `CallManager.create_call()` builds the per-call prompt and greeting, then Plivo `calls.create` dials the number. |
+| Plivo answers (`/answer` or `/outbound/answer`) | `server.py` | Returns `<Stream bidirectional keepCallAlive>` XML that points Plivo at `/ws`. Call metadata travels in `?body=`. |
+| Each call (`/ws`) | `server.py` → `run_agent()` in `agent.py` | Accepts the WebSocket, reads Plivo's `start` event, then runs `DeepgramVoiceAgent.run()`. That opens a **new** Deepgram WebSocket for the call, sends Settings (inline block or saved UUID), personalizes a saved session, and runs the `plivo_rx` / `deepgram_rx` / `plivo_tx` tasks until the call ends. There is no Deepgram connection before a call arrives. |
+| `end_call` tool | `agent.py` → `hangup_callback` | After the goodbye has played, the agent calls `_hangup_call()` from `server.py`, which hangs up via the Plivo REST API. Plivo credentials never leave `server.py`. |
+| Manual CLI: `uv run python -m inbound.agent --publish` / `--list` / `--delete` | `agent.py` → `main()` | Manages saved agent configurations over the Deepgram REST API. No server is started. |
+| Shared helpers | `utils.py` | μ-law codec, resampling, `plivo_to_deepgram` / `deepgram_to_plivo` (pass-through), phone normalization. |
+
 ## Audio Formats
 
 | Hop | Format | Sample Rate | Frame Size | Notes |
@@ -234,6 +248,35 @@ Put the printed line in `.env` and restart the server. The session start log sho
 
 - **Inbound:** the base prompt is `system_prompt.md` (or `SYSTEM_PROMPT`). Each call appends the `## Current Call Context` block (caller number, call ID, time) with `UpdatePrompt`, then injects `AGENT_GREETING`.
 - **Outbound:** the template's `{{opening_reason}}`, `{{objective}}` and `{{context}}` placeholders are replaced with pointers such as `[the objective under "This Call" below]`. Each call appends a `## This Call` section with `UpdatePrompt`. That section holds the greeting already spoken, the opening reason, the objective and the additional context, followed by the call context. The `CallManager` greeting is then injected. Inline mode still renders the template exactly as before.
+
+### Startup check
+
+When the server starts (`main()` in `inbound/server.py` / `outbound/server.py`, before uvicorn accepts calls), it runs `check_saved_agent_config()` from the matching `agent.py`:
+
+- **Inline mode** (no agent ID): it logs `Deepgram agent settings: inline (listen=… think=… speak=… functions=5)` and makes no API call.
+- **Saved mode**: it fetches the config (`GET .../agents/{uuid}`, which needs `agent:read`) and logs the models the config actually contains. It then warns about drift between the config and what `--publish` would create from the deployed code and env:
+  - a model env var that is **explicitly set** but differs from the config, e.g. `DEEPGRAM_THINK_MODEL=gpt-5.4-mini is ignored in saved mode: the saved config has think.provider.model='gpt-4.1-mini'. Re-publish to apply it.`;
+  - a base prompt or `FUNCTION_DEFINITIONS` that differs from the code (function names only in the config or only in the code are listed).
+- **Unknown ID** (404/400): the server logs how to fix it and **exits with code 1**. Without the check, Deepgram would answer every call's Settings with `INTERNAL_SERVER_ERROR` ("resolving agent ID") and each call would end without a greeting.
+- **Can't verify** (e.g. a key without `agent:read`, or a network error): it logs a warning and starts anyway.
+
+### How the agent ID and the model env vars interact
+
+With an agent ID set, Deepgram receives **only the ID**. The model env vars matter only when `--publish` runs, because that is when their values are copied into the config. The inbound direction is shown here; outbound works the same with `DEEPGRAM_OUTBOUND_AGENT_ID`.
+
+| # | `DEEPGRAM_INBOUND_AGENT_ID` | Model env vars | Settings sent to Deepgram | Models used on calls | Startup check |
+|---|---|---|---|---|---|
+| 1 | unset | unset | full inline `agent` block | defaults (`flux-general-en`, `open_ai`/`gpt-4.1-mini`, `aura-2-thalia-en`) | logs "inline" |
+| 2 | unset | e.g. `DEEPGRAM_THINK_MODEL=gpt-5.4-mini` | inline block with that model | `gpt-5.4-mini` (after restart) | logs "inline" |
+| 3 | set | unset, or equal to the published values | `"agent": "<uuid>"`, then `UpdatePrompt` + `InjectAgentMessage` | the values in effect at `--publish` time | logs the saved models |
+| 4 | set | changed after publishing | the UUID only | still the published models | ⚠️ warns that the env var is ignored |
+| 5 | set | `system_prompt.md` / `SYSTEM_PROMPT` or `FUNCTION_DEFINITIONS` changed without re-publishing | the UUID only | the published prompt and functions | ⚠️ warns about prompt/function drift |
+| 6 | set to a deleted or wrong ID | any | — | — | ❌ server exits with code 1 |
+| 7 | inbound set, outbound unset | set | inbound: UUID; outbound: inline | inbound: published models; outbound: current env | each server checks its own direction |
+| 8 | either | `AGENT_GREETING` set | inline: `agent.greeting`; saved: `InjectAgentMessage` | n/a | n/a |
+| 9 | n/a | `DEEPGRAM_PROJECT_ID` | not used on calls | n/a | used by the check and by `--publish`/`--list`/`--delete` |
+
+To change a model or the prompt in saved mode: run `--publish` again (you get a new UUID), put the new UUID in the env var, restart the server, and delete the old config.
 
 **Turn handling.** The injected greeting comes back as `ConversationText` (role `assistant`) followed by `AgentAudioDone`, the same events as an inline greeting. It therefore still counts as turn 1 and emits `agent_text` and `turn_complete`.
 

@@ -1950,6 +1950,119 @@ def saved_config_id():
         print(f"\n[saved config] deleted {config_id}")
 
 
+class TestUnitSavedConfigStartupCheck:
+    """check_saved_agent_config(): server startup verification of the agent settings mode."""
+
+    AGENT_ID = "11111111-2222-3333-4444-555555555555"
+
+    @pytest.fixture(autouse=True)
+    def _key(self, monkeypatch):
+        from inbound import agent as inbound_mod
+        from outbound import agent as outbound_mod
+
+        for mod in (inbound_mod, outbound_mod):
+            monkeypatch.setattr(mod, "DEEPGRAM_API_KEY", "test-key")
+            monkeypatch.setattr(mod, "DEEPGRAM_PROJECT_ID", "proj-1")
+        for name in inbound_mod._PUBLISHED_ENV_FIELDS:
+            monkeypatch.delenv(name, raising=False)
+
+    def _route(self, routes, config):
+        routes[("GET", f"/projects/proj-1/agents/{self.AGENT_ID}")] = {
+            "agent_uuid": self.AGENT_ID,
+            "config": json.dumps(config),
+            "metadata": {},
+        }
+
+    def test_inline_mode_makes_no_api_call(self, fake_deepgram_rest, captured_messages):
+        from inbound.agent import check_saved_agent_config
+
+        _routes, requests = fake_deepgram_rest
+        assert check_saved_agent_config(agent_id="") is True
+        assert requests == []
+        assert any("Deepgram agent settings: inline" in m for m in captured_messages)
+
+    def test_saved_config_matching_code_passes_without_warnings(
+        self, fake_deepgram_rest, captured_messages
+    ):
+        from inbound.agent import build_agent_config, check_saved_agent_config
+
+        routes, _ = fake_deepgram_rest
+        self._route(routes, build_agent_config())
+        assert check_saved_agent_config(agent_id=self.AGENT_ID) is True
+        assert any(f"saved config {self.AGENT_ID}" in m for m in captured_messages)
+        assert not any("Re-publish" in m for m in captured_messages)
+
+    def test_explicit_model_env_var_that_differs_is_reported(self, monkeypatch):
+        from inbound import agent as agent_mod
+
+        published = agent_mod.build_agent_config()
+        monkeypatch.setenv("DEEPGRAM_THINK_MODEL", "gpt-5.4-mini")
+        monkeypatch.setattr(agent_mod, "DEEPGRAM_THINK_MODEL", "gpt-5.4-mini")
+        (warning,) = agent_mod.saved_config_drift(published)
+        assert "DEEPGRAM_THINK_MODEL=gpt-5.4-mini is ignored" in warning
+        assert "'gpt-4.1-mini'" in warning
+
+    def test_unset_model_env_vars_are_not_compared(self, monkeypatch):
+        """A deployment that sets only the agent id must not get model warnings."""
+        from inbound import agent as agent_mod
+
+        published = agent_mod.build_agent_config()
+        published["think"]["provider"]["model"] = "claude-haiku-4-5"
+        assert agent_mod.saved_config_drift(published) == []
+
+    def test_prompt_and_function_drift_reported(self):
+        from inbound import agent as agent_mod
+
+        published = agent_mod.build_agent_config()
+        published["think"]["prompt"] = "an older prompt"
+        published["think"]["functions"] = published["think"]["functions"][:-1]
+        warnings = agent_mod.saved_config_drift(published)
+        assert any("prompt differs" in w for w in warnings)
+        assert any("only in code: ['end_call']" in w for w in warnings)
+
+    @pytest.mark.parametrize("status", [400, 404])
+    def test_unknown_agent_id_fails_startup(self, fake_deepgram_rest, captured_messages, status):
+        from inbound.agent import check_saved_agent_config
+
+        routes, _ = fake_deepgram_rest
+        routes[("GET", f"/projects/proj-1/agents/{self.AGENT_ID}")] = _http_error(
+            status, {"category": "NOT_FOUND", "message": "agent not found"}
+        )
+        assert check_saved_agent_config(agent_id=self.AGENT_ID) is False
+        assert any("DEEPGRAM_INBOUND_AGENT_ID" in m and "--publish" in m for m in captured_messages)
+
+    def test_unverifiable_agent_id_warns_but_starts(self, fake_deepgram_rest, captured_messages):
+        from inbound.agent import check_saved_agent_config
+
+        routes, _ = fake_deepgram_rest
+        routes[("GET", f"/projects/proj-1/agents/{self.AGENT_ID}")] = _http_error(
+            403, {"category": "INSUFFICIENT_PERMISSIONS", "message": "no agent:read"}
+        )
+        assert check_saved_agent_config(agent_id=self.AGENT_ID) is True
+        assert any("Using it unverified" in m for m in captured_messages)
+
+    def test_outbound_check_uses_outbound_env_var(self, fake_deepgram_rest, captured_messages):
+        from outbound.agent import check_saved_agent_config
+
+        routes, _ = fake_deepgram_rest
+        routes[("GET", f"/projects/proj-1/agents/{self.AGENT_ID}")] = _http_error(404, {})
+        assert check_saved_agent_config(agent_id=self.AGENT_ID) is False
+        assert any("DEEPGRAM_OUTBOUND_AGENT_ID" in m for m in captured_messages)
+
+    @pytest.mark.parametrize("module", ["inbound.server", "outbound.server"])
+    def test_server_refuses_to_start_when_check_fails(self, monkeypatch, module):
+        import importlib
+
+        server = importlib.import_module(module)
+        started = []
+        monkeypatch.setattr(server, "check_saved_agent_config", lambda: False)
+        monkeypatch.setattr(server, "PUBLIC_URL", "", raising=False)
+        monkeypatch.setattr(server.uvicorn, "run", lambda *a, **k: started.append(True))
+        with pytest.raises(SystemExit):
+            server.main()
+        assert started == []
+
+
 @pytest.mark.skipif(not DEEPGRAM_API_KEY, reason="DEEPGRAM_API_KEY not configured")
 class TestDeepgramSavedConfigIntegration:
     """Publish a real saved agent config, connect with ``agent: <uuid>``, always delete it."""

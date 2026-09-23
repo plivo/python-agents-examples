@@ -18,7 +18,7 @@ from fastapi.responses import Response
 from loguru import logger
 from plivo import plivoxml
 
-from inbound.agent import run_agent
+from inbound.agent import check_saved_agent_config, run_agent
 from utils import normalize_phone_number
 
 load_dotenv()
@@ -403,6 +403,10 @@ async def websocket_endpoint(
 def main() -> None:
     """Run the inbound server."""
     logger.info(f"Starting Deepgram Voice Agent Inbound Agent on port {SERVER_PORT}")
+
+    # Verify the Deepgram agent settings once, before accepting calls
+    if not check_saved_agent_config():
+        raise SystemExit(1)
 
     if PLIVO_PHONE_NUMBER and PUBLIC_URL:
         logger.info("Configuring Plivo webhooks...")

@@ -378,7 +378,11 @@ def build_agent_config(prompt: str | None = None) -> dict[str, Any]:
 
 
 class DeepgramAPIError(RuntimeError):
-    """A Deepgram management REST call failed."""
+    """A Deepgram management REST call failed (``status`` is the HTTP code, if any)."""
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 def _deepgram_api(method: str, path: str, body: dict[str, Any] | None = None) -> Any:
@@ -404,7 +408,7 @@ def _deepgram_api(method: str, path: str, body: dict[str, Any] | None = None) ->
                 " (saved agent configurations need a DEEPGRAM_API_KEY with the "
                 "agent:write scope to publish/delete and agent:read to list)"
             )
-        raise DeepgramAPIError(message) from e
+        raise DeepgramAPIError(message, status=e.code) from e
     except urllib.error.URLError as e:
         raise DeepgramAPIError(f"{method} {path} failed: {e.reason}") from e
     return json.loads(raw) if raw else {}
@@ -449,6 +453,114 @@ def list_agent_configs(project_id: str | None = None) -> list[dict[str, Any]]:
 def delete_agent_config(agent_id: str, project_id: str | None = None) -> None:
     """Delete a saved agent configuration (configs are immutable; old ones pile up)."""
     _deepgram_api("DELETE", f"/projects/{project_id or resolve_project_id()}/agents/{agent_id}")
+
+
+def get_agent_config(agent_id: str, project_id: str | None = None) -> dict[str, Any]:
+    """Fetch a saved agent configuration's ``agent`` block (the API returns it as a string)."""
+    got = _deepgram_api("GET", f"/projects/{project_id or resolve_project_id()}/agents/{agent_id}")
+    config = got.get("config", {})
+    return json.loads(config) if isinstance(config, str) else config
+
+
+# Env var -> the saved-config field it sets when --publish runs
+_PUBLISHED_ENV_FIELDS: dict[str, tuple[str, ...]] = {
+    "DEEPGRAM_LISTEN_MODEL": ("listen", "provider", "model"),
+    "DEEPGRAM_LISTEN_EOT_THRESHOLD": ("listen", "provider", "eot_threshold"),
+    "DEEPGRAM_LISTEN_EOT_TIMEOUT_MS": ("listen", "provider", "eot_timeout_ms"),
+    "DEEPGRAM_LISTEN_LANGUAGE": ("listen", "provider", "language"),
+    "DEEPGRAM_THINK_PROVIDER": ("think", "provider", "type"),
+    "DEEPGRAM_THINK_MODEL": ("think", "provider", "model"),
+    "DEEPGRAM_THINK_TEMPERATURE": ("think", "provider", "temperature"),
+    "DEEPGRAM_SPEAK_MODEL": ("speak", "provider", "model"),
+}
+
+
+def _dig(config: dict[str, Any], *path: str) -> Any:
+    for key in path:
+        if not isinstance(config, dict):
+            return None
+        config = config.get(key)
+    return config
+
+
+def describe_agent_config(config: dict[str, Any]) -> str:
+    """One-line summary of an agent block's models, for startup logs."""
+    think = _dig(config, "think", "provider") or {}
+    functions = _dig(config, "think", "functions") or []
+    return (
+        f"listen={_dig(config, 'listen', 'provider', 'model')} "
+        f"think={think.get('type')}/{think.get('model')} "
+        f"speak={_dig(config, 'speak', 'provider', 'model')} functions={len(functions)}"
+    )
+
+
+def saved_config_drift(saved: dict[str, Any]) -> list[str]:
+    """How a saved config differs from what --publish would create from this code/env now.
+
+    Model env vars are compared only when explicitly set (a deployment may set just the
+    agent id). Prompt and functions always come from the deployed code, so any
+    difference there is real drift.
+    """
+    current = build_agent_config()
+    warnings = []
+    for env_name, path in _PUBLISHED_ENV_FIELDS.items():
+        if env_name not in os.environ:
+            continue
+        now, published = _dig(current, *path), _dig(saved, *path)
+        if now != published:
+            warnings.append(
+                f"{env_name}={os.environ[env_name]} is ignored in saved mode: the saved config "
+                f"has {'.'.join(path)}={published!r}. Re-publish to apply it."
+            )
+    saved_functions = _dig(saved, "think", "functions") or []
+    if saved_functions != FUNCTION_DEFINITIONS:
+        saved_names = {f.get("name") for f in saved_functions}
+        code_names = {f["name"] for f in FUNCTION_DEFINITIONS}
+        warnings.append(
+            "Saved config functions differ from FUNCTION_DEFINITIONS in the code "
+            f"(only in saved: {sorted(saved_names - code_names)}, "
+            f"only in code: {sorted(code_names - saved_names)}). Re-publish to sync them."
+        )
+    if _dig(saved, "think", "prompt") != _dig(current, "think", "prompt"):
+        warnings.append(
+            "Saved config prompt differs from the code's base prompt "
+            "(system_prompt.md / SYSTEM_PROMPT). Re-publish to apply prompt changes."
+        )
+    return warnings
+
+
+def check_saved_agent_config(agent_id: str | None = None) -> bool:
+    """Server startup check of the Deepgram agent settings mode.
+
+    Inline mode: log the models from env. Saved mode: fetch the saved config, log what
+    it actually contains and warn about drift from the code/env. Returns False when the
+    id does not resolve (every call would fail), so the server should not start.
+    """
+    agent_id = DEEPGRAM_INBOUND_AGENT_ID if agent_id is None else agent_id
+    env_var = f"DEEPGRAM_{AGENT_DIRECTION.upper()}_AGENT_ID"
+    if not agent_id:
+        logger.info(
+            f"Deepgram agent settings: inline ({describe_agent_config(build_agent_config())})"
+        )
+        return True
+    try:
+        saved = get_agent_config(agent_id)
+    except DeepgramAPIError as e:
+        if e.status in (400, 404):
+            logger.error(
+                f"{env_var}={agent_id} is not a saved agent configuration ({e}). Every call "
+                f"would fail (Deepgram replies INTERNAL_SERVER_ERROR). Publish one with "
+                f"`uv run python -m {AGENT_DIRECTION}.agent --publish` or unset {env_var}."
+            )
+            return False
+        logger.warning(f"Could not verify {env_var}={agent_id}: {e}. Using it unverified.")
+        return True
+    logger.info(
+        f"Deepgram agent settings: saved config {agent_id} ({describe_agent_config(saved)})"
+    )
+    for warning in saved_config_drift(saved):
+        logger.warning(warning)
+    return True
 
 
 @dataclass(frozen=True)

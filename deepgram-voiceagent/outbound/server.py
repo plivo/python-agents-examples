@@ -22,6 +22,7 @@ from plivo import plivoxml
 from outbound.agent import (
     DEFAULT_OUTBOUND_GREETING,
     CallManager,
+    check_saved_agent_config,
     determine_outcome,
     run_agent,
 )
@@ -527,6 +528,10 @@ async def websocket_endpoint(
 def main() -> None:
     """Run the outbound server."""
     logger.info(f"Starting Deepgram Voice Agent Outbound Agent on port {SERVER_PORT}")
+
+    # Verify the Deepgram agent settings once, before accepting calls
+    if not check_saved_agent_config():
+        raise SystemExit(1)
     uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT, log_level="info")
 
 
