@@ -1623,7 +1623,10 @@ def main(argv: list[str] | None = None) -> int:
             print("Set this in .env to use it:")
             print(f"{env_var}={agent_id}")
         elif args.list:
-            for cfg in list_agent_configs():
+            configs = list_agent_configs()
+            if not configs:
+                print("No saved agent configurations in this project.")
+            for cfg in configs:
                 print(f"{cfg.get('agent_uuid') or cfg.get('agent_id')}  {cfg.get('metadata', {})}")
         else:
             delete_agent_config(args.delete)
