@@ -419,11 +419,25 @@ def deepgram_to_plivo(mulaw_8k: bytes) -> bytes:
 # WebSockets to the local server, so Plivo can reach /answer and /ws without ngrok.
 
 TUNNEL_URL_PATTERN = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+CLOUDFLARED_RELEASES = "https://github.com/cloudflare/cloudflared/releases/latest/download"
+_ARCH_MAC = "$(uname -m | sed s/x86_64/amd64/)"
+_ARCH_LINUX = "$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
 CLOUDFLARED_INSTALL_HINT = (
-    "Install cloudflared: `brew install cloudflared` (macOS), or see "
-    "https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/"
-    "downloads/ (Linux/Windows)"
+    "Install it into ~/.local/bin with curl:\n"
+    "  macOS: mkdir -p ~/.local/bin && curl -fsSL "
+    f'"{CLOUDFLARED_RELEASES}/cloudflared-darwin-{_ARCH_MAC}.tgz" | tar -xz -C ~/.local/bin\n'
+    "  Linux: mkdir -p ~/.local/bin && curl -fsSL -o ~/.local/bin/cloudflared "
+    f'"{CLOUDFLARED_RELEASES}/cloudflared-linux-{_ARCH_LINUX}" && chmod +x ~/.local/bin/cloudflared'
 )
+
+
+def find_cloudflared() -> str | None:
+    """Locate cloudflared on PATH, falling back to ~/.local/bin (the documented install dir)."""
+    found = shutil.which("cloudflared")
+    if found:
+        return found
+    local = os.path.expanduser("~/.local/bin/cloudflared")
+    return local if os.access(local, os.X_OK) else None
 
 
 class TunnelError(RuntimeError):
@@ -442,9 +456,9 @@ def start_quick_tunnel(port: int, timeout_s: float = 30.0) -> tuple[str, subproc
     Returns ``(public_url, process)``; stop it with :func:`stop_tunnel`.
     Raises :class:`TunnelError` if cloudflared is missing or no URL appears in time.
     """
-    binary = shutil.which("cloudflared")
+    binary = find_cloudflared()
     if not binary:
-        raise TunnelError(f"cloudflared not found on PATH. {CLOUDFLARED_INSTALL_HINT}")
+        raise TunnelError(f"cloudflared not found. {CLOUDFLARED_INSTALL_HINT}")
 
     proc = subprocess.Popen(
         [binary, "tunnel", "--no-autoupdate", "--url", f"http://localhost:{port}"],

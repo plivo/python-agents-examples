@@ -1399,12 +1399,28 @@ class TestUnitQuickTunnel:
         )
         assert parse_tunnel_url("INF Registered tunnel connection connIndex=0") == ""
 
-    def test_missing_cloudflared_raises_with_install_hint(self, monkeypatch):
+    def test_missing_cloudflared_raises_with_install_hint(self, monkeypatch, tmp_path):
         import utils
 
         monkeypatch.setattr(utils.shutil, "which", lambda _name: None)
-        with pytest.raises(utils.TunnelError, match="brew install cloudflared"):
+        monkeypatch.setenv("HOME", str(tmp_path))  # no ~/.local/bin/cloudflared either
+        with pytest.raises(utils.TunnelError, match="curl -fsSL") as exc:
             utils.start_quick_tunnel(8000)
+        assert "cloudflared-darwin-" in str(exc.value)
+        assert "cloudflared-linux-" in str(exc.value)
+
+    def test_find_cloudflared_falls_back_to_local_bin(self, monkeypatch, tmp_path):
+        import utils
+
+        monkeypatch.setattr(utils.shutil, "which", lambda _name: None)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert utils.find_cloudflared() is None
+        local_bin = tmp_path / ".local" / "bin"
+        local_bin.mkdir(parents=True)
+        binary = local_bin / "cloudflared"
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+        assert utils.find_cloudflared() == str(binary)
 
     def test_start_returns_url_and_stop_terminates(self, monkeypatch, tmp_path):
         import utils

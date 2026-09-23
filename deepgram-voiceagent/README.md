@@ -54,10 +54,23 @@ cp .env.example .env   # set DEEPGRAM_API_KEY, PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN, 
 
 ### Option A: one command, local
 
+Install `cloudflared` once. The official binary goes into `~/.local/bin`, which `--tunnel` checks even if it isn't on your `PATH`:
+
 ```bash
-brew install cloudflared               # once (Linux/Windows: see Cloudflare's cloudflared downloads page)
+# macOS (Apple Silicon or Intel)
+mkdir -p ~/.local/bin && curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-$(uname -m | sed s/x86_64/amd64/).tgz" | tar -xz -C ~/.local/bin
+
+# Linux (x86_64 or arm64)
+mkdir -p ~/.local/bin && curl -fsSL -o ~/.local/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')" && chmod +x ~/.local/bin/cloudflared
+```
+
+Then start the agent:
+
+```bash
 uv run python -m inbound.server --tunnel
 ```
+
+On Windows, download `cloudflared-windows-amd64.exe` from [Cloudflare's releases](https://github.com/cloudflare/cloudflared/releases/latest), rename it to `cloudflared.exe`, and put it on your `PATH`.
 
 What `--tunnel` does:
 
@@ -498,7 +511,7 @@ The image is based on `python:3.12-slim` by default; pass `--build-arg BASE_IMAG
 
 ### `--tunnel`: "cloudflared not found" or no "Ready!" line
 
-- **"cloudflared not found on PATH":** install it (`brew install cloudflared` on macOS) and run again.
+- **"cloudflared not found":** run the `curl` install command from [Option A](#option-a-one-command-local); the error message prints it too. Then run again.
 - **"Could not reach … from this machine" but Plivo calls work:** your local DNS (often a VPN) is slow to resolve new `trycloudflare.com` hostnames. Plivo resolves the URL on its own network, so calls can still work.
 - **Calls fail too:** restart with `--tunnel` to get a new URL, or use ngrok or a deployed host instead. Quick tunnels are meant for development and have no uptime guarantee.
 
