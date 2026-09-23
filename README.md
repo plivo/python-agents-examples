@@ -20,7 +20,7 @@ All examples follow the same general pattern:
 
 ## Examples
 
-Each example directory is self-contained with its own dependencies, environment configuration, and documentation. Directory names follow the convention `{llm}-{stt}-{tts}-{framework}` (see [CONTRIBUTING.md](./CONTRIBUTING.md) for details).
+Each example directory is self-contained with its own dependencies, environment configuration, and documentation. Directory names follow the convention `{llm}-{stt}-{tts}-{framework}`, or `{provider}-{product}` for managed voice-agent platforms (see [CONTRIBUTING.md](./CONTRIBUTING.md) for details).
 
 ### Speech-to-Speech (S2S)
 
@@ -32,6 +32,14 @@ These examples use models that handle both speech input and output natively — 
 | [gemini2.5-live-pipecat](./gemini2.5-live-pipecat/) | Gemini 2.5 Live | Pipecat | Modular pipeline, built-in VAD, less code |
 | [gptrealtime1.5-native](./gptrealtime1.5-native/) | GPT Realtime 1.5 | None | Silero VAD, barge-in support, function calling |
 | [grok3-voice-native](./grok3-voice-native/) | Grok 3 Voice | None | Silero VAD, barge-in support, function calling |
+
+### Managed Voice-Agent Platforms
+
+These examples connect Plivo to a hosted voice-agent product that runs STT, LLM, TTS, turn detection and barge-in on its side. Models are chosen in `.env` using the platform's own values.
+
+| Example | Platform | Default models (configurable) | Highlights |
+|---------|----------|-------------------------------|------------|
+| [deepgram-voiceagent](./deepgram-voiceagent/) | Deepgram Voice Agent API | Flux STT, GPT-4.1 mini, Aura-2 TTS | Single WebSocket, μ-law 8kHz end to end (no transcoding), Flux end-of-turn, client-side function calling, checkpoint-tracked playback |
 
 ### STT + LLM + TTS Pipeline
 
