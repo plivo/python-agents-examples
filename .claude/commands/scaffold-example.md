@@ -35,6 +35,11 @@ Examples: `gpt5.4-assemblyaiu3-cartesiasonic3-native`, `gemini2.5-live-pipecat`,
 - If a variant suffix follows the orchestration type, it must be a known variant: `no-vad`, `webrtcvad`
 - Unknown suffixes should be flagged — ask the user before proceeding
 
+**Managed voice-agent platform** (hosted product runs STT/LLM/TTS, turn detection and barge-in — see CLAUDE.md "Managed Voice-Agent Platforms"): the name is `{provider}-{product}[-{variant}]` instead, e.g. `deepgram-voiceagent`.
+- `{product}` must mirror the platform's own branding for the product; do not reuse another platform's term. Confirm the product name with the user before creating files.
+- No model/orchestration/VAD tokens. Add `[tool.voice-agent-example]` `category = "managed-platform"` to `pyproject.toml`.
+- Variants are not predefined — if one seems needed, propose it and get the user's explicit approval.
+
 If the name does not match, stop and ask the user to provide a corrected name.
 
 ### 1. Create the full directory structure

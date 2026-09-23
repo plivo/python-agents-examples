@@ -47,16 +47,39 @@ Drop the size class (mini/nano/pro/flash) — it's `.env` config. Only include s
 
 ### Examples
 
-`gpt5.4-assemblyaiu3-cartesiasonic3-native`, `gemini2.5-live-pipecat`, `gpt4.1-deepgramnova3-elevenflashv2.5-native`
+`gpt5.4-assemblyaiu3-cartesiasonic3-native`, `gemini2.5-live-pipecat`, `gpt4.1-deepgramnova3-elevenflashv2.5-native`, `deepgram-voiceagent` (managed platform — see below)
 
 Orchestration types:
 - **native** — raw websockets/SDK, custom asyncio task management, client-side Silero VAD (default)
 - **pipecat** / **livekit** / **vapi** — framework-based Pipeline, framework-managed VAD
+- **managed platform** — hosted voice-agent product; no orchestration token in the name (see "Managed Voice-Agent Platforms")
 
 Variants:
 - **`-no-vad`** — explicitly opts out of client-side VAD (e.g., `gemini2.5-live-native-no-vad` relies on server-side VAD)
 - **`-webrtcvad`** — uses WebRTC VAD instead of Silero (e.g., `gemini2.5-live-native-webrtcvad`)
 - All new native examples include Silero VAD by default. These suffixes are the exception, not the rule.
+
+### Managed Voice-Agent Platforms
+
+A managed platform runs the whole conversation loop (STT, LLM, TTS, turn detection, barge-in) as one hosted product; the example only bridges Plivo audio to it and answers its client-side events. These are named after the **product**, not its component models, and do not use the orchestration/VAD tokens above:
+
+`{provider}-{product}[-{variant}]` — e.g. `deepgram-voiceagent` (Deepgram "Voice Agent API")
+
+- **`{provider}`** — the company name, lowercased.
+- **`{product}`** — the platform's *own* name for the product, as branded in its docs/API reference: lowercased, spaces and punctuation removed, generic suffixes like "API" dropped. Honor each brand's naming; do **not** reuse another platform's product term or invent a shared category word. If the product name is the company name, write it once. If a provider has several voice-agent products, use the one whose API the example actually calls.
+- **No model components** — model choices are `.env` config. Env vars mirror the platform's own config schema and accept its documented values verbatim (model ids, provider types); never define aliases or wrapper values on top. The README lists tested combinations.
+- **No `native`/`-no-vad`/orchestration token** — turn detection and barge-in are owned by the platform. The client still must flush Plivo playback (`clearAudio`) on the platform's interruption event.
+- **One example per platform.** A different model combination is a README/`.env` change, not a new example.
+- Declare the category in `pyproject.toml` so `scripts/validate-example.sh` applies the right checks:
+  ```toml
+  [tool.voice-agent-example]
+  category = "managed-platform"
+  ```
+- Canonical file structure, config placement, audio rules and the 3-task asyncio pattern still apply (`_receive_from_{api}()` handles the platform's events). No Silero/VAD code.
+
+**Variants (`-{variant}`) are not predefined and require human review.** Add one only when the *integration contract* changes in a way `.env` config cannot express — e.g. how Plivo audio reaches the platform changes, or a pipeline stage moves out of the platform into this example's own code. When proposing one: name what differs in the integration (not a model, and not a vendor unless the vendor *is* the difference), keep it to one or two lowercase words, check it doesn't collide with an existing token, and call it out in the PR description for a reviewer to approve before the directory is created. The validator only checks the name's format.
+
+Legacy: `gpt4.1-deepgramnova3-elevenflashv2.5-vapi` predates this rule and is still named by components; it will be revisited separately.
 
 ## Canonical File Structure (ALL examples)
 
@@ -266,6 +289,7 @@ Run: `uv run pytest tests/test_integration.py -v -k "unit"` (offline)
 - `grok3-voice-native/tests/` — full test suite to replicate
 - `gemini2.5-live-native-no-vad/` — alternative native pattern (SDK-based, server-side VAD, no client-side VAD)
 - `gemini2.5-live-pipecat/inbound/agent.py` — framework Pipeline reference
+- `deepgram-voiceagent/` — managed voice-agent platform reference (raw WebSocket bridge, platform-side turn detection, checkpoint-based playback tracking)
 
 ## README Demo Description (Required)
 

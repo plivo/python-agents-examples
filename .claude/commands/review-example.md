@@ -13,6 +13,7 @@ Read `CLAUDE.md` for all rules. Then systematically check every item below.
 ### Detection
 
 First, determine orchestration type by reading `{example-name}/inbound/agent.py`:
+- If `pyproject.toml` declares `category = "managed-platform"` under `[tool.voice-agent-example]` → **managed platform**
 - If it imports from `pipecat` or `livekit` → **framework**
 - Otherwise → **native**
 
@@ -22,7 +23,7 @@ Run through EVERY item. Report PASS or FAIL with details for each.
 
 #### Naming (1 check)
 
-0. **Directory name follows convention**: Must match `{provider}-...-{orchestration}[-{variant}]` where orchestration is `native|pipecat|livekit|vapi` and variant (if present) is `no-vad|webrtcvad`
+0. **Directory name follows convention**: Must match `{provider}-...-{orchestration}[-{variant}]` where orchestration is `native|pipecat|livekit|vapi` and variant (if present) is `no-vad|webrtcvad`. For a **managed platform**, the name is `{provider}-{product}[-{variant}]`: verify `{product}` matches the platform's own branding and flag any variant for human approval (VAD checks do not apply; `clearAudio` on the platform's interruption event does)
 
 #### Structure (8 checks)
 
