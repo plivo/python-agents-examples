@@ -10,6 +10,10 @@ These tests:
 5. Transcribe the agent audio locally with faster-whisper and check its content
 6. Ask the agent to end the call and verify the server closes the WebSocket
 
+Every test runs twice: ``[inline]`` (Settings carries the agent block) and ``[saved]``
+(a saved agent config is published for the module, the server runs with
+DEEPGRAM_INBOUND_AGENT_ID set, and the config is always deleted afterwards).
+
 Requirements:
     - Valid DEEPGRAM_API_KEY in .env
     - faster-whisper installed (dev dependency)
@@ -211,19 +215,32 @@ async def plivo_call(call_uuid: str):
 # =============================================================================
 
 
-@pytest.fixture(scope="module")
-def server_process():
-    """Start the inbound server on TEST_PORT (SIGTERM -> wait(5) -> SIGKILL on teardown)."""
-    proc = start_server(
-        "inbound.server",
-        TEST_PORT,
-        LOG_PATH,
-        # No Plivo credentials: end_call must not try a REST hangup of a fake call
-        {"PLIVO_AUTH_ID": "", "PLIVO_AUTH_TOKEN": "", "PUBLIC_URL": ""},
-    )
-    print(f"\n[server] logs: {LOG_PATH}")
-    yield proc
-    stop_server(proc)
+@pytest.fixture(scope="module", params=["inline", "saved"])
+def server_process(request):
+    """Start the inbound server on TEST_PORT (SIGTERM -> wait(5) -> SIGKILL on teardown).
+
+    ``saved`` publishes a saved agent config first and always deletes it afterwards.
+    """
+    from inbound.agent import DeepgramAPIError, delete_agent_config, publish_agent_config
+
+    # No Plivo credentials: end_call must not try a REST hangup of a fake call
+    env = {"PLIVO_AUTH_ID": "", "PLIVO_AUTH_TOKEN": "", "PUBLIC_URL": ""}
+    env["DEEPGRAM_INBOUND_AGENT_ID"] = ""
+    if request.param == "saved":
+        try:
+            env["DEEPGRAM_INBOUND_AGENT_ID"] = publish_agent_config()
+        except DeepgramAPIError as e:
+            pytest.skip(f"cannot publish a saved agent config: {e}")
+        print(f"\n[saved config] published {env['DEEPGRAM_INBOUND_AGENT_ID']}")
+    try:
+        proc = start_server("inbound.server", TEST_PORT, LOG_PATH, env)
+        print(f"\n[server] mode={request.param} logs: {LOG_PATH}")
+        yield request.param, env["DEEPGRAM_INBOUND_AGENT_ID"]
+        stop_server(proc)
+    finally:
+        if env["DEEPGRAM_INBOUND_AGENT_ID"]:
+            delete_agent_config(env["DEEPGRAM_INBOUND_AGENT_ID"])
+            print(f"\n[saved config] deleted {env['DEEPGRAM_INBOUND_AGENT_ID']}")
 
 
 # =============================================================================
@@ -336,6 +353,24 @@ class TestE2ELive:
         assert any("goodbye played -- hanging up" in m for m in messages)
         sessions = read_log_events(LOG_PATH, "session_end")
         assert sessions, "No session_end event logged"
+
+    async def test_settings_mode_logged(self, server_process):
+        """The session logs which Settings mode it used, and session_end carries it."""
+        mode, config_id = server_process
+        async with plivo_call("test-e2e-mode") as call:
+            await call.collect_response(timeout=20)
+        expected = f"settings: saved agent config {config_id}" if config_id else "settings: inline"
+        deadline = time.monotonic() + 5.0
+        ends: list[dict] = []
+        while time.monotonic() < deadline and not ends:
+            await asyncio.sleep(0.2)
+            ends = [
+                e for e in read_log_events(LOG_PATH, "session_end") if e["call_id"] == call.call_id
+            ]
+        print(f"\n[{mode}] session_end agent_config={ends and ends[0].get('agent_config')}")
+        assert any(expected in m for m in log_messages(LOG_PATH)), expected
+        assert ends, "No session_end for this call"
+        assert ends[0]["agent_config"] == (config_id or "inline")
 
 
 if __name__ == "__main__":

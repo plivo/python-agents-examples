@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import math
 import os
@@ -1352,6 +1353,400 @@ class TestUnitServerRoutes:
 
 
 # =============================================================================
+# UNIT TESTS - Saved agent configurations (opt-in DEEPGRAM_{INBOUND,OUTBOUND}_AGENT_ID)
+# =============================================================================
+
+SAVED_UUID = "11111111-2222-3333-4444-555555555555"
+
+
+def make_outbound_agent(**kwargs: Any):
+    """Build an outbound agent wired to fake Plivo + Deepgram sockets."""
+    from outbound.agent import DeepgramVoiceAgent
+
+    dg_ws = FakeDeepgramWS()
+    agent = DeepgramVoiceAgent(
+        websocket=FakePlivoWS(),
+        call_id=CALL_ID,
+        from_number=kwargs.pop("from_number", "+15551234567"),
+        stream_id=STREAM_ID,
+        **kwargs,
+    )
+    agent._dg_ws = dg_ws
+    agent._running = True
+    return agent, dg_ws
+
+
+class TestUnitSavedAgentConfig:
+    """Saved-mode Settings, build_agent_config() and the saved-mode handshake."""
+
+    def test_saved_settings_reference_uuid_only(self):
+        agent, _, _ = make_agent(agent_config_id=SAVED_UUID)
+        settings = agent._build_settings()
+        inline = make_agent()[0]._build_settings()
+        assert settings == {
+            "type": "Settings",
+            "tags": inline["tags"],
+            "audio": inline["audio"],
+            "agent": SAVED_UUID,
+        }
+        assert json.loads(json.dumps(settings))["agent"] == SAVED_UUID
+
+    def test_agent_config_id_defaults_to_env(self, monkeypatch):
+        from inbound import agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "DEEPGRAM_INBOUND_AGENT_ID", SAVED_UUID)
+        agent, _, _ = make_agent()
+        assert agent._build_settings()["agent"] == SAVED_UUID
+        assert agent._settings_mode() == f"saved agent config {SAVED_UUID}"
+        monkeypatch.setattr(agent_mod, "DEEPGRAM_INBOUND_AGENT_ID", "")
+        assert make_agent()[0]._settings_mode() == "inline"
+
+    @pytest.mark.parametrize("direction", ["inbound", "outbound"])
+    def test_build_agent_config_is_static(self, direction):
+        import importlib
+
+        agent_mod = importlib.import_module(f"{direction}.agent")
+        config = agent_mod.build_agent_config()
+        assert set(config) == {"listen", "think", "speak"}, "no greeting in a saved config"
+        assert config["think"]["functions"] == agent_mod.FUNCTION_DEFINITIONS
+        prompt = config["think"]["prompt"]
+        assert "Current Call Context" not in prompt
+        assert "{{" not in prompt
+        assert _find_keys(config, "language") == []
+        json.dumps(config)
+
+    def test_inbound_config_prompt_is_system_prompt(self):
+        from inbound.agent import SYSTEM_PROMPT, build_agent_config
+
+        assert build_agent_config()["think"]["prompt"] == SYSTEM_PROMPT
+
+    def test_outbound_config_prompt_points_at_this_call(self):
+        from outbound.agent import build_agent_config
+
+        prompt = build_agent_config()["think"]["prompt"]
+        assert prompt.count('"This Call"') >= 3  # opening reason, objective, context
+
+    def test_inline_settings_are_agent_config_plus_greeting_and_context(self):
+        from inbound.agent import SYSTEM_PROMPT, build_agent_config
+
+        agent, _, _ = make_agent(initial_message="Hello from a test.")
+        context = agent._build_call_context()
+        assert "+15551234567" in context
+        assert agent._build_settings()["agent"] == {
+            **build_agent_config(prompt=SYSTEM_PROMPT + context),
+            "greeting": "Hello from a test.",
+        }
+
+    def test_outbound_inline_settings_are_agent_config_plus_greeting_and_context(self):
+        from outbound.agent import CallManager, build_agent_config
+
+        record = CallManager().create_call(phone_number="+1555", opening_reason="a demo")
+        agent, _ = make_outbound_agent(
+            system_prompt=record.system_prompt,
+            initial_message=record.initial_message,
+            opening_reason="a demo",
+        )
+        assert agent._build_settings()["agent"] == {
+            **build_agent_config(prompt=record.system_prompt + agent._build_call_context()),
+            "greeting": record.initial_message,
+        }
+
+    async def test_saved_handshake_sends_context_then_greeting_then_flushes(self):
+        agent, plivo_ws, dg = make_agent(
+            settings_applied=False, agent_config_id=SAVED_UUID, initial_message="Hi there."
+        )
+        chunk = b"\x01" * 160
+        plivo_ws.push({"event": "media", "media": {"payload": base64.b64encode(chunk).decode()}})
+        plivo_ws.push({"event": "text", "text": "hello agent"})
+        plivo_ws.push({"event": "stop"})
+        await agent._receive_from_plivo()
+        assert dg.sent == []
+
+        dg.feed({"type": "Welcome", "request_id": "r"})
+        dg.feed({"type": "SettingsApplied"})
+        await agent._handshake(dg)
+
+        settings, update, greeting = (json.loads(m) for m in dg.sent[:3])
+        assert settings == {**settings, "type": "Settings", "agent": SAVED_UUID}
+        assert update["type"] == "UpdatePrompt"
+        assert "+15551234567" in update["prompt"]
+        assert "Current Call Context" in update["prompt"]
+        assert greeting == {"type": "InjectAgentMessage", "message": "Hi there."}
+        assert dg.sent[3] == chunk, "buffered audio is flushed after the greeting"
+        assert json.loads(dg.sent[4]) == {"type": "InjectUserMessage", "content": "hello agent"}
+        assert agent._settings_applied.is_set()
+
+    async def test_inline_handshake_sends_no_personalization(self):
+        agent, _, dg = make_agent(settings_applied=False)
+        dg.feed({"type": "Welcome", "request_id": "r"})
+        dg.feed({"type": "SettingsApplied"})
+        await agent._handshake(dg)
+        assert dg.sent_types() == ["Settings"]
+
+    async def test_saved_handshake_without_caller_skips_update_prompt(self):
+        agent, _, dg = make_agent(
+            settings_applied=False, agent_config_id=SAVED_UUID, from_number=""
+        )
+        dg.feed({"type": "Welcome", "request_id": "r"})
+        dg.feed({"type": "SettingsApplied"})
+        await agent._handshake(dg)
+        assert dg.sent_types() == ["Settings", "InjectAgentMessage"]
+
+    async def test_saved_greeting_counts_as_turn_1(self, captured_events):
+        """InjectAgentMessage comes back as ConversationText(assistant), like agent.greeting."""
+        agent, _, dg = make_agent(stream_id="", settings_applied=False, agent_config_id=SAVED_UUID)
+        for item in (
+            {"type": "Welcome", "request_id": "req-s"},
+            {"type": "SettingsApplied"},
+            {"type": "PromptUpdated"},
+            {"type": "ConversationText", "role": "assistant", "content": "Hi there."},
+            b"\x10" * 480,
+            {"type": "AgentAudioDone"},
+            None,
+        ):
+            dg.feed(item)
+        await asyncio.wait_for(agent._receive_from_deepgram(dg), timeout=2)
+        assert [(e["turn"], e["text"]) for e in of_event(captured_events, "agent_text")] == [
+            (1, "Hi there.")
+        ]
+        (turn,) = of_event(captured_events, "turn_complete")
+        assert (turn["turn"], turn["barge_in"], turn["agent_text"]) == (1, False, "Hi there.")
+
+    @pytest.mark.parametrize(("config_id", "expected"), [(SAVED_UUID, SAVED_UUID), ("", "inline")])
+    def test_session_end_reports_agent_config(self, captured_events, config_id, expected):
+        agent, _, _ = make_agent(agent_config_id=config_id)
+        agent._emit_session_end()
+        (session_end,) = of_event(captured_events, "session_end")
+        assert session_end["agent_config"] == expected
+
+    async def test_outbound_saved_mode_appends_campaign_details(self):
+        agent, dg = make_outbound_agent(
+            agent_config_id=SAVED_UUID,
+            initial_message="Hi, this is Alex from TechFlow.",
+            opening_reason="your trial ends soon",
+            objective="book a renewal call",
+            context="customer since 2024",
+        )
+        agent._settings_applied.clear()
+        dg.feed({"type": "Welcome", "request_id": "r"})
+        dg.feed({"type": "SettingsApplied"})
+        await agent._handshake(dg)
+        settings, update, greeting = dg.sent_json()
+        assert settings["agent"] == SAVED_UUID
+        prompt = update["prompt"]
+        assert "## This Call" in prompt
+        for text in (
+            "your trial ends soon",
+            "book a renewal call",
+            "customer since 2024",
+            '"Hi, this is Alex from TechFlow."',
+            "+15551234567",
+        ):
+            assert text in prompt, text
+        assert greeting == {
+            "type": "InjectAgentMessage",
+            "message": "Hi, this is Alex from TechFlow.",
+        }
+
+    def test_outbound_ws_passes_campaign_to_agent(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        from outbound import server
+
+        seen: dict[str, Any] = {}
+
+        async def fake_run_agent(**kwargs):
+            seen.update(kwargs)
+
+        monkeypatch.setattr(server, "run_agent", fake_run_agent)
+        record = server.call_manager.create_call(
+            phone_number="+1555", opening_reason="a demo", objective="book", context="ctx"
+        )
+        body = base64.b64encode(
+            json.dumps({"call_uuid": "u", "is_outbound": True, "call_id": record.call_id}).encode()
+        ).decode()
+        with TestClient(server.app).websocket_connect(f"/ws?body={body}") as ws:
+            ws.send_text(json.dumps({"event": "start", "start": {"callId": "u", "streamId": "s"}}))
+        assert (seen["opening_reason"], seen["objective"], seen["context"]) == (
+            "a demo",
+            "book",
+            "ctx",
+        )
+        assert seen["initial_message"] == record.initial_message
+
+
+class _FakeHTTPResponse:
+    def __init__(self, payload: Any) -> None:
+        self._raw = json.dumps(payload).encode() if payload is not None else b""
+
+    def read(self) -> bytes:
+        return self._raw
+
+    def __enter__(self) -> _FakeHTTPResponse:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+@pytest.fixture
+def fake_deepgram_rest(monkeypatch):
+    """Replace urllib.request.urlopen: route -> JSON payload (or an exception to raise)."""
+    import urllib.request
+
+    requests: list[Any] = []
+    routes: dict[tuple[str, str], Any] = {}
+
+    def urlopen(request, timeout=None):
+        requests.append(request)
+        path = request.full_url.split("/v1", 1)[1]
+        result = routes[(request.get_method(), path)]
+        if isinstance(result, BaseException):
+            raise result
+        return _FakeHTTPResponse(result)
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    return routes, requests
+
+
+def _http_error(code: int, payload: dict[str, Any]):
+    import io
+    import urllib.error
+
+    return urllib.error.HTTPError(
+        "https://api.deepgram.com/v1/x", code, "err", {}, io.BytesIO(json.dumps(payload).encode())
+    )
+
+
+class TestUnitSavedConfigPublish:
+    """publish/list/delete + project-id resolution against a mocked REST API."""
+
+    @pytest.fixture(autouse=True)
+    def _key(self, monkeypatch):
+        from inbound import agent as inbound_mod
+        from outbound import agent as outbound_mod
+
+        for mod in (inbound_mod, outbound_mod):
+            monkeypatch.setattr(mod, "DEEPGRAM_API_KEY", "test-key")
+            monkeypatch.setattr(mod, "DEEPGRAM_PROJECT_ID", "proj-1")
+
+    @pytest.mark.parametrize("id_field", ["agent_uuid", "agent_id"])
+    def test_publish_payload(self, fake_deepgram_rest, id_field):
+        from inbound.agent import EXAMPLE_NAME, build_agent_config, publish_agent_config
+
+        routes, requests = fake_deepgram_rest
+        routes[("POST", "/projects/proj-1/agents")] = {id_field: "new-uuid"}
+        assert publish_agent_config() == "new-uuid"
+
+        (request,) = requests
+        assert request.get_header("Authorization") == "Token test-key"
+        body = json.loads(request.data)
+        assert isinstance(body["config"], str), "config must be a JSON string"
+        assert json.loads(body["config"]) == build_agent_config()
+        assert body["metadata"] == {"example": EXAMPLE_NAME, "direction": "inbound"}
+
+    def test_outbound_publish_payload(self, fake_deepgram_rest):
+        from outbound.agent import build_agent_config, publish_agent_config
+
+        routes, requests = fake_deepgram_rest
+        routes[("POST", "/projects/proj-1/agents")] = {"agent_uuid": "out-uuid"}
+        assert publish_agent_config() == "out-uuid"
+        body = json.loads(requests[0].data)
+        config = json.loads(body["config"])
+        assert config == build_agent_config()
+        assert "greeting" not in config
+        assert "{{" not in config["think"]["prompt"]
+        assert body["metadata"]["direction"] == "outbound"
+
+    def test_publish_without_uuid_in_response_fails(self, fake_deepgram_rest):
+        from inbound.agent import DeepgramAPIError, publish_agent_config
+
+        routes, _ = fake_deepgram_rest
+        routes[("POST", "/projects/proj-1/agents")] = {"something": "else"}
+        with pytest.raises(DeepgramAPIError, match="agent_uuid"):
+            publish_agent_config()
+
+    def test_403_names_the_missing_scope(self, fake_deepgram_rest):
+        from inbound.agent import DeepgramAPIError, publish_agent_config
+
+        routes, _ = fake_deepgram_rest
+        routes[("POST", "/projects/proj-1/agents")] = _http_error(
+            403, {"err_code": "INSUFFICIENT_PERMISSIONS", "err_msg": "Missing scope"}
+        )
+        with pytest.raises(DeepgramAPIError) as excinfo:
+            publish_agent_config()
+        message = str(excinfo.value)
+        assert "HTTP 403" in message
+        assert "INSUFFICIENT_PERMISSIONS" in message
+        assert "agent:write" in message
+
+    def test_project_id_from_env_needs_no_lookup(self, fake_deepgram_rest):
+        from inbound.agent import resolve_project_id
+
+        assert resolve_project_id() == "proj-1"
+        assert fake_deepgram_rest[1] == []
+
+    def test_single_project_is_used(self, fake_deepgram_rest, monkeypatch):
+        from inbound import agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "DEEPGRAM_PROJECT_ID", "")
+        routes, _ = fake_deepgram_rest
+        routes[("GET", "/projects")] = {"projects": [{"project_id": "only", "name": "x"}]}
+        assert agent_mod.resolve_project_id() == "only"
+
+    @pytest.mark.parametrize(
+        ("projects", "match"),
+        [
+            ([{"project_id": "a"}, {"project_id": "b"}], "set DEEPGRAM_PROJECT_ID"),
+            ([], "no Deepgram projects"),
+        ],
+    )
+    def test_ambiguous_or_missing_project_errors(
+        self, fake_deepgram_rest, monkeypatch, projects, match
+    ):
+        from inbound import agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "DEEPGRAM_PROJECT_ID", "")
+        routes, _ = fake_deepgram_rest
+        routes[("GET", "/projects")] = {"projects": projects}
+        with pytest.raises(agent_mod.DeepgramAPIError, match=match):
+            agent_mod.resolve_project_id()
+
+    def test_list_and_delete(self, fake_deepgram_rest):
+        from inbound.agent import delete_agent_config, list_agent_configs
+
+        routes, requests = fake_deepgram_rest
+        routes[("GET", "/projects/proj-1/agents")] = [{"agent_uuid": "a", "metadata": {}}]
+        routes[("DELETE", "/projects/proj-1/agents/a")] = {}
+        assert list_agent_configs() == [{"agent_uuid": "a", "metadata": {}}]
+        delete_agent_config("a")
+        assert requests[-1].get_method() == "DELETE"
+
+    def test_cli_publish_prints_env_line(self, fake_deepgram_rest, capsys):
+        from outbound.agent import main
+
+        routes, _ = fake_deepgram_rest
+        routes[("POST", "/projects/proj-1/agents")] = {"agent_uuid": "cli-uuid"}
+        assert main(["--publish"]) == 0
+        assert "DEEPGRAM_OUTBOUND_AGENT_ID=cli-uuid" in capsys.readouterr().out
+
+    def test_cli_reports_api_errors(self, fake_deepgram_rest, capsys):
+        from inbound.agent import main
+
+        routes, _ = fake_deepgram_rest
+        routes[("DELETE", "/projects/proj-1/agents/x")] = _http_error(404, {"err_msg": "nope"})
+        assert main(["--delete", "x"]) == 1
+        assert "HTTP 404" in capsys.readouterr().err
+
+    def test_cli_requires_api_key(self, monkeypatch, capsys):
+        from inbound import agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "DEEPGRAM_API_KEY", "")
+        assert agent_mod.main(["--list"]) == 2
+        assert "DEEPGRAM_API_KEY" in capsys.readouterr().err
+
+
+# =============================================================================
 # LOCAL INTEGRATION TESTS (real server subprocess + real Deepgram)
 # =============================================================================
 
@@ -1506,6 +1901,138 @@ class TestDeepgramAgentIntegration:
         rms = rms_of_ulaw(bytes(audio))
         assert rms > 500, f"Greeting RMS {rms:.0f} too low"
         assert "ConversationText" in events
+
+
+# =============================================================================
+# DEEPGRAM SAVED AGENT CONFIGURATION INTEGRATION (publish -> use -> delete)
+# =============================================================================
+
+_SPOKEN_DIGITS = {
+    "zero": "0",
+    "oh": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+}
+
+
+def spoken_digits(text: str) -> str:
+    """Digits in ``text``, counting spelled-out digits ("five five five" -> "555")."""
+    out = []
+    for token in "".join(c if c.isalnum() else " " for c in text.lower()).split():
+        if token.isdigit():
+            out.append(token)
+        elif token in _SPOKEN_DIGITS:
+            out.append(_SPOKEN_DIGITS[token])
+    return "".join(out)
+
+
+@pytest.fixture(scope="module")
+def saved_config_id():
+    """Publish a real inbound saved agent config for this module; ALWAYS delete it."""
+    from inbound.agent import DeepgramAPIError, delete_agent_config, publish_agent_config
+
+    try:
+        config_id = publish_agent_config()
+    except DeepgramAPIError as e:
+        pytest.skip(f"cannot publish a saved agent config: {e}")
+    print(f"\n[saved config] published {config_id}")
+    try:
+        yield config_id
+    finally:
+        delete_agent_config(config_id)
+        print(f"\n[saved config] deleted {config_id}")
+
+
+@pytest.mark.skipif(not DEEPGRAM_API_KEY, reason="DEEPGRAM_API_KEY not configured")
+class TestDeepgramSavedConfigIntegration:
+    """Publish a real saved agent config, connect with ``agent: <uuid>``, always delete it."""
+
+    CALLER = "+14155550123"
+
+    @contextlib.asynccontextmanager
+    async def _session(self, config_id: str):
+        """Connect in saved mode and run the agent's own handshake (UpdatePrompt + greeting)."""
+        from inbound.agent import DEEPGRAM_AGENT_URL, DeepgramVoiceAgent
+
+        agent = DeepgramVoiceAgent(
+            websocket=FakePlivoWS(),
+            call_id=CALL_ID,
+            from_number=self.CALLER,
+            agent_config_id=config_id,
+        )
+        async with websockets.connect(
+            DEEPGRAM_AGENT_URL,
+            additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+            max_size=None,
+        ) as dg:
+            agent._dg_ws = dg
+            await agent._handshake(dg)
+            yield agent, dg
+
+    async def _until_audio_done(self, agent, dg, timeout: float = 30) -> dict[str, Any]:
+        """Collect one agent response; answer FunctionCallRequests via the agent's handler."""
+        result: dict[str, Any] = {"audio": bytearray(), "types": [], "text": [], "functions": []}
+        async with asyncio.timeout(timeout):
+            while True:
+                msg = await dg.recv()
+                if isinstance(msg, bytes):
+                    result["audio"].extend(msg)
+                    continue
+                evt = json.loads(msg)
+                result["types"].append(evt["type"])
+                assert evt["type"] != "Error", evt
+                if evt["type"] == "ConversationText" and evt.get("role") == "assistant":
+                    result["text"].append(evt["content"])
+                elif evt["type"] == "FunctionCallRequest":
+                    result["functions"] += [f["name"] for f in evt["functions"]]
+                    await agent._on_function_call_request(evt)
+                elif evt["type"] == "AgentAudioDone":
+                    return result
+
+    async def test_saved_config_is_listed(self, saved_config_id):
+        from inbound.agent import EXAMPLE_NAME, list_agent_configs
+
+        configs = {c.get("agent_uuid"): c for c in list_agent_configs()}
+        assert saved_config_id in configs
+        assert configs[saved_config_id]["metadata"] == {
+            "example": EXAMPLE_NAME,
+            "direction": "inbound",
+        }
+
+    async def test_greeting_and_injected_caller_context(self, saved_config_id):
+        from inbound.agent import DEFAULT_GREETING
+
+        async with self._session(saved_config_id) as (agent, dg):
+            greeting = await self._until_audio_done(agent, dg)
+            assert "PromptUpdated" in greeting["types"]
+            assert " ".join(greeting["text"]) == DEFAULT_GREETING
+            assert len(greeting["audio"]) >= 8000, f"greeting too short: {greeting['types']}"
+            assert rms_of_ulaw(bytes(greeting["audio"])) > 500
+
+            await agent._inject_user_text("What phone number am I calling from?")
+            answer = await self._until_audio_done(agent, dg)
+        spoken = " ".join(answer["text"])
+        print(f"\n[saved config] caller-number answer: {spoken}")
+        assert "4155550123" in spoken_digits(spoken), spoken
+
+    async def test_client_side_function_call(self, saved_config_id):
+        async with self._session(saved_config_id) as (agent, dg):
+            await self._until_audio_done(agent, dg)  # greeting
+            await agent._inject_user_text("Please check the status of my order TF-123456.")
+            response = await self._until_audio_done(agent, dg)
+            if not response["functions"]:  # the function result may arrive after a filler
+                response = await self._until_audio_done(agent, dg)
+        spoken = " ".join(response["text"])
+        print(f"\n[saved config] functions={response['functions']} response: {spoken}")
+        assert "check_order_status" in response["functions"]
+        assert spoken
 
 
 # =============================================================================

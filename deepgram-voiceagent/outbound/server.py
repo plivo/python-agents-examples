@@ -475,12 +475,19 @@ async def websocket_endpoint(
         # Load outbound prompt and initial message from call record
         system_prompt = None
         initial_message = DEFAULT_OUTBOUND_GREETING
+        campaign: dict[str, str] = {}
         if call_data.get("is_outbound"):
             outbound_call_id = call_data.get("call_id", "")
             record = call_manager.get_call(outbound_call_id)
             if record:
                 system_prompt = record.system_prompt
                 initial_message = record.initial_message
+                # Saved agent config mode sends these per call via UpdatePrompt
+                campaign = {
+                    "opening_reason": record.opening_reason,
+                    "objective": record.objective,
+                    "context": record.context,
+                }
                 logger.bind(call_id=outbound_call_id).info(
                     f"Outbound call detected: call_id={outbound_call_id}"
                 )
@@ -500,6 +507,7 @@ async def websocket_endpoint(
             parent_call_id=call_data.get("parent_call_uuid", ""),
             sip_headers=call_data.get("sip_headers"),
             hangup_callback=functools.partial(_hangup_call, call_id),
+            **campaign,
         )
 
     except WebSocketDisconnect:
