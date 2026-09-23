@@ -64,8 +64,8 @@ What `--tunnel` does:
 
 1. Starts `cloudflared tunnel --url http://localhost:$SERVER_PORT`. The quick tunnel needs no Cloudflare account.
 2. Uses the `https://<random>.trycloudflare.com` URL as `PUBLIC_URL`.
-3. Points your Plivo number at it. The server creates or updates the `Deepgram_VoiceAgent` Plivo application.
-4. Logs `Ready! Call +<number>` once the URL answers, which usually takes about 10 to 20 s.
+3. Points your Plivo number at it, creating or updating the `Deepgram_VoiceAgent` Plivo application. Plivo only accepts a URL once it can resolve the hostname, so for a new tunnel the server retries in the background for up to 3 minutes. In testing this took about 70 s.
+4. Logs `Ready! Call +<number>` once Plivo accepts the URL.
 
 Call the number. Ctrl+C stops the server and the tunnel. The URL changes on every run and the number is re-pointed each time.
 
@@ -500,8 +500,8 @@ The image is based on `python:3.12-slim` by default; pass `--build-arg BASE_IMAG
 ### `--tunnel`: "cloudflared not found" or no "Ready!" line
 
 - **"cloudflared not found":** [install `cloudflared`](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/) so it's on your `PATH`, then run again.
-- **"Could not reach … from this machine" but Plivo calls work:** your local DNS (often a VPN) is slow to resolve new `trycloudflare.com` hostnames. Plivo resolves the URL on its own network, so calls can still work.
-- **Calls fail too:** restart with `--tunnel` to get a new URL, or use ngrok or a deployed host instead. Quick tunnels are meant for development and have no uptime guarantee.
+- **`Waiting for Plivo to accept …` for a while:** this is normal. Plivo rejects a new `trycloudflare.com` hostname (`Must be a valid url`) until it resolves, and the server keeps retrying for up to 3 minutes before `Ready!`. With `outbound.server --tunnel`, calls placed during that window are retried the same way.
+- **`Plivo did not accept … within 180s`:** restart with `--tunnel` to get a new URL, or use ngrok or a deployed host with a fixed `PUBLIC_URL`. Quick tunnels are meant for development and have no uptime guarantee.
 
 ### 401 / handshake rejected
 

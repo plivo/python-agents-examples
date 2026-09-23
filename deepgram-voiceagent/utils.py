@@ -15,8 +15,6 @@ import re
 import shutil
 import subprocess
 import threading
-import time
-import urllib.request
 
 import numpy as np
 import phonenumbers
@@ -478,17 +476,3 @@ def stop_tunnel(proc: subprocess.Popen | None) -> None:
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
-
-
-def wait_until_reachable(url: str, timeout_s: float = 60.0, interval_s: float = 1.0) -> bool:
-    """Poll ``url`` until it answers HTTP 200 (new quick-tunnel DNS can take a few seconds)."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=5) as resp:
-                if resp.status == 200:
-                    return True
-        except Exception:
-            pass
-        time.sleep(interval_s)
-    return False

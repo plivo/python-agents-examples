@@ -1453,11 +1453,6 @@ class TestUnitQuickTunnel:
         with pytest.raises(utils.TunnelError):
             utils.start_quick_tunnel(8000, timeout_s=5)
 
-    def test_wait_until_reachable_gives_up(self):
-        from utils import wait_until_reachable
-
-        assert not wait_until_reachable("http://127.0.0.1:9/", timeout_s=0.3, interval_s=0.1)
-
     @pytest.mark.parametrize("module", ["inbound.server", "outbound.server"])
     def test_start_tunnel_sets_public_url(self, monkeypatch, module):
         import importlib
@@ -1500,6 +1495,157 @@ class TestUnitQuickTunnel:
             )
         assert resp.status_code == 200
         assert "wss://t-2.trycloudflare.com/ws?body=" in resp.text
+
+
+class FakePlivoClient:
+    """Minimal stand-in for plivo.RestClient covering applications/numbers/calls."""
+
+    def __init__(self, apps=None, reject_urls: int = 0):
+        self.apps = list(apps or [])
+        self.reject_urls = reject_urls  # first N app/call writes fail with "valid url"
+        self.list_params: list = []
+        self.updated: list = []
+        self.created: list = []
+        self.numbers_updated: list = []
+        self.calls_created: list = []
+        outer = self
+
+        class _Apps:
+            def list(self, **params):
+                outer.list_params.append(params)
+                prefix = params.get("app_name", "")
+                return {"objects": [a for a in outer.apps if a["app_name"].startswith(prefix)]}
+
+            def update(self, app_id, **params):
+                outer._maybe_reject()
+                outer.updated.append((app_id, params))
+
+            def create(self, app_name, **params):
+                outer._maybe_reject()
+                outer.created.append((app_name, params))
+                return {"app_id": "new-app"}
+
+        class _Numbers:
+            def update(self, number, app_id):
+                outer.numbers_updated.append((number, app_id))
+
+        class _Calls:
+            def create(self, **params):
+                outer._maybe_reject()
+                outer.calls_created.append(params)
+                return {"request_uuid": "req-1"}
+
+        self.applications, self.numbers, self.calls = _Apps(), _Numbers(), _Calls()
+
+    def _maybe_reject(self):
+        if self.reject_urls > 0:
+            self.reject_urls -= 1
+            raise plivo.exceptions.ValidationError(
+                "{'answer_url': ['Must be a valid url'], 'hangup_url': ['Must be a valid url']}"
+            )
+
+
+class TestUnitPlivoAutoConfig:
+    """Plivo number auto-config: app-name prefix filter, --tunnel URL wait, shutdown."""
+
+    @pytest.fixture
+    def inbound_server(self, monkeypatch):
+        from inbound import server
+
+        monkeypatch.setattr(server, "PLIVO_AUTH_ID", "MAXXXX")
+        monkeypatch.setattr(server, "PLIVO_AUTH_TOKEN", "token")
+        monkeypatch.setattr(server, "PLIVO_PHONE_NUMBER", "+14155550123")
+        monkeypatch.setattr(server, "PUBLIC_URL", "https://t-3.trycloudflare.com")
+        monkeypatch.setattr(server, "TUNNEL_URL_RETRY_INTERVAL_S", 0.0)
+        return server
+
+    def _install(self, monkeypatch, server, fake):
+        monkeypatch.setattr(server.plivo, "RestClient", lambda **_kw: fake)
+
+    def test_lists_apps_by_prefix_and_updates_exact_match(self, monkeypatch, inbound_server):
+        fake = FakePlivoClient(
+            apps=[
+                {"app_name": "Deepgram_VoiceAgent_Test", "app_id": "test-app"},
+                {"app_name": "Deepgram_VoiceAgent", "app_id": "real-app"},
+            ]
+        )
+        self._install(monkeypatch, inbound_server, fake)
+        assert inbound_server.configure_plivo_webhooks()
+        assert fake.list_params == [{"app_name": "Deepgram_VoiceAgent"}]
+        assert [u[0] for u in fake.updated] == ["real-app"]
+        assert fake.updated[0][1]["answer_url"] == "https://t-3.trycloudflare.com/answer"
+        assert fake.numbers_updated == [("14155550123", "real-app")]
+
+    def test_creates_app_when_only_prefix_matches_exist(self, monkeypatch, inbound_server):
+        fake = FakePlivoClient(apps=[{"app_name": "Deepgram_VoiceAgent_Test", "app_id": "t"}])
+        self._install(monkeypatch, inbound_server, fake)
+        assert inbound_server.configure_plivo_webhooks()
+        assert fake.updated == []
+        assert [c[0] for c in fake.created] == ["Deepgram_VoiceAgent"]
+        assert fake.numbers_updated == [("14155550123", "new-app")]
+
+    def test_invalid_url_without_wait_fails_fast(self, monkeypatch, inbound_server):
+        fake = FakePlivoClient(reject_urls=1)
+        self._install(monkeypatch, inbound_server, fake)
+        assert not inbound_server.configure_plivo_webhooks()
+        assert fake.numbers_updated == []
+
+    def test_tunnel_wait_retries_until_plivo_accepts_url(self, monkeypatch, inbound_server):
+        fake = FakePlivoClient(reject_urls=3)
+        self._install(monkeypatch, inbound_server, fake)
+        assert inbound_server.configure_plivo_webhooks(wait_for_url_s=30)
+        assert len(fake.list_params) == 4  # 3 rejections + 1 success
+        assert fake.numbers_updated == [("14155550123", "new-app")]
+
+    def test_tunnel_wait_gives_up_after_deadline(self, monkeypatch, inbound_server):
+        fake = FakePlivoClient(reject_urls=10_000)
+        self._install(monkeypatch, inbound_server, fake)
+        monkeypatch.setattr(inbound_server, "TUNNEL_URL_RETRY_INTERVAL_S", 0.01)
+        assert not inbound_server.configure_plivo_webhooks(wait_for_url_s=0.05)
+        assert 1 < len(fake.list_params) < 50  # retried, then stopped at the deadline
+        assert fake.numbers_updated == []
+
+    def test_other_validation_errors_are_not_retried(self, monkeypatch, inbound_server):
+        fake = FakePlivoClient()
+
+        def bad_update(number, app_id):
+            raise plivo.exceptions.ValidationError("number not found")
+
+        fake.numbers.update = bad_update
+        self._install(monkeypatch, inbound_server, fake)
+        assert not inbound_server.configure_plivo_webhooks(wait_for_url_s=30)
+        assert len(fake.list_params) == 1
+
+    @pytest.mark.parametrize("module", ["inbound.server", "outbound.server"])
+    async def test_lifespan_shutdown_stops_tunnel(self, monkeypatch, module):
+        """Covers SIGTERM too: uvicorn runs lifespan shutdown before re-raising the signal."""
+        import importlib
+
+        server = importlib.import_module(module)
+        stopped = []
+        monkeypatch.setattr(server, "_tunnel_proc", "fake-proc")
+        monkeypatch.setattr(server, "stop_tunnel", lambda proc: stopped.append(proc))
+        async with server._lifespan(server.app):
+            assert stopped == []
+        assert stopped == ["fake-proc"]
+
+    async def test_outbound_call_retries_invalid_url_on_fresh_tunnel(self, monkeypatch):
+        from outbound import server
+
+        fake = FakePlivoClient(reject_urls=2)
+        monkeypatch.setattr(server, "TUNNEL_URL_RETRY_INTERVAL_S", 0.0)
+        monkeypatch.setattr(server, "_tunnel_started_at", time.monotonic())
+        result = await server._create_call(fake, from_="1", to_="2", answer_url="https://x")
+        assert result == {"request_uuid": "req-1"}
+        assert len(fake.calls_created) == 1
+
+    async def test_outbound_call_invalid_url_not_retried_without_tunnel(self, monkeypatch):
+        from outbound import server
+
+        fake = FakePlivoClient(reject_urls=1)
+        monkeypatch.setattr(server, "_tunnel_started_at", None)
+        with pytest.raises(plivo.exceptions.ValidationError):
+            await server._create_call(fake, from_="1", to_="2", answer_url="https://x")
 
 
 class TestUnitSavedAgentConfig:

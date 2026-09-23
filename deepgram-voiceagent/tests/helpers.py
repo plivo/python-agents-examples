@@ -153,7 +153,8 @@ def upsert_application(
     params = {"answer_url": answer_url, "answer_method": "POST"}
     if hangup_url:
         params.update(hangup_url=hangup_url, hangup_method="POST")
-    apps = client.applications.list()
+    # app_name filters by prefix server-side (the unfiltered list is paged at 20)
+    apps = client.applications.list(app_name=app_name)
     for app_obj in apps["objects"]:
         if app_obj["app_name"] == app_name:
             client.applications.update(app_id=app_obj["app_id"], **params)

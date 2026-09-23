@@ -12,6 +12,8 @@ import json
 import os
 import sys
 import threading
+import time
+from collections.abc import AsyncIterator
 
 import plivo
 import uvicorn
@@ -27,7 +29,6 @@ from utils import (
     normalize_phone_number,
     start_quick_tunnel,
     stop_tunnel,
-    wait_until_reachable,
 )
 
 load_dotenv()
@@ -128,7 +129,22 @@ PLIVO_AUTH_TOKEN = os.getenv("PLIVO_AUTH_TOKEN", "")
 PLIVO_PHONE_NUMBER = os.getenv("PLIVO_PHONE_NUMBER", "")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "")
 
+# --tunnel: Plivo rejects answer URLs whose hostname it can't resolve yet ("Must be a
+# valid url"); a fresh trycloudflare.com hostname took ~70s to be accepted in testing.
+TUNNEL_URL_ACCEPT_TIMEOUT_S = 180.0
+TUNNEL_URL_RETRY_INTERVAL_S = 5.0
+_tunnel_proc = None  # cloudflared process started by --tunnel
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Stop the --tunnel process on shutdown (runs on Ctrl+C and SIGTERM alike)."""
+    yield
+    stop_tunnel(_tunnel_proc)
+
+
 app = FastAPI(
+    lifespan=_lifespan,
     title="Deepgram Voice Agent API + Plivo (Inbound)",
     description=(
         "Inbound voice agent: Deepgram Voice Agent API "
@@ -158,8 +174,17 @@ async def _hangup_call(call_uuid: str) -> None:
 # =============================================================================
 
 
-def configure_plivo_webhooks() -> bool:
-    """Configure Plivo phone number with webhook URLs."""
+def _is_invalid_url_error(e: Exception) -> bool:
+    """Plivo's API rejects answer/hangup URLs whose hostname it can't resolve yet."""
+    return isinstance(e, plivo.exceptions.ValidationError) and "valid url" in str(e).lower()
+
+
+def configure_plivo_webhooks(wait_for_url_s: float = 0.0) -> bool:
+    """Point PLIVO_PHONE_NUMBER at this server's /answer and /hangup.
+
+    With ``wait_for_url_s`` > 0 (used by --tunnel), keep retrying while Plivo rejects a
+    PUBLIC_URL it can't resolve yet, instead of failing on the first attempt.
+    """
     if not all([PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN, PLIVO_PHONE_NUMBER, PUBLIC_URL]):
         missing = []
         if not PLIVO_AUTH_ID:
@@ -173,61 +198,67 @@ def configure_plivo_webhooks() -> bool:
         logger.warning(f"Skipping Plivo auto-config. Missing: {', '.join(missing)}")
         return False
 
-    try:
-        client = plivo.RestClient(auth_id=PLIVO_AUTH_ID, auth_token=PLIVO_AUTH_TOKEN)
+    phone_number = normalize_phone_number(PLIVO_PHONE_NUMBER)
+    if not phone_number:
+        logger.error(f"Invalid phone number format: {PLIVO_PHONE_NUMBER}")
+        return False
 
-        app_name = "Deepgram_VoiceAgent"
-        answer_url = f"{PUBLIC_URL}/answer"
-        hangup_url = f"{PUBLIC_URL}/hangup"
+    client = plivo.RestClient(auth_id=PLIVO_AUTH_ID, auth_token=PLIVO_AUTH_TOKEN)
+    app_name = "Deepgram_VoiceAgent"
+    answer_url = f"{PUBLIC_URL}/answer"
+    hangup_url = f"{PUBLIC_URL}/hangup"
+    deadline = time.monotonic() + wait_for_url_s
+    waiting_logged = False
 
-        # Check if application already exists
-        apps = client.applications.list()
-        existing_app = None
-        for app_obj in apps["objects"]:
-            if app_obj["app_name"] == app_name:
-                existing_app = app_obj
-                break
+    while True:
+        try:
+            # app_name filters by prefix server-side, so pick the exact match
+            apps = client.applications.list(app_name=app_name)
+            existing_app = next((a for a in apps["objects"] if a["app_name"] == app_name), None)
+            if existing_app:
+                client.applications.update(
+                    app_id=existing_app["app_id"],
+                    answer_url=answer_url,
+                    answer_method="POST",
+                    hangup_url=hangup_url,
+                    hangup_method="POST",
+                )
+                app_id = existing_app["app_id"]
+                logger.info(f"Updated Plivo application: {app_name}")
+            else:
+                response = client.applications.create(
+                    app_name=app_name,
+                    answer_url=answer_url,
+                    answer_method="POST",
+                    hangup_url=hangup_url,
+                    hangup_method="POST",
+                )
+                app_id = response["app_id"]
+                logger.info(f"Created Plivo application: {app_name}")
 
-        if existing_app:
-            client.applications.update(
-                app_id=existing_app["app_id"],
-                answer_url=answer_url,
-                answer_method="POST",
-                hangup_url=hangup_url,
-                hangup_method="POST",
-            )
-            app_id = existing_app["app_id"]
-            logger.info(f"Updated Plivo application: {app_name}")
-        else:
-            response = client.applications.create(
-                app_name=app_name,
-                answer_url=answer_url,
-                answer_method="POST",
-                hangup_url=hangup_url,
-                hangup_method="POST",
-            )
-            app_id = response["app_id"]
-            logger.info(f"Created Plivo application: {app_name}")
+            client.numbers.update(number=phone_number, app_id=app_id)
 
-        phone_number = normalize_phone_number(PLIVO_PHONE_NUMBER)
-        if not phone_number:
-            logger.error(f"Invalid phone number format: {PLIVO_PHONE_NUMBER}")
+            logger.info(f"Plivo webhooks configured for +{phone_number}")
+            logger.info(f"  Answer URL: {answer_url}")
+            logger.info(f"  Hangup URL: {hangup_url}")
+            return True
+
+        except plivo.exceptions.ValidationError as e:
+            if _is_invalid_url_error(e) and time.monotonic() < deadline:
+                if not waiting_logged:
+                    logger.info(
+                        f"Waiting for Plivo to accept {PUBLIC_URL} (a new tunnel hostname can "
+                        f"take a minute to resolve); retrying every "
+                        f"{TUNNEL_URL_RETRY_INTERVAL_S:.0f}s..."
+                    )
+                    waiting_logged = True
+                time.sleep(TUNNEL_URL_RETRY_INTERVAL_S)
+                continue
+            logger.error(f"Plivo validation error: {e}")
             return False
-
-        client.numbers.update(number=phone_number, app_id=app_id)
-
-        logger.info(f"Plivo webhooks configured for +{phone_number}")
-        logger.info(f"  Answer URL: {answer_url}")
-        logger.info(f"  Hangup URL: {hangup_url}")
-
-        return True
-
-    except plivo.exceptions.ValidationError as e:
-        logger.error(f"Plivo validation error: {e}")
-        return False
-    except Exception as e:
-        logger.error(f"Failed to configure Plivo: {e}")
-        return False
+        except Exception as e:
+            logger.error(f"Failed to configure Plivo: {e}")
+            return False
 
 
 # =============================================================================
@@ -411,25 +442,26 @@ async def websocket_endpoint(
 
 def _start_tunnel() -> None:
     """``--tunnel``: expose SERVER_PORT via a Cloudflare quick tunnel and use it as PUBLIC_URL."""
-    global PUBLIC_URL
+    global PUBLIC_URL, _tunnel_proc
     try:
         url, proc = start_quick_tunnel(SERVER_PORT)
     except TunnelError as e:
         logger.error(f"--tunnel: {e}")
         raise SystemExit(1) from e
-    atexit.register(stop_tunnel, proc)
+    _tunnel_proc = proc
+    atexit.register(stop_tunnel, proc)  # covers exits before uvicorn's lifespan starts
     PUBLIC_URL = url
     logger.info(f"Tunnel up: {url} -> http://localhost:{SERVER_PORT}")
 
 
-def _announce_when_reachable(phone: str) -> None:
-    """Log the 'call now' line only once PUBLIC_URL actually reaches this server."""
-    if wait_until_reachable(f"{PUBLIC_URL}/"):
+def _configure_plivo_for_tunnel(phone: str) -> None:
+    """Background: wait until Plivo accepts the tunnel URL, then point the number at it."""
+    if configure_plivo_webhooks(wait_for_url_s=TUNNEL_URL_ACCEPT_TIMEOUT_S):
         logger.info(f"Ready! Call +{phone} to talk to the agent (Ctrl+C to stop)")
     else:
         logger.warning(
-            f"Could not reach {PUBLIC_URL} from this machine within 60s. Plivo resolves it "
-            "independently, so calls may still work; if they don't, restart with --tunnel"
+            f"Plivo did not accept {PUBLIC_URL} within {TUNNEL_URL_ACCEPT_TIMEOUT_S:.0f}s. "
+            "Restart with --tunnel to get a new URL, or use a fixed PUBLIC_URL"
         )
 
 
@@ -456,13 +488,11 @@ def main() -> None:
     if PLIVO_PHONE_NUMBER and PUBLIC_URL:
         logger.info("Configuring Plivo webhooks...")
         phone = normalize_phone_number(PLIVO_PHONE_NUMBER)
-        if configure_plivo_webhooks():
-            if args.tunnel:
-                threading.Thread(
-                    target=_announce_when_reachable, args=(phone,), daemon=True
-                ).start()
-            else:
-                logger.info(f"Ready! Call +{phone} to test")
+        if args.tunnel:
+            # Serve calls right away; the number is pointed here once Plivo accepts the URL
+            threading.Thread(target=_configure_plivo_for_tunnel, args=(phone,), daemon=True).start()
+        elif configure_plivo_webhooks():
+            logger.info(f"Ready! Call +{phone} to test")
         else:
             logger.warning("Plivo auto-configuration failed. Configure manually.")
     else:

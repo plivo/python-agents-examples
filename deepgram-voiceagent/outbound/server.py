@@ -11,6 +11,8 @@ import functools
 import json
 import os
 import sys
+import time
+from collections.abc import AsyncIterator
 from datetime import datetime
 
 import plivo
@@ -133,7 +135,23 @@ PLIVO_AUTH_TOKEN = os.getenv("PLIVO_AUTH_TOKEN", "")
 PLIVO_PHONE_NUMBER = os.getenv("PLIVO_PHONE_NUMBER", "")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "")
 
+# --tunnel: Plivo rejects answer URLs whose hostname it can't resolve yet ("Must be a
+# valid url"); a fresh trycloudflare.com hostname took ~70s to be accepted in testing.
+TUNNEL_URL_ACCEPT_TIMEOUT_S = 180.0
+TUNNEL_URL_RETRY_INTERVAL_S = 5.0
+_tunnel_proc = None  # cloudflared process started by --tunnel
+_tunnel_started_at: float | None = None
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Stop the --tunnel process on shutdown (runs on Ctrl+C and SIGTERM alike)."""
+    yield
+    stop_tunnel(_tunnel_proc)
+
+
 app = FastAPI(
+    lifespan=_lifespan,
     title="Deepgram Voice Agent API + Plivo (Outbound)",
     description=(
         "Outbound voice agent: Deepgram Voice Agent API "
@@ -176,6 +194,31 @@ async def health_check() -> dict:
     }
 
 
+def _is_invalid_url_error(e: Exception) -> bool:
+    """Plivo's API rejects answer/hangup URLs whose hostname it can't resolve yet."""
+    return isinstance(e, plivo.exceptions.ValidationError) and "valid url" in str(e).lower()
+
+
+async def _create_call(client: plivo.RestClient, **params) -> object:
+    """Place the call off the event loop. Right after --tunnel starts, Plivo may reject the
+    new tunnel URL until it resolves, so retry that specific error for a limited time."""
+    while True:
+        try:
+            return await asyncio.to_thread(client.calls.create, **params)
+        except plivo.exceptions.ValidationError as e:
+            fresh_tunnel = (
+                _tunnel_started_at is not None
+                and time.monotonic() - _tunnel_started_at < TUNNEL_URL_ACCEPT_TIMEOUT_S
+            )
+            if not (_is_invalid_url_error(e) and fresh_tunnel):
+                raise
+            logger.info(
+                f"Plivo does not accept {PUBLIC_URL} yet (new tunnel hostname); "
+                f"retrying in {TUNNEL_URL_RETRY_INTERVAL_S:.0f}s"
+            )
+            await asyncio.sleep(TUNNEL_URL_RETRY_INTERVAL_S)
+
+
 @app.post("/outbound/call")
 async def outbound_initiate(
     request: Request,
@@ -213,7 +256,8 @@ async def outbound_initiate(
         answer_url = f"{PUBLIC_URL}/outbound/answer?call_id={record.call_id}"
         hangup_url = f"{PUBLIC_URL}/outbound/hangup"
 
-        call_response = client.calls.create(
+        call_response = await _create_call(
+            client,
             from_=from_number,
             to_=to_number,
             answer_url=answer_url,
@@ -534,13 +578,15 @@ async def websocket_endpoint(
 
 def _start_tunnel() -> None:
     """``--tunnel``: expose SERVER_PORT via a Cloudflare quick tunnel and use it as PUBLIC_URL."""
-    global PUBLIC_URL
+    global PUBLIC_URL, _tunnel_proc, _tunnel_started_at
     try:
         url, proc = start_quick_tunnel(SERVER_PORT)
     except TunnelError as e:
         logger.error(f"--tunnel: {e}")
         raise SystemExit(1) from e
-    atexit.register(stop_tunnel, proc)
+    _tunnel_proc = proc
+    _tunnel_started_at = time.monotonic()
+    atexit.register(stop_tunnel, proc)  # covers exits before uvicorn's lifespan starts
     PUBLIC_URL = url
     logger.info(f"Tunnel up: {url} -> http://localhost:{SERVER_PORT}")
 
