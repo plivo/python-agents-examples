@@ -97,7 +97,7 @@ deepgram-voiceagent/
 ├── inbound/
 │   ├── __init__.py
 │   ├── agent.py            # DeepgramVoiceAgent, FUNCTION_DEFINITIONS, _build_settings(), run_agent()
-│   ├── server.py           # FastAPI: /, /answer, /ws, /hangup, /fallback, /hold + _hangup_call(), Plivo auto-config, startup log of the agent path
+│   ├── server.py           # FastAPI: /, /answer, /ws, /hangup, /fallback, /hold + _hangup_call(), Plivo auto-config, startup log of the agent path + reusable-config ID check
 │   └── system_prompt.md    # Inbound system prompt
 ├── outbound/
 │   ├── __init__.py
@@ -163,8 +163,8 @@ Three concurrent asyncio tasks, following the canonical `FIRST_COMPLETED` patter
 | When | File | What it does |
 |---|---|---|
 | Module import | `inbound/agent.py`, `outbound/agent.py` | `load_dotenv()`, read the `DEEPGRAM_*` config, load `system_prompt.md`, define `FUNCTION_DEFINITIONS`. No network calls. |
-| Server start: `uv run python -m inbound.server` | `inbound/server.py` → `main()` | Logging sinks (text/JSON/file/Redis) and optional OTel are set up when the module loads. Then `describe_deepgram_agent()` logs the active path, e.g. `Deepgram agent: inline (listen=flux-general-en, think=open_ai/gpt-4.1-mini, speak=aura-2-thalia-en)` or `Deepgram agent: reusable config <uuid> …` (no Deepgram API call), then `configure_plivo_webhooks()` creates or updates the Plivo application and assigns `PLIVO_PHONE_NUMBER` when `PUBLIC_URL` is set, then uvicorn starts. |
-| Server start: `uv run python -m outbound.server` | `outbound/server.py` → `main()` | Same agent-path log line, then uvicorn. There is no number auto-config, because answer and hangup URLs are passed per call. |
+| Server start: `uv run python -m inbound.server` | `inbound/server.py` → `main()` | Logging sinks (text/JSON/file/Redis) and optional OTel are set up when the module loads. Then `describe_deepgram_agent()` logs the active path. On the reusable path, `verify_deepgram_agent_id()` looks the UUID up in the API key's Deepgram project (`GET /v1/projects`, then `/projects/{id}/agents/{uuid}`) and **exits with code 1 if it isn't found**. It warns and starts anyway if it can't check (network error, key without `agent:read`), e.g. `Deepgram agent: inline (listen=flux-general-en, think=open_ai/gpt-4.1-mini, speak=aura-2-thalia-en)` or `Deepgram agent: reusable config <uuid> …` (no Deepgram API call), then `configure_plivo_webhooks()` creates or updates the Plivo application and assigns `PLIVO_PHONE_NUMBER` when `PUBLIC_URL` is set, then uvicorn starts. |
+| Server start: `uv run python -m outbound.server` | `outbound/server.py` → `main()` | Same agent-path log line and reusable-config ID check, then uvicorn. There is no number auto-config, because answer and hangup URLs are passed per call. |
 | `POST /outbound/call` | `outbound/server.py` | `CallManager.create_call()` builds the per-call prompt and greeting, then Plivo `calls.create` dials the number. |
 | Plivo answers (`/answer` or `/outbound/answer`) | `server.py` | Returns `<Stream bidirectional keepCallAlive>` XML that points Plivo at `/ws`. Call metadata travels in `?body=`. |
 | Each call (`/ws`) | `server.py` → `run_agent()` in `agent.py` | Accepts the WebSocket, reads Plivo's `start` event, then runs `DeepgramVoiceAgent.run()`. That opens a **new** Deepgram WebSocket for the call, sends Settings (inline block or reusable config UUID), sends `UpdatePrompt` + `InjectAgentMessage` on the reusable path, and runs the `plivo_rx` / `deepgram_rx` / `plivo_tx` tasks until the call ends. There is no Deepgram connection before a call arrives. |
@@ -445,7 +445,7 @@ Only the default row went through the full Plivo call suites. For any other comb
 
 ## Dependencies
 
-- Runtime: `fastapi`, `uvicorn[standard]`, `websockets>=15.0`, `plivo`, `python-dotenv`, `python-multipart`, `loguru`, `numpy`, `scipy`, `phonenumbers`. No torch, Silero, ONNX, OpenAI or Deepgram SDK.
+- Runtime: `fastapi`, `uvicorn[standard]`, `websockets>=15.0`, `plivo`, `httpx` (the reusable-config ID check at startup), `python-dotenv`, `python-multipart`, `loguru`, `numpy`, `scipy`, `phonenumbers`. No torch, Silero, ONNX, OpenAI or Deepgram SDK.
 - `observability` extra: `opentelemetry-api`, `opentelemetry-sdk`, `opentelemetry-exporter-otlp`, `opentelemetry-instrumentation-httpx`, `traceloop-sdk`.
 - `streaming` extra: `redis[hiredis]`.
 - `dev` group: `ruff`, `pre-commit`, `pytest`, `pytest-asyncio`, `httpx`, `faster-whisper`, `gtts`, `pydub`, `audioop-lts` (Python 3.13+).
@@ -541,7 +541,7 @@ A field in `Settings` is invalid. The most common cause is an `agent.language` o
 
 ### Reusable config: every call fails, or old models/prompt are used
 
-- The server does not check the UUID at startup; it only logs `Deepgram agent: reusable config <uuid>`. A deleted or mistyped UUID makes Deepgram reply to each call's `Settings` with an `Error` (`INTERNAL_SERVER_ERROR`, "resolving agent ID"), and the call ends without a greeting. List the project's configs (see [Creating a reusable config](#creating-a-reusable-config)) and fix the env var, or empty it to go back to inline.
+- **Server exits at startup with "… is not an agent config in the API key's Deepgram project"**: the UUID in `DEEPGRAM_INBOUND_AGENT_ID` / `DEEPGRAM_OUTBOUND_AGENT_ID` was deleted or mistyped. Without this check, Deepgram would reply to every call's `Settings` with an `Error` (`INTERNAL_SERVER_ERROR`, "resolving agent ID") and calls would end without a greeting. List the configs (see [Creating a reusable config](#creating-a-reusable-config)) and fix the env var, or empty it to go back to inline. If the log instead says `Could not verify … starting unverified`, the check couldn't run (network, or a key without `agent:read`), and a bad UUID would only show up on the first call.
 - Changes to `DEEPGRAM_*` model vars, `system_prompt.md` or `FUNCTION_DEFINITIONS` have no effect on this path, because the config was fixed when it was created. Create a new config, switch the UUID and restart.
 
 ### Silence on the call / no greeting

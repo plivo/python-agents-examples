@@ -31,7 +31,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 import plivo
@@ -1476,7 +1476,7 @@ class TestUnitInlineSettingsSnapshot:
 
 
 class TestUnitStartupLog:
-    """server.py logs which agent path is active, from agent.py constants, with no REST call."""
+    """server.py logs which agent path is active; the only network call is the ID check."""
 
     SERVERS = (
         ("inbound.server", "DEEPGRAM_INBOUND_AGENT_ID"),
@@ -1509,7 +1509,9 @@ class TestUnitStartupLog:
         assert "model env vars are not used" in line
 
     @pytest.mark.parametrize(("module", "var"), SERVERS)
-    def test_main_logs_the_path_without_network(self, monkeypatch, captured_messages, module, var):
+    def test_main_logs_the_path_and_only_checks_the_id(
+        self, monkeypatch, captured_messages, module, var
+    ):
         import importlib
         import socket
         import sys
@@ -1526,8 +1528,15 @@ class TestUnitStartupLog:
 
         monkeypatch.setattr(socket, "create_connection", no_network)
         monkeypatch.setattr(socket.socket, "connect", no_network)
+        # The reusable path's only network access is the fail-fast ID check (tested
+        # separately in TestUnitAgentIdStartupCheck); stub it so nothing else connects.
+        verified = []
+        monkeypatch.setattr(
+            server, "verify_deepgram_agent_id", lambda agent_id: verified.append(agent_id) or True
+        )
         server.main()
         assert started == [True]
+        assert verified == [SAVED_UUID]
         assert any(f"Deepgram agent: reusable config {SAVED_UUID}" in m for m in captured_messages)
 
 
@@ -1715,6 +1724,110 @@ class FakePlivoClient:
             raise plivo.exceptions.ValidationError(
                 "{'answer_url': ['Must be a valid url'], 'hangup_url': ['Must be a valid url']}"
             )
+
+
+class TestUnitAgentIdStartupCheck:
+    """Fail-fast check in server.py that a reusable agent config UUID exists."""
+
+    PROJECTS: ClassVar[dict] = {"projects": [{"project_id": "p1"}]}
+
+    @staticmethod
+    def _http_error(code: int):
+        request = httpx.Request("GET", "https://api.deepgram.com/v1/projects/p1/agents/u")
+        response = httpx.Response(code, request=request)
+        return httpx.HTTPStatusError("err", request=request, response=response)
+
+    def _fake_get(self, monkeypatch, server, routes):
+        calls = []
+
+        def fake(path):
+            calls.append(path)
+            result = routes(path)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        monkeypatch.setattr(server, "_deepgram_get", fake)
+        return calls
+
+    @pytest.mark.parametrize("module", ["inbound.server", "outbound.server"])
+    def test_found_in_the_keys_project(self, monkeypatch, module):
+        import importlib
+
+        server = importlib.import_module(module)
+        calls = self._fake_get(
+            monkeypatch,
+            server,
+            lambda p: self.PROJECTS if p == "/projects" else {"agent_uuid": "u"},
+        )
+        assert server.verify_deepgram_agent_id("u") is True
+        assert calls == ["/projects", "/projects/p1/agents/u"]
+
+    @pytest.mark.parametrize("module", ["inbound.server", "outbound.server"])
+    @pytest.mark.parametrize("code", [400, 404])
+    def test_missing_raises(self, monkeypatch, module, code):
+        import importlib
+
+        server = importlib.import_module(module)
+        self._fake_get(
+            monkeypatch,
+            server,
+            lambda p: self.PROJECTS if p == "/projects" else self._http_error(code),
+        )
+        with pytest.raises(server.AgentIdNotFound, match="API key's Deepgram project"):
+            server.verify_deepgram_agent_id("bogus")
+
+    @pytest.mark.parametrize("module", ["inbound.server", "outbound.server"])
+    def test_unverifiable_starts_anyway(self, monkeypatch, module):
+        import importlib
+
+        server = importlib.import_module(module)
+        # key without agent:read -> 403
+        self._fake_get(
+            monkeypatch,
+            server,
+            lambda p: self.PROJECTS if p == "/projects" else self._http_error(403),
+        )
+        assert server.verify_deepgram_agent_id("u") is False
+        # network down
+        self._fake_get(monkeypatch, server, lambda p: httpx.ConnectError("no route"))
+        assert server.verify_deepgram_agent_id("u") is False
+        # unexpected /projects response
+        self._fake_get(monkeypatch, server, lambda p: {"projects": []})
+        assert server.verify_deepgram_agent_id("u") is False
+
+    @pytest.mark.parametrize(
+        ("module", "id_var"),
+        [
+            ("inbound.server", "DEEPGRAM_INBOUND_AGENT_ID"),
+            ("outbound.server", "DEEPGRAM_OUTBOUND_AGENT_ID"),
+        ],
+    )
+    def test_main_exits_on_missing_id_and_skips_check_inline(self, monkeypatch, module, id_var):
+        import importlib
+        import sys
+
+        server = importlib.import_module(module)
+        started = []
+        monkeypatch.setattr(server.uvicorn, "run", lambda *a, **k: started.append(True))
+        monkeypatch.setattr(server, "PLIVO_PHONE_NUMBER", "")
+        monkeypatch.setattr(sys, "argv", [module])
+        checked = []
+
+        def missing(agent_id):
+            checked.append(agent_id)
+            raise server.AgentIdNotFound("nope")
+
+        monkeypatch.setattr(server, "verify_deepgram_agent_id", missing)
+
+        monkeypatch.setattr(server, id_var, "bogus-uuid")
+        with pytest.raises(SystemExit) as exc:
+            server.main()
+        assert exc.value.code == 1 and started == [] and checked == ["bogus-uuid"]
+
+        monkeypatch.setattr(server, id_var, "")  # inline path: no network check at all
+        server.main()
+        assert started == [True] and checked == ["bogus-uuid"]
 
 
 class TestUnitPlivoAutoConfig:

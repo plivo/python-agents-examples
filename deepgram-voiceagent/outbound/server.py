@@ -15,6 +15,7 @@ import time
 from collections.abc import AsyncIterator
 from datetime import datetime
 
+import httpx
 import plivo
 import uvicorn
 from dotenv import load_dotenv
@@ -24,6 +25,7 @@ from loguru import logger
 from plivo import plivoxml
 
 from outbound.agent import (
+    DEEPGRAM_API_KEY,
     DEEPGRAM_LISTEN_MODEL,
     DEEPGRAM_OUTBOUND_AGENT_ID,
     DEEPGRAM_SPEAK_MODEL,
@@ -595,6 +597,52 @@ def _start_tunnel() -> None:
     logger.info(f"Tunnel up: {url} -> http://localhost:{SERVER_PORT}")
 
 
+DEEPGRAM_API_BASE = "https://api.deepgram.com/v1"
+
+
+class AgentIdNotFound(RuntimeError):
+    """The reusable agent config UUID does not exist in the API key's project."""
+
+
+def _deepgram_get(path: str) -> dict:
+    resp = httpx.get(
+        f"{DEEPGRAM_API_BASE}{path}",
+        headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def verify_deepgram_agent_id(agent_id: str) -> bool:
+    """Fail-fast startup check: does the reusable agent config UUID exist?
+
+    A Deepgram API key belongs to one project, and agent configs are looked up per
+    project, so: GET /projects (the key's project), then GET its /agents/{uuid}.
+    Returns True if found. Raises AgentIdNotFound if it isn't (every call would fail at
+    connect). Returns False if it could not be verified (network error, key without the
+    agent:read scope); the caller starts anyway with a warning.
+    """
+    try:
+        project_id = _deepgram_get("/projects")["projects"][0]["project_id"]
+        _deepgram_get(f"/projects/{project_id}/agents/{agent_id}")
+        return True
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code in (400, 404):
+            raise AgentIdNotFound(
+                f"DEEPGRAM_OUTBOUND_AGENT_ID={agent_id} is not an agent config in the API key's "
+                "Deepgram project. Every call would fail at connect. Create one (README: "
+                f"'Choosing a path') or unset DEEPGRAM_OUTBOUND_AGENT_ID."
+            ) from e
+        error: Exception = e
+    except (httpx.HTTPError, ValueError, KeyError, IndexError) as e:
+        error = e
+    logger.warning(
+        f"Could not verify DEEPGRAM_OUTBOUND_AGENT_ID={agent_id} ({error}); starting unverified"
+    )
+    return False
+
+
 def describe_deepgram_agent() -> str:
     """One line naming the active agent path. Reads agent.py constants; no network calls."""
     if DEEPGRAM_OUTBOUND_AGENT_ID:
@@ -621,6 +669,13 @@ def main() -> None:
 
     logger.info(f"Starting Deepgram Voice Agent Outbound Agent on port {SERVER_PORT}")
     logger.info(describe_deepgram_agent())
+    if DEEPGRAM_OUTBOUND_AGENT_ID:
+        try:
+            if verify_deepgram_agent_id(DEEPGRAM_OUTBOUND_AGENT_ID):
+                logger.info(f"Verified reusable agent config {DEEPGRAM_OUTBOUND_AGENT_ID} exists")
+        except AgentIdNotFound as e:
+            logger.error(str(e))
+            raise SystemExit(1) from e
 
     if args.tunnel:
         _start_tunnel()
