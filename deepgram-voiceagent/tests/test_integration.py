@@ -2431,6 +2431,56 @@ class TestUnitReadyLine:
         assert any("no Ready line" in m for m in captured_messages)
 
 
+class TestUnitServerPorts:
+    """Inbound and outbound default to different ports so both can run at once.
+
+    SERVER_PORT is read at import time, so each case imports the module in a fresh
+    interpreter (no state leaks into other tests) with ``load_dotenv`` stubbed out so the
+    local ``.env`` can't override the env vars under test.
+    """
+
+    @staticmethod
+    def _port(module: str, **env_vars: str) -> int:
+        import subprocess
+        import sys
+
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("SERVER_PORT", "OUTBOUND_SERVER_PORT", "OTEL_EXPORTER_OTLP_ENDPOINT")
+        }
+        env.update(env_vars)
+        code = (
+            "import dotenv; dotenv.load_dotenv = lambda *a, **k: False\n"
+            f"import {module} as m; print(m.SERVER_PORT)"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=Path(__file__).parent.parent,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        return int(result.stdout.strip().splitlines()[-1])
+
+    def test_inbound_default_port(self):
+        assert self._port("inbound.server") == 8000
+
+    def test_inbound_reads_server_port(self):
+        assert self._port("inbound.server", SERVER_PORT="18123") == 18123
+
+    def test_outbound_default_port(self):
+        assert self._port("outbound.server") == 8001
+
+    def test_outbound_reads_outbound_server_port(self):
+        assert self._port("outbound.server", OUTBOUND_SERVER_PORT="18124") == 18124
+
+    def test_outbound_ignores_server_port(self):
+        assert self._port("outbound.server", SERVER_PORT="18125") == 8001
+
+
 class _NoThread:
     def start(self) -> None:
         pass

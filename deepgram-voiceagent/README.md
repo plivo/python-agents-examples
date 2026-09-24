@@ -62,14 +62,14 @@ uv run python -m inbound.server --tunnel
 
 What `--tunnel` does:
 
-1. Starts `cloudflared tunnel --url http://localhost:$SERVER_PORT`. The quick tunnel needs no Cloudflare account.
+1. Starts `cloudflared tunnel --url http://localhost:$SERVER_PORT` (inbound, default 8000; the outbound server uses `$OUTBOUND_SERVER_PORT`, default 8001). The quick tunnel needs no Cloudflare account.
 2. Uses the `https://<random>.trycloudflare.com` URL as `PUBLIC_URL`.
 3. Points your Plivo number at it, creating or updating the `Deepgram_VoiceAgent` Plivo application. Plivo only accepts a URL once it can resolve the hostname, so for a new tunnel the server retries in the background for up to 3 minutes. In testing this took about 70 s.
 4. Logs `Ready! Call +<number> to talk to the agent (Ctrl+C to stop)` once the server accepts connections and Plivo has accepted the URL.
 
 Call the number. Ctrl+C stops the server and the tunnel. The URL changes on every run and the number is re-pointed each time.
 
-For outbound calls, run `uv run python -m outbound.server --tunnel`. Once it accepts connections it logs `Ready!` with a ready-to-paste cURL for Plivo's Make Call API with this server's answer URL; see [Outbound Calls](#outbound-calls). In short:
+For outbound calls, run `uv run python -m outbound.server --tunnel`. It listens on port 8001, so it can run at the same time as the inbound server, each with its own tunnel URL. Once it accepts connections it logs `Ready!` with a ready-to-paste cURL for Plivo's Make Call API with this server's answer URL; see [Outbound Calls](#outbound-calls). In short:
 
 ```bash
 set -a && source .env && set +a   # PLIVO_AUTH_ID / PLIVO_AUTH_TOKEN in the shell
@@ -88,11 +88,20 @@ docker build -t deepgram-voiceagent .
 docker run --env-file .env -e PUBLIC_URL=https://your-host.example.com -p 8000:8000 deepgram-voiceagent
 ```
 
-The container listens on port 8000 and configures the Plivo number from `PUBLIC_URL` on startup. For outbound calls, append `uv run python -m outbound.server` to `docker run`, then place calls with Plivo's Make Call API using `answer_url=https://your-host.example.com/outbound/answer`. See [Deployment](#deployment) for suitable hosts.
+The container listens on port 8000 and configures the Plivo number from `PUBLIC_URL` on startup. For outbound calls, append `uv run python -m outbound.server` to `docker run` and publish port 8001 instead:
+
+```bash
+docker run --env-file .env -e PUBLIC_URL=https://your-outbound-host.example.com -p 8001:8001 deepgram-voiceagent \
+  uv run python -m outbound.server
+```
+
+Then place calls with Plivo's Make Call API using `answer_url=https://your-outbound-host.example.com/outbound/answer`. See [Deployment](#deployment) for suitable hosts.
 
 ### Other ways to expose the server
 
-Without `--tunnel`, any tunnel works. For example, run `ngrok http 8000`, set `PUBLIC_URL` to its HTTPS URL, then `uv run python -m inbound.server`.
+Without `--tunnel`, any tunnel works. For example, run `ngrok http 8000`, set `PUBLIC_URL` to its HTTPS URL, then `uv run python -m inbound.server`. For outbound, tunnel port 8001 (`ngrok http 8001`) instead.
+
+To run both servers at once behind fixed URLs, give each process its own `PUBLIC_URL` on the command line, e.g. `PUBLIC_URL=https://out.example.com uv run python -m outbound.server`. A variable set in the shell takes precedence over `.env`, because `load_dotenv()` does not override variables that are already set.
 
 ## Project Structure
 
@@ -168,7 +177,7 @@ Three concurrent asyncio tasks, following the canonical `FIRST_COMPLETED` patter
 |---|---|---|
 | Module import | `inbound/agent.py`, `outbound/agent.py` | `load_dotenv()`, read the `DEEPGRAM_*` config, load `system_prompt.md`, define `FUNCTION_DEFINITIONS`. No network calls. |
 | Server start: `uv run python -m inbound.server` | `inbound/server.py` → `main()` | Logging sinks (text/JSON/file/Redis) and optional OTel are set up when the module loads. Then `describe_deepgram_agent()` logs the active path, e.g. `Deepgram agent: inline (listen=flux-general-en, think=open_ai/gpt-4.1-mini, speak=aura-2-thalia-en)` or `Deepgram agent: reusable config <uuid> …`. On the reusable path, `verify_deepgram_agent_id()` looks the UUID up in the API key's Deepgram project (`GET /v1/projects`, then `/projects/{id}/agents/{uuid}`) and **exits with code 1 if it isn't found**; when found, it keeps the config's model names for trace attributes. It warns and starts anyway if it can't check (network error, key without `agent:read`). `check_webhook_auth_config()` then **exits with code 1 if `PLIVO_AUTH_TOKEN` is empty** (see [Webhook authentication](#webhook-authentication)). Then `configure_plivo_webhooks()` creates or updates the Plivo application and assigns `PLIVO_PHONE_NUMBER` when `PUBLIC_URL` is set (with `--tunnel`, in a background thread that retries until Plivo accepts the new URL), then uvicorn starts. `Ready! Call +N to talk to the agent (Ctrl+C to stop)` is logged once, when both the server accepts connections (a local TCP connect to `SERVER_PORT`; the lifespan hook runs before uvicorn binds) and the Plivo setup succeeded. No Ready line if the Plivo setup fails or is skipped. |
-| Server start: `uv run python -m outbound.server` | `outbound/server.py` → `main()` | Same agent-path log line, reusable-config ID check and webhook-auth check, then uvicorn. Once the server accepts connections it logs `Ready!` with a cURL for Plivo's Make Call API and this server's answer URL, ending with `(Ctrl+C to stop)`. There is no number auto-config, because you pass the answer and hangup URLs with each call. |
+| Server start: `uv run python -m outbound.server` | `outbound/server.py` → `main()` | Same agent-path log line, reusable-config ID check and webhook-auth check, then uvicorn on `OUTBOUND_SERVER_PORT` (default 8001). Once the server accepts connections it logs `Ready!` with a cURL for Plivo's Make Call API and this server's answer URL, ending with `(Ctrl+C to stop)`. There is no number auto-config, because you pass the answer and hangup URLs with each call. |
 | You place a call (Plivo Make Call API) | your shell / backend → Plivo | `POST https://api.plivo.com/v1/Account/{auth_id}/Call/` with `from`, `to`, `answer_url=<PUBLIC_URL>/outbound/answer?opening_reason=…&objective=…&context=…` and optional `hangup_url`. The server has no dial endpoint and keeps no call records. |
 | Plivo answers (`/answer` or `/outbound/answer`) | `server.py` | `verify_plivo_signature()` checks Plivo's V3 signature (403 if invalid). Then returns `<Stream bidirectional keepCallAlive>` XML that points Plivo at `/ws`. Call metadata (and, outbound, the `answer_url` call details) travels as base64 JSON in `?body=`, percent-encoded so a `+` in the base64 isn't read as a space. |
 | Each call (`/ws`) | `server.py` → `run_agent()` in `agent.py` | Accepts the WebSocket, reads Plivo's `start` event, then runs `DeepgramVoiceAgent.run()`. That opens a **new** Deepgram WebSocket for the call, sends Settings (inline block or reusable config UUID), sends `UpdatePrompt` + `InjectAgentMessage` on the reusable path, and runs the `plivo_rx` / `deepgram_rx` / `plivo_tx` tasks until the call ends. There is no Deepgram connection before a call arrives. |
@@ -518,7 +527,8 @@ session                  +    0ms  21983ms  gpt-4.1-mini, flux-general-en, aura-
 | `PLIVO_PHONE_NUMBER` | Plivo number (inbound auto-config; outbound: the `from` shown in the startup cURL) | Required |
 | `PLIVO_TEST_NUMBER` | Second Plivo number for live call tests | — |
 | `PUBLIC_URL` | Public HTTPS URL for webhooks; `https://` → `wss://` for the stream URL. Must match the URL Plivo calls: signatures are checked against it | Required |
-| `SERVER_PORT` | Server port | `8000` |
+| `SERVER_PORT` | Inbound server port | `8000` |
+| `OUTBOUND_SERVER_PORT` | Outbound server port (differs from inbound so both can run at once) | `8001` |
 | `DEFAULT_COUNTRY_CODE` | Default region for phone parsing | `US` |
 | `LOG_LEVEL` | Agent pipeline log verbosity (`verbose` / `normal` / `quiet`) | `normal` |
 | `LOG_FORMAT` | `json` replaces the stderr sink with serialized JSON | `text` |
@@ -536,7 +546,7 @@ docker run -v "$PWD/my_prompt.md:/app/inbound/system_prompt.md:ro" \
   -p 8000:8000 --env-file .env -e PUBLIC_URL=https://your-host.example.com deepgram-voiceagent
 
 docker run -v "$PWD/my_outbound_prompt.md:/app/outbound/system_prompt.md:ro" \
-  -p 8000:8000 --env-file .env -e PUBLIC_URL=https://your-host.example.com deepgram-voiceagent \
+  -p 8001:8001 --env-file .env -e PUBLIC_URL=https://your-host.example.com deepgram-voiceagent \
   uv run python -m outbound.server
 ```
 
@@ -639,12 +649,12 @@ docker build -t deepgram-voiceagent .
 # Inbound (default): configures the Plivo number from PUBLIC_URL on startup
 docker run -p 8000:8000 --env-file .env -e PUBLIC_URL=https://your-host.example.com deepgram-voiceagent
 
-# Outbound
-docker run -p 8000:8000 --env-file .env -e PUBLIC_URL=https://your-host.example.com deepgram-voiceagent \
+# Outbound (listens on 8001, OUTBOUND_SERVER_PORT)
+docker run -p 8001:8001 --env-file .env -e PUBLIC_URL=https://your-host.example.com deepgram-voiceagent \
   uv run python -m outbound.server
 ```
 
-The image is based on `python:3.12-slim` by default; pass `--build-arg BASE_IMAGE=...` to change it. It runs `uv sync --locked --no-install-project --no-dev --extra streaming`, so the Redis sink is available but the `observability` extra is not installed. The image does not include `cloudflared`, so `--tunnel` is for local runs only.
+The image exposes 8000 (inbound) and 8001 (outbound). It is based on `python:3.12-slim` by default; pass `--build-arg BASE_IMAGE=...` to change it. It runs `uv sync --locked --no-install-project --no-dev --extra streaming`, so the Redis sink is available but the `observability` extra is not installed. The image does not include `cloudflared`, so `--tunnel` is for local runs only.
 
 ## Troubleshooting
 

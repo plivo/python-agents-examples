@@ -24,8 +24,8 @@ COPY utils.py utils.py
 COPY inbound/ inbound/
 COPY outbound/ outbound/
 
-# Expose port
-EXPOSE 8000
+# Expose ports: 8000 inbound (SERVER_PORT), 8001 outbound (OUTBOUND_SERVER_PORT)
+EXPOSE 8000 8001
 
 # Run the server (default: inbound mode)
 # For outbound: CMD ["uv", "run", "python", "-m", "outbound.server"]

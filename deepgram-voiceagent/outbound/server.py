@@ -131,8 +131,9 @@ try:
 except ImportError:
     pass
 
-# Server configuration
-SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
+# Server configuration. Own port (not SERVER_PORT) so inbound and outbound can run side by
+# side, each with its own --tunnel.
+SERVER_PORT = int(os.getenv("OUTBOUND_SERVER_PORT", "8001"))
 PLIVO_AUTH_ID = os.getenv("PLIVO_AUTH_ID", "")
 PLIVO_AUTH_TOKEN = os.getenv("PLIVO_AUTH_TOKEN", "")
 PLIVO_PHONE_NUMBER = os.getenv("PLIVO_PHONE_NUMBER", "")
