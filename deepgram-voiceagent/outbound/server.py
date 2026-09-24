@@ -14,12 +14,9 @@ import atexit
 import base64
 import contextlib
 import functools
-import hashlib
-import hmac
 import json
 import os
 import sys
-import time
 from collections.abc import AsyncIterator
 from typing import NoReturn
 from urllib.parse import quote, urlencode
@@ -141,11 +138,7 @@ PLIVO_AUTH_TOKEN = os.getenv("PLIVO_AUTH_TOKEN", "")
 PLIVO_PHONE_NUMBER = os.getenv("PLIVO_PHONE_NUMBER", "")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "")
 
-# Webhook + /ws authentication: README "Webhook authentication". Always on.
-# Lifetime of the /ws token issued by the answer webhook. Plivo opens the stream within
-# seconds of receiving the answer XML; 5 minutes leaves slack for slow networks while a
-# leaked stream URL stops working soon after.
-WS_TOKEN_TTL_S = 300
+# Webhook authentication: README "Webhook authentication". Always on.
 
 _tunnel_proc = None  # cloudflared process started by --tunnel
 
@@ -241,20 +234,20 @@ app = FastAPI(
 
 
 # =============================================================================
-# Webhook authentication: Plivo V3 signatures + short-lived /ws tokens
+# Webhook authentication: Plivo V3 signatures
 # =============================================================================
 
 
 def check_webhook_auth_config() -> None:
-    """Startup: refuse to run without PLIVO_AUTH_TOKEN (the key for both checks)."""
+    """Startup: refuse to run without PLIVO_AUTH_TOKEN (the signature-check key)."""
     if not PLIVO_AUTH_TOKEN:
         logger.error(
-            "PLIVO_AUTH_TOKEN is empty: Plivo webhook signatures and /ws tokens cannot be "
-            "checked, so every Plivo request would be rejected. Set PLIVO_AUTH_TOKEN (a "
+            "PLIVO_AUTH_TOKEN is empty: Plivo webhook signatures cannot be checked, so "
+            "every Plivo request would be rejected. Set PLIVO_AUTH_TOKEN (a "
             "subaccount's token if the number belongs to a subaccount)."
         )
         raise SystemExit(1)
-    logger.info("Webhook auth: Plivo V3 signatures on webhooks, signed tokens on /ws")
+    logger.info("Webhook auth: Plivo V3 signatures on webhooks")
 
 
 def public_request_url(request: Request) -> str:
@@ -308,38 +301,14 @@ async def verify_plivo_signature(request: Request) -> None:
 PLIVO_SIGNED = [Depends(verify_plivo_signature)]
 
 
-def _ws_token_mac(body: str, expires: int) -> str:
-    message = f"deepgram-voiceagent/ws|{expires}|{body}".encode()
-    return hmac.new(PLIVO_AUTH_TOKEN.encode(), message, hashlib.sha256).hexdigest()
-
-
-def issue_ws_token(body: str, now: float | None = None) -> str:
-    """``<expiry>.<hmac>``: binds the /ws ``body`` to an expiry, keyed with PLIVO_AUTH_TOKEN."""
-    expires = int(time.time() if now is None else now) + WS_TOKEN_TTL_S
-    return f"{expires}.{_ws_token_mac(body, expires)}"
-
-
-def ws_token_error(body: str, token: str, now: float | None = None) -> str | None:
-    """Why ``token`` does not authorize ``body`` (None if it does)."""
-    if not token:
-        return "missing token"
-    expires_s, _, mac = token.partition(".")
-    if not expires_s.isdigit() or not mac:
-        return "malformed token"
-    if not PLIVO_AUTH_TOKEN:
-        return "PLIVO_AUTH_TOKEN not set"
-    if not hmac.compare_digest(mac, _ws_token_mac(body, int(expires_s))):
-        return "bad token (body or expiry tampered)"
-    if int(expires_s) < (time.time() if now is None else now):
-        return "expired token"
-    return None
-
-
 def stream_url(body_data: dict) -> str:
-    """wss:// URL for <Stream>: base64 call metadata plus its /ws token."""
+    """wss:// URL for <Stream> carrying the base64 call metadata.
+
+    ``body`` is percent-encoded: a raw ``+`` in base64 would reach /ws as a space.
+    """
     body_b64 = base64.b64encode(json.dumps(body_data).encode()).decode()
     ws_base = PUBLIC_URL.rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
-    return f"{ws_base}/ws?body={quote(body_b64, safe='')}&token={issue_ws_token(body_b64)}"
+    return f"{ws_base}/ws?body={quote(body_b64, safe='')}"
 
 
 # =============================================================================
@@ -457,18 +426,8 @@ async def outbound_hangup_webhook(request: Request) -> Response:
 async def websocket_endpoint(
     websocket: WebSocket,
     body: str = Query(default=""),
-    token: str = Query(default=""),
 ) -> None:
-    """WebSocket endpoint for bidirectional audio streaming with Plivo.
-
-    ``token`` (issued by the signed answer webhook) must match ``body`` and be unexpired;
-    otherwise the handshake is refused before any Deepgram connection.
-    """
-    error = ws_token_error(body, token)
-    if error:
-        logger.warning(f"Rejected /ws connection: {error}")
-        await websocket.close(code=1008)  # before accept(): handshake refused (403)
-        return
+    """WebSocket endpoint for bidirectional audio streaming with Plivo."""
     await websocket.accept()
 
     call_data = {}

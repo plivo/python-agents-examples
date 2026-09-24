@@ -46,7 +46,6 @@ from tests.helpers import (
     start_server,
     stop_server,
     stream_body,
-    stream_query,
     stream_url_from_xml,
 )
 from utils import (
@@ -67,7 +66,6 @@ PLIVO_AUTH_TOKEN = os.getenv("PLIVO_AUTH_TOKEN", "")
 PLIVO_PHONE_NUMBER = os.getenv("PLIVO_PHONE_NUMBER", "")
 
 TEST_PORT = 18001
-LOCAL_WS_URL = f"ws://localhost:{TEST_PORT}/ws"
 LOCAL_HTTP_URL = f"http://localhost:{TEST_PORT}"
 
 STREAM_ID = "stream-0001"
@@ -1338,7 +1336,6 @@ class TestUnitServerRoutes:
         assert 'keepCallAlive="true"' in xml
         assert "audio/x-mulaw;rate=8000" in xml
         assert "wss://example.ngrok.app/ws?body=" in xml
-        assert stream_query(xml)["token"]
         meta = stream_body(xml)
         assert meta["call_uuid"] == "uuid-1"
         assert meta["from"] == "+15551234567"
@@ -1494,7 +1491,7 @@ class TestUnitServerRoutes:
 
 
 # =============================================================================
-# UNIT TESTS - Webhook authentication (Plivo V3 signatures, /ws tokens)
+# UNIT TESTS - Webhook authentication (Plivo V3 signatures)
 # =============================================================================
 
 SERVER_MODULES = ["inbound.server", "outbound.server"]
@@ -1535,7 +1532,7 @@ class _RunAgentRecorder:
 
 
 class TestUnitWebhookAuth:
-    """Plivo V3 signature checks on webhooks and the signed /ws token."""
+    """Plivo V3 signature checks on webhooks; /ws takes the stream URL they issue."""
 
     @pytest.mark.parametrize(("module", "method", "path"), WEBHOOK_ROUTES)
     def test_every_webhook_accepts_signed_and_rejects_unsigned(
@@ -1687,10 +1684,10 @@ class TestUnitWebhookAuth:
         assert client.post("/answer", data=FORM, headers=headers).status_code == 403
         assert any("PUBLIC_URL not set" in m for m in captured_messages)
 
-    # --- /ws token ---------------------------------------------------------------
+    # --- /ws ----------------------------------------------------------------------
 
     @pytest.mark.parametrize("module", SERVER_MODULES)
-    def test_ws_with_issued_token_runs_agent(self, monkeypatch, module):
+    def test_ws_with_issued_stream_url_runs_agent(self, monkeypatch, module):
         from fastapi.testclient import TestClient
 
         server = _server(module, monkeypatch)
@@ -1703,83 +1700,6 @@ class TestUnitWebhookAuth:
             ws.send_text(json.dumps({"event": "start", "start": {"callId": "c-1"}}))
         assert len(recorder.calls) == 1
         assert recorder.calls[0]["from_number"] == FORM["From"]
-
-    def _assert_ws_rejected(self, server, monkeypatch, path, captured_messages, reason):
-        from fastapi.testclient import TestClient
-        from starlette.websockets import WebSocketDisconnect
-
-        recorder = _RunAgentRecorder()
-        monkeypatch.setattr(server, "run_agent", recorder)
-        with (
-            pytest.raises(WebSocketDisconnect) as exc,
-            TestClient(server.app).websocket_connect(path),
-        ):
-            pass
-        assert exc.value.code == 1008
-        assert recorder.calls == [], "no agent (and no Deepgram connection) may start"
-        assert any(f"Rejected /ws connection: {reason}" in m for m in captured_messages)
-
-    @pytest.mark.parametrize("module", SERVER_MODULES)
-    def test_ws_missing_token_rejected(self, monkeypatch, captured_messages, module):
-        server = _server(module, monkeypatch)
-        body = base64.b64encode(b'{"call_uuid": "c-1"}').decode()
-        self._assert_ws_rejected(
-            server, monkeypatch, f"/ws?body={body}", captured_messages, "missing token"
-        )
-
-    @pytest.mark.parametrize("module", SERVER_MODULES)
-    def test_ws_expired_token_rejected(self, monkeypatch, captured_messages, module):
-        from urllib.parse import quote
-
-        server = _server(module, monkeypatch)
-        body = base64.b64encode(b'{"call_uuid": "c-1"}').decode()
-        token = server.issue_ws_token(body, now=time.time() - server.WS_TOKEN_TTL_S - 1)
-        path = f"/ws?body={quote(body, safe='')}&token={token}"
-        self._assert_ws_rejected(server, monkeypatch, path, captured_messages, "expired token")
-
-    @pytest.mark.parametrize("module", SERVER_MODULES)
-    def test_ws_tampered_body_rejected(self, monkeypatch, captured_messages, module):
-        from fastapi.testclient import TestClient
-
-        server = _server(module, monkeypatch)
-        path = _answer_path(module)
-        answer = TestClient(server.app).post(
-            path, data=FORM, headers=signed("POST", PUBLIC, path, FORM)
-        )
-        query = stream_query(answer.text)
-        forged = base64.b64encode(json.dumps({"call_uuid": "evil"}).encode()).decode()
-        self._assert_ws_rejected(
-            server,
-            monkeypatch,
-            f"/ws?body={forged}&token={query['token']}",
-            captured_messages,
-            "bad token",
-        )
-
-    @pytest.mark.parametrize("module", SERVER_MODULES)
-    def test_ws_token_expiry_cannot_be_extended(self, monkeypatch, captured_messages, module):
-        from urllib.parse import quote
-
-        server = _server(module, monkeypatch)
-        body = base64.b64encode(b'{"call_uuid": "c-1"}').decode()
-        _expires, mac = server.issue_ws_token(body, now=time.time() - 3600).split(".")
-        path = f"/ws?body={quote(body, safe='')}&token={int(time.time()) + 3600}.{mac}"
-        self._assert_ws_rejected(server, monkeypatch, path, captured_messages, "bad token")
-
-    def test_ws_token_unit(self, monkeypatch):
-        from inbound import server
-
-        body = "eyJhIjogMX0="
-        token = server.issue_ws_token(body, now=1000)
-        assert token.startswith(f"{1000 + server.WS_TOKEN_TTL_S}.")
-        assert server.ws_token_error(body, token, now=1000 + server.WS_TOKEN_TTL_S) is None
-        assert server.ws_token_error(body, token, now=1001 + server.WS_TOKEN_TTL_S) == (
-            "expired token"
-        )
-        assert server.ws_token_error(body, "", now=1000) == "missing token"
-        assert server.ws_token_error(body, "abc", now=1000) == "malformed token"
-        monkeypatch.setattr(server, "PLIVO_AUTH_TOKEN", "another-account-token")
-        assert server.ws_token_error(body, token, now=1000).startswith("bad token")
 
     # --- Startup ------------------------------------------------------------------
 
@@ -2800,16 +2720,11 @@ class TestLocalIntegration:
             return await client.post(f"{LOCAL_HTTP_URL}/answer", data=form, headers=headers)
 
     async def _stream_url(self, call_uuid: str) -> str:
-        """The /ws URL (with its token) from a Plivo-signed answer webhook."""
+        """The /ws URL from a Plivo-signed answer webhook."""
         return stream_url_from_xml((await self._answer(call_uuid)).text)
 
     async def test_local_unsigned_answer_rejected(self, server_process):
         assert (await self._answer("test-unsigned", signed_request=False)).status_code == 403
-
-    async def test_local_ws_without_token_rejected(self, server_process):
-        with pytest.raises(websockets.exceptions.InvalidStatus):
-            async with websockets.connect(LOCAL_WS_URL, close_timeout=2):
-                pass
 
     async def test_local_answer_webhook(self, server_process):
         response = await self._answer("test123")

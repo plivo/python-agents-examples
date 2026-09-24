@@ -167,7 +167,7 @@ def stream_url_from_xml(xml: str) -> str:
 
 
 def stream_query(xml: str) -> dict[str, str]:
-    """Decoded query params (``body``, ``token``) of the <Stream> URL."""
+    """Decoded query params (``body``) of the <Stream> URL."""
     return {k: v[0] for k, v in parse_qs(urlsplit(stream_url_from_xml(xml)).query).items()}
 
 

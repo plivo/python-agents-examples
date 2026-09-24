@@ -63,7 +63,7 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 
 TEST_PORT = 18001
 TEST_HTTP_URL = f"http://localhost:{TEST_PORT}"
-# Plivo auth token the local server checks webhook signatures and /ws tokens with
+# Plivo auth token the local server checks webhook signatures with
 TEST_AUTH_TOKEN = "test-plivo-auth-token"
 LOG_PATH = server_log_path("e2e_live_server")
 
@@ -202,7 +202,7 @@ class SimulatedPlivo:
 
 @contextlib.asynccontextmanager
 async def plivo_call(call_uuid: str):
-    # Answer webhook signed as Plivo signs it; its <Stream> URL carries the /ws token
+    # Answer webhook signed as Plivo signs it; /ws is opened at its <Stream> URL
     answer = await asyncio.to_thread(
         signed_webhook,
         "POST",
@@ -232,7 +232,7 @@ def server_process(request):
     ``saved`` creates a reusable agent config first and always deletes it afterwards.
     """
     # No PLIVO_AUTH_ID: end_call must not try a REST hangup of a fake call. Webhook auth
-    # uses a test token (answer webhooks are signed, /ws needs the issued token).
+    # uses a test token (answer webhooks are signed like Plivo's).
     env = {
         "PLIVO_AUTH_ID": "",
         "PLIVO_AUTH_TOKEN": TEST_AUTH_TOKEN,
