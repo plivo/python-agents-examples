@@ -232,12 +232,11 @@ def server_process(request):
     ``saved`` creates a reusable agent config first and always deletes it afterwards.
     """
     # No PLIVO_AUTH_ID: end_call must not try a REST hangup of a fake call. Webhook auth
-    # stays on with a test token (answer webhooks are signed, /ws needs the issued token).
+    # uses a test token (answer webhooks are signed, /ws needs the issued token).
     env = {
         "PLIVO_AUTH_ID": "",
         "PLIVO_AUTH_TOKEN": TEST_AUTH_TOKEN,
         "PLIVO_PHONE_NUMBER": "",
-        "PLIVO_WEBHOOK_AUTH": "on",
         "PUBLIC_URL": TEST_HTTP_URL,
     }
     env["DEEPGRAM_INBOUND_AGENT_ID"] = ""

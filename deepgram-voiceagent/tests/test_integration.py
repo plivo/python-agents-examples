@@ -157,14 +157,13 @@ class FakeDeepgramWS:
 
 
 @pytest.fixture(autouse=True)
-def webhook_auth_on(monkeypatch):
+def plivo_test_auth_token(monkeypatch):
     """Both servers check webhook signatures and /ws tokens with TEST_AUTH_TOKEN."""
     from inbound import server as inbound_server
     from outbound import server as outbound_server
 
     for server in (inbound_server, outbound_server):
         monkeypatch.setattr(server, "PLIVO_AUTH_TOKEN", TEST_AUTH_TOKEN)
-        monkeypatch.setattr(server, "PLIVO_WEBHOOK_AUTH", "on")
 
 
 def signed(method: str, public_url: str, path: str, data: dict | None = None) -> dict[str, str]:
@@ -1782,31 +1781,7 @@ class TestUnitWebhookAuth:
         monkeypatch.setattr(server, "PLIVO_AUTH_TOKEN", "another-account-token")
         assert server.ws_token_error(body, token, now=1000).startswith("bad token")
 
-    # --- PLIVO_WEBHOOK_AUTH switch and startup -------------------------------------
-
-    @pytest.mark.parametrize("module", SERVER_MODULES)
-    def test_switch_off_skips_both_checks(self, monkeypatch, module):
-        from fastapi.testclient import TestClient
-
-        server = _server(module, monkeypatch)
-        monkeypatch.setattr(server, "PLIVO_WEBHOOK_AUTH", "off")
-        recorder = _RunAgentRecorder()
-        monkeypatch.setattr(server, "run_agent", recorder)
-        client = TestClient(server.app)
-        answer = client.post(_answer_path(module), data=FORM)  # unsigned
-        assert answer.status_code == 200
-        assert "token" not in stream_query(answer.text)
-        with client.websocket_connect(ws_path(answer.text)) as ws:
-            ws.send_text(json.dumps({"event": "start", "start": {"callId": "c-1"}}))
-        assert len(recorder.calls) == 1
-
-    @pytest.mark.parametrize("module", SERVER_MODULES)
-    def test_switch_off_warns_at_startup(self, monkeypatch, captured_messages, module):
-        server = _server(module, monkeypatch)
-        monkeypatch.setattr(server, "PLIVO_WEBHOOK_AUTH", "off")
-        monkeypatch.setattr(server, "PLIVO_AUTH_TOKEN", "")
-        server.check_webhook_auth_config()  # no SystemExit even without a token
-        assert any("PLIVO_WEBHOOK_AUTH=off" in m and "NOT checked" in m for m in captured_messages)
+    # --- Startup ------------------------------------------------------------------
 
     @pytest.mark.parametrize("module", SERVER_MODULES)
     def test_refuses_to_start_without_auth_token(self, monkeypatch, captured_messages, module):
@@ -1822,13 +1797,6 @@ class TestUnitWebhookAuth:
         assert exc.value.code == 1
         assert started == []
         assert any("PLIVO_AUTH_TOKEN is empty" in m for m in captured_messages)
-
-    @pytest.mark.parametrize("value", ["on", "", "yes", "OFFF"])
-    def test_anything_but_off_keeps_auth_on(self, monkeypatch, value):
-        from inbound import server
-
-        monkeypatch.setattr(server, "PLIVO_WEBHOOK_AUTH", value)
-        assert server.webhook_auth_enabled() is True
 
 
 # =============================================================================
@@ -2803,7 +2771,7 @@ class TestLocalIntegration:
         """Start the inbound server as a subprocess (SIGTERM -> wait(5) -> SIGKILL)."""
         log_path = server_log_path("integration_local_server")
         # No PLIVO_AUTH_ID: the local server must never touch the Plivo REST API. Webhook
-        # auth stays on, keyed with a test token; requests are signed like Plivo's.
+        # auth is keyed with a test token; requests are signed like Plivo's.
         proc = start_server(
             "inbound.server",
             TEST_PORT,
@@ -2812,7 +2780,6 @@ class TestLocalIntegration:
                 "PLIVO_AUTH_ID": "",
                 "PLIVO_AUTH_TOKEN": TEST_AUTH_TOKEN,
                 "PLIVO_PHONE_NUMBER": "",
-                "PLIVO_WEBHOOK_AUTH": "on",
                 "PUBLIC_URL": LOCAL_HTTP_URL,
             },
         )

@@ -205,7 +205,7 @@ For framework examples: no VAD in utils (framework handles it).
 New examples authenticate everything Plivo reaches (reference: `deepgram-voiceagent/`, README "Webhook authentication"):
 - **Plivo HTTP webhooks** (answer, hangup, fallback, …): verify the V3 signature (`X-Plivo-Signature-V3` + `-Nonce`) with `plivo.utils.validate_v3_signature`, keyed with `PLIVO_AUTH_TOKEN`, via a FastAPI dependency in `server.py`. Rebuild the signed URL as `PUBLIC_URL` + request path + raw query string (never `request.url`: behind a tunnel it is `http://localhost…`), read at request time so `--tunnel` works. Signed params are the form fields for POST and the query string for GET. Failure: 403, plus a warning with the path and reason, never the signature or token.
 - **`/ws`**: the verified answer webhook appends a short-lived HMAC token (`<expiry>.<hmac(body, expiry)>`, keyed with `PLIVO_AUTH_TOKEN`) to the stream URL. `/ws` checks it (constant-time, unexpired, body untampered) before `accept()` and before any AI-provider connection. Don't rely on Plivo signing the WebSocket handshake.
-- **On by default**: `PLIVO_WEBHOOK_AUTH=off` disables both checks and logs a startup warning. With auth on and an empty `PLIVO_AUTH_TOKEN`, refuse to start. Tests sign requests the way Plivo does, instead of turning auth off.
+- **Always on**: no env switch disables either check. With an empty `PLIVO_AUTH_TOKEN`, refuse to start. Tests use a dummy `PLIVO_AUTH_TOKEN` and sign requests the way Plivo does.
 
 ## Asyncio Patterns (Native)
 

@@ -141,9 +141,7 @@ PLIVO_AUTH_TOKEN = os.getenv("PLIVO_AUTH_TOKEN", "")
 PLIVO_PHONE_NUMBER = os.getenv("PLIVO_PHONE_NUMBER", "")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "")
 
-# Webhook + /ws authentication (README: "Webhook authentication"). "off" disables both
-# checks for local experiments; any other value (default "on") keeps them on.
-PLIVO_WEBHOOK_AUTH = os.getenv("PLIVO_WEBHOOK_AUTH", "on").strip().lower()
+# Webhook + /ws authentication: README "Webhook authentication". Always on.
 # Lifetime of the /ws token issued by the answer webhook. Plivo opens the stream within
 # seconds of receiving the answer XML; 5 minutes leaves slack for slow networks while a
 # leaked stream URL stops working soon after.
@@ -247,28 +245,16 @@ app = FastAPI(
 # =============================================================================
 
 
-def webhook_auth_enabled() -> bool:
-    """Checks are on unless PLIVO_WEBHOOK_AUTH is exactly "off"."""
-    return PLIVO_WEBHOOK_AUTH != "off"
-
-
 def check_webhook_auth_config() -> None:
-    """Startup: refuse to run with auth on but no key; warn loudly when auth is off."""
-    if not webhook_auth_enabled():
-        logger.warning(
-            "PLIVO_WEBHOOK_AUTH=off: Plivo webhook signatures and /ws tokens are NOT checked. "
-            "Anyone who can reach this server can fake webhooks and open /ws (Deepgram usage "
-            "on your key). Use only for local experiments."
-        )
-        return
+    """Startup: refuse to run without PLIVO_AUTH_TOKEN (the key for both checks)."""
     if not PLIVO_AUTH_TOKEN:
         logger.error(
-            "PLIVO_WEBHOOK_AUTH is on but PLIVO_AUTH_TOKEN is empty: Plivo webhook signatures "
-            "and /ws tokens cannot be checked. Set PLIVO_AUTH_TOKEN (or PLIVO_WEBHOOK_AUTH=off "
-            "for local experiments only)."
+            "PLIVO_AUTH_TOKEN is empty: Plivo webhook signatures and /ws tokens cannot be "
+            "checked, so every Plivo request would be rejected. Set PLIVO_AUTH_TOKEN (a "
+            "subaccount's token if the number belongs to a subaccount)."
         )
         raise SystemExit(1)
-    logger.info("Webhook auth on: Plivo V3 signatures on webhooks, signed tokens on /ws")
+    logger.info("Webhook auth: Plivo V3 signatures on webhooks, signed tokens on /ws")
 
 
 def public_request_url(request: Request) -> str:
@@ -295,8 +281,6 @@ async def verify_plivo_signature(request: Request) -> None:
     POST: the form fields are the signed params (the URL's query string is part of the
     signed URL). GET: Plivo's params are in the query string, so the URL carries them.
     """
-    if not webhook_auth_enabled():
-        return
     signature = request.headers.get("X-Plivo-Signature-V3", "")
     nonce = request.headers.get("X-Plivo-Signature-V3-Nonce", "")
     if not signature or not nonce:
@@ -352,13 +336,10 @@ def ws_token_error(body: str, token: str, now: float | None = None) -> str | Non
 
 
 def stream_url(body_data: dict) -> str:
-    """wss:// URL for <Stream>: base64 call metadata plus, with auth on, its /ws token."""
+    """wss:// URL for <Stream>: base64 call metadata plus its /ws token."""
     body_b64 = base64.b64encode(json.dumps(body_data).encode()).decode()
     ws_base = PUBLIC_URL.rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
-    url = f"{ws_base}/ws?body={quote(body_b64, safe='')}"
-    if webhook_auth_enabled():
-        url += f"&token={issue_ws_token(body_b64)}"
-    return url
+    return f"{ws_base}/ws?body={quote(body_b64, safe='')}&token={issue_ws_token(body_b64)}"
 
 
 # =============================================================================
@@ -480,15 +461,14 @@ async def websocket_endpoint(
 ) -> None:
     """WebSocket endpoint for bidirectional audio streaming with Plivo.
 
-    With auth on, ``token`` (issued by the signed answer webhook) must match ``body`` and
-    be unexpired; otherwise the handshake is refused before any Deepgram connection.
+    ``token`` (issued by the signed answer webhook) must match ``body`` and be unexpired;
+    otherwise the handshake is refused before any Deepgram connection.
     """
-    if webhook_auth_enabled():
-        error = ws_token_error(body, token)
-        if error:
-            logger.warning(f"Rejected /ws connection: {error}")
-            await websocket.close(code=1008)  # before accept(): handshake refused (403)
-            return
+    error = ws_token_error(body, token)
+    if error:
+        logger.warning(f"Rejected /ws connection: {error}")
+        await websocket.close(code=1008)  # before accept(): handshake refused (403)
+        return
     await websocket.accept()
 
     call_data = {}
