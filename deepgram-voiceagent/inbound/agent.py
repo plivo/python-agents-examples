@@ -65,18 +65,22 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 try:
     from opentelemetry import trace as _otel_trace
+    from opentelemetry.trace import Status as _Status
+    from opentelemetry.trace import StatusCode as _StatusCode
 
     _tracer = _otel_trace.get_tracer("voice-agent")
 except ImportError:
     _otel_trace = None  # type: ignore[assignment]
+    _Status = _StatusCode = None  # type: ignore[assignment,misc]
     _tracer = None  # type: ignore[assignment]
 
 
 def _traced(span_name: str):
     """Decorator that wraps an async method in an OTel span.
 
-    Creates a span with call_id, records exceptions automatically,
-    and ends the span on exit. No-op when opentelemetry is not installed.
+    Creates a span with call_id, records exceptions (a task cancelled at teardown is
+    marked ``cancelled``, not an error), and ends the span on exit. No-op when
+    opentelemetry is not installed.
     """
 
     def decorator(fn):
@@ -84,12 +88,259 @@ def _traced(span_name: str):
         async def wrapper(self, *args, **kwargs):
             if not _tracer:
                 return await fn(self, *args, **kwargs)
-            with _tracer.start_as_current_span(span_name, attributes={"call_id": self.call_id[:8]}):
-                return await fn(self, *args, **kwargs)
+            with _tracer.start_as_current_span(
+                span_name,
+                attributes={"call_id": self.parent_call_id},
+                record_exception=False,
+                set_status_on_exception=False,
+            ) as span:
+                try:
+                    return await fn(self, *args, **kwargs)
+                except asyncio.CancelledError:
+                    span.set_attribute("cancelled", True)
+                    raise
+                except Exception as exc:
+                    span.record_exception(exc)
+                    span.set_status(_Status(_StatusCode.ERROR, str(exc)))
+                    raise
 
         return wrapper
 
     return decorator
+
+
+TRACE_TEXT_MAX = 512  # Truncation for transcript/tool text in span attributes
+EOT_MATCH_WINDOW_NS = 5_000_000_000  # An EndOfTurn this recent starts the next user turn
+STT_MATCH_WINDOW_NS = 2_000_000_000  # stt_latency this recent before EOT -> the turn's stt
+SAVED_CONFIG_MODEL = "saved-config"  # Model label when a reusable config's models are unknown
+# LatencyReport keys (seconds) that become child spans of the turn. One llm span per LLM
+# pass: ttt_tool_latency (pass that emitted a tool call) and ttt_text_latency (pass that
+# produced speech); ttt_token_latency is used only when ttt_text_latency is absent.
+_LATENCY_SPAN_KEYS = ("ttt_text_latency", "ttt_tool_latency", "ttt_token_latency", "tts_latency")
+
+
+def _truncate(value: Any, limit: int = TRACE_TEXT_MAX) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, default=str)
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+class _CallTrace:
+    """Per-call OTel spans below ``session``: turn -> stt / llm / tts / tool.<name> / playback.
+
+    Spans are started with explicit parents instead of the current context, because one
+    turn spans several tasks (plivo_rx injects text, deepgram_rx handles Deepgram events,
+    plivo_tx sends the audio). Deepgram reports durations only (``LatencyReport``, in
+    seconds), so stt/llm/tts spans are back-computed: end = report arrival, start = end -
+    duration. Every method is a no-op when opentelemetry is not installed.
+    """
+
+    def __init__(self, call_id: str) -> None:
+        self.tracer = _tracer
+        self.call_id = call_id
+        self.session: Any = None
+        self.llm_attributes: dict[str, Any] = {}
+        self.turn: Any = None
+        self.turn_start_ns = 0
+        self.turn_awaiting_eot = False  # user turn started without an EndOfTurn yet
+        self.playback: Any = None
+        self.playback_started = False
+        self.playback_chunks0 = 0
+        self.pending_eot: tuple[str, int] | None = None  # (trigger, time_ns)
+        self.last_stt: tuple[float, int] | None = None  # (seconds, arrival_ns)
+        self.samples: list[tuple[str, float, int]] = []  # (key, seconds, arrival_ns)
+
+    @property
+    def enabled(self) -> bool:
+        return self.tracer is not None
+
+    def _context(self, parent: Any) -> Any:
+        return _otel_trace.set_span_in_context(parent) if parent is not None else None
+
+    def _span(self, name: str, parent: Any, attributes: dict[str, Any], **kwargs: Any) -> Any:
+        return self.tracer.start_span(
+            name, context=self._context(parent), attributes=attributes, **kwargs
+        )
+
+    # -- session --
+
+    def bind_session(self, attributes: dict[str, Any], llm_attributes: dict[str, Any]) -> None:
+        """Attach to the ``session`` span that ``@_traced("session")`` made current."""
+        if not self.enabled:
+            return
+        self.session = _otel_trace.get_current_span()
+        self.session.set_attributes(attributes)
+        self.llm_attributes = llm_attributes
+
+    def set_session_attribute(self, key: str, value: Any) -> None:
+        if self.enabled and self.session is not None and value is not None:
+            self.session.set_attribute(key, value)
+
+    def event(self, name: str, attributes: dict[str, Any]) -> None:
+        """Span event on the current turn, falling back to the session."""
+        target = self.turn if self.turn is not None else self.session
+        if self.enabled and target is not None:
+            target.add_event(name, attributes)
+
+    def error(self, code: str, description: str) -> None:
+        """Deepgram ``Error``: event on turn + session, session status ERROR."""
+        if not self.enabled or self.session is None:
+            return
+        attributes = {"code": code, "description": description}
+        if self.turn is not None:
+            self.turn.add_event("deepgram.error", attributes)
+        self.session.add_event("deepgram.error", attributes)
+        self.session.set_status(_Status(_StatusCode.ERROR, f"{code} {description}".strip()))
+
+    def exception(self, exc: BaseException) -> None:
+        if self.enabled and self.session is not None:
+            self.session.record_exception(exc)
+            self.session.set_status(_Status(_StatusCode.ERROR, str(exc)))
+
+    # -- turn --
+
+    def start_turn(self, turn: int, user_text: str, source: str) -> None:
+        """Open a ``turn`` span. ``source``: greeting | audio | text (InjectUserMessage)."""
+        if not self.enabled:
+            return
+        if self.turn is not None:
+            self._finish_turn({"turn.completed": False, "turn.ended_by": "next_turn"})
+        now = time.time_ns()
+        start = now
+        attributes: dict[str, Any] = {
+            "turn": turn,
+            "call_id": self.call_id,
+            "turn.source": source,
+            "user_text": _truncate(user_text),
+        }
+        pending, self.pending_eot = self.pending_eot, None
+        if source != "greeting" and pending and now - pending[1] <= EOT_MATCH_WINDOW_NS:
+            attributes["eot.trigger"] = pending[0]
+            start = pending[1]
+        self.turn = self._span("turn", self.session, attributes, start_time=start)
+        self.turn_start_ns = start
+        self.turn_awaiting_eot = source != "greeting" and "eot.trigger" not in attributes
+        self.playback = None
+        self.playback_started = False
+        self.samples = [s for s in self.samples if s[2] >= start]
+        stt = self.last_stt
+        if source == "audio" and stt and start - STT_MATCH_WINDOW_NS <= stt[1] <= now:
+            self._reported_span("stt", "stt_latency", stt[0], stt[1])
+
+    def on_end_of_turn(self, trigger: str) -> None:
+        """Deepgram ``EndOfTurn``: label the open user turn, or start time of the next one."""
+        if not self.enabled:
+            return
+        if self.turn is not None and self.turn_awaiting_eot:
+            self.turn.set_attribute("eot.trigger", trigger)
+            self.turn_awaiting_eot = False
+        else:
+            self.pending_eot = (trigger, time.time_ns())
+
+    def on_latency(self, key: str, seconds: float) -> None:
+        if not self.enabled:
+            return
+        if key == "stt_latency":  # arrives ~every audio frame; keep only the latest
+            self.last_stt = (seconds, time.time_ns())
+        elif key in _LATENCY_SPAN_KEYS:
+            self.samples.append((key, seconds, time.time_ns()))
+
+    def _reported_span(self, name: str, key: str, seconds: float, arrival_ns: int) -> None:
+        attributes: dict[str, Any] = {
+            "call_id": self.call_id,
+            "deepgram.timing": "reported_duration",
+            "deepgram.metric": key,
+            "deepgram.latency_ms": round(seconds * 1000),
+        }
+        if name == "llm":
+            attributes.update(self.llm_attributes)
+        span = self._span(name, self.turn, attributes, start_time=arrival_ns - round(seconds * 1e9))
+        span.end(end_time=arrival_ns)
+
+    def end_turn(self, attributes: dict[str, Any], barge_in: bool, tx_chunks: int) -> None:
+        """``turn_complete`` was emitted: close the playback span and the turn."""
+        if not self.enabled or self.turn is None:
+            return
+        self._finish_turn(
+            {**attributes, "turn.completed": True}, interrupted=barge_in, tx_chunks=tx_chunks
+        )
+
+    def _finish_turn(
+        self, attributes: dict[str, Any], interrupted: bool = False, tx_chunks: int | None = None
+    ) -> None:
+        keys = {s[0] for s in self.samples}
+        for key, seconds, arrival in self.samples:
+            if key == "tts_latency":
+                self._reported_span("tts", key, seconds, arrival)
+            elif key != "ttt_token_latency" or "ttt_text_latency" not in keys:
+                self._reported_span("llm", key, seconds, arrival)
+        self.samples = []
+        self.end_playback(interrupted, attributes.get("playback_ms"), tx_chunks)
+        self.turn.set_attributes({k: v for k, v in attributes.items() if v is not None})
+        self.turn.end()
+        self.turn = None
+        self.turn_awaiting_eot = False
+
+    # -- playback --
+
+    def on_play_audio(self, tx_chunks: int) -> None:
+        """First playAudio of the turn opens ``playback`` (until playedStream / barge-in)."""
+        if not self.enabled or self.turn is None or self.playback_started:
+            return
+        self.playback_started = True
+        self.turn_awaiting_eot = False  # a later EndOfTurn belongs to the next turn
+        self.playback_chunks0 = tx_chunks
+        self.playback = self._span("playback", self.turn, {"call_id": self.call_id})
+
+    def end_playback(
+        self, interrupted: bool, playback_ms: int | None, tx_chunks: int | None
+    ) -> None:
+        if self.playback is None:
+            return
+        self.playback.set_attribute("interrupted", interrupted)
+        if playback_ms is not None:
+            self.playback.set_attribute("playback_ms", playback_ms)
+        if tx_chunks is not None:
+            self.playback.set_attribute("plivo.tx_chunks", tx_chunks - self.playback_chunks0)
+        self.playback.end()
+        self.playback = None
+
+    # -- tools --
+
+    def start_tool(self, name: str, fn_id: str, arguments: Any) -> Any:
+        if not self.enabled:
+            return None
+        parent = self.turn if self.turn is not None else self.session
+        return self._span(
+            f"tool.{name}",
+            parent,
+            {
+                "call_id": self.call_id,
+                "tool.name": name,
+                "tool.call_id": fn_id,
+                "tool.arguments": _truncate(arguments),
+            },
+        )
+
+    @staticmethod
+    def end_tool(span: Any, status: str, result: Any = None) -> None:
+        if span is None:
+            return
+        span.set_attribute("tool.status", status)
+        if result is not None:
+            span.set_attribute("tool.result", _truncate(result))
+        if status in ("error", "timeout", "cancelled"):
+            span.set_status(_Status(_StatusCode.ERROR, status))
+        span.end()
+
+    # -- teardown --
+
+    def close(self) -> None:
+        """Session teardown: end any open playback/turn so no span leaks."""
+        if not self.enabled or self.turn is None:
+            return
+        self._finish_turn(
+            {"turn.completed": False, "turn.ended_by": "session_end"}, interrupted=True
+        )
 
 
 # =============================================================================
@@ -379,6 +630,7 @@ class DeepgramVoiceAgent:
         sip_headers: dict[str, str] | None = None,
         hangup_callback: Callable[[], Awaitable[None]] | None = None,
         agent_config_id: str | None = None,
+        saved_agent_models: dict[str, str] | None = None,
     ):
         self.websocket = websocket
         self.call_id = call_id
@@ -394,6 +646,9 @@ class DeepgramVoiceAgent:
         self.agent_config_id = (
             DEEPGRAM_INBOUND_AGENT_ID if agent_config_id is None else agent_config_id
         )
+        # Reusable config's models, resolved by server.py at startup (trace attributes only)
+        self.saved_agent_models = saved_agent_models or {}
+        self._trace = _CallTrace(self.parent_call_id)
 
         # Connection + handshake
         self._running = False
@@ -580,6 +835,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
             f"[{self.call_id[:8]}] [  0.00s] [session] "
             f"call answered (sip_headers={self.sip_headers})"
         )
+        self._trace.bind_session(*self._trace_attributes())
 
         try:
             async with websockets.connect(
@@ -593,9 +849,38 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                 await self._run_streaming_tasks(dg_ws)
         except Exception as e:
             self._loge("session", f"ERROR: {e}")
+            self._trace.exception(e)
         finally:
             self._running = False
+            self._trace.close()
             self._emit_session_end()
+
+    def _trace_attributes(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """(session attributes, llm attributes). A reusable config's models come from
+        server.py's startup lookup, else ``saved-config`` (no per-call network calls)."""
+        if self.agent_config_id:
+            models = self.saved_agent_models
+            listen = models.get("listen_model", SAVED_CONFIG_MODEL)
+            think_provider = models.get("think_provider", SAVED_CONFIG_MODEL)
+            think_model = models.get("think_model", SAVED_CONFIG_MODEL)
+            speak = models.get("speak_model", SAVED_CONFIG_MODEL)
+        else:
+            listen, speak = DEEPGRAM_LISTEN_MODEL, DEEPGRAM_SPEAK_MODEL
+            think_provider, think_model = DEEPGRAM_THINK_PROVIDER, DEEPGRAM_THINK_MODEL
+        llm = {
+            "gen_ai.system": "deepgram",
+            "gen_ai.request.model": think_model,
+            "deepgram.think.provider": think_provider,
+        }
+        session = {
+            **llm,
+            "call_id": self.parent_call_id,
+            "leg_call_id": self.call_id,
+            "deepgram.listen.model": listen,
+            "deepgram.speak.model": speak,
+            "deepgram.agent_config": self.agent_config_id or "inline",
+        }
+        return session, llm
 
     def _settings_mode(self) -> str:
         if self.agent_config_id:
@@ -646,6 +931,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                 etype = evt.get("type")
                 if etype == "Welcome":
                     self._request_id = evt.get("request_id")
+                    self._trace.set_session_attribute("deepgram.request_id", self._request_id)
                     self._log("deepgram", f"Welcome (request_id={self._request_id})")
                     if not settings_sent:
                         await dg_ws.send(json.dumps(self._build_settings()))
@@ -655,6 +941,10 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                 elif etype == "SettingsApplied":
                     break
                 elif etype == "Error":
+                    self._trace.error(
+                        str(evt.get("code", "")),
+                        str(evt.get("description") or evt.get("message", "")),
+                    )
                     raise RuntimeError(
                         f"Deepgram Error during handshake: "
                         f"{evt.get('code')} {evt.get('description') or evt.get('message')}"
@@ -667,6 +957,8 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                 f"(settings_sent={settings_sent})"
             ) from e
 
+        if self._turn_count == 0 and self.initial_message:
+            self._trace.start_turn(1, "", source="greeting")  # turn 1 = the greeting
         if self.agent_config_id:
             await self._personalize_saved_session(dg_ws)
 
@@ -694,6 +986,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
 
     # -- plivo_rx --
 
+    @_traced("plivo_rx")
     async def _receive_from_plivo(self) -> None:
         """Receive Plivo events: forward audio to Deepgram, handle text/checkpoint acks."""
         media_count = 0
@@ -777,7 +1070,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
         if self._is_playing:
             await self._on_user_started_speaking()
         self._last_injected_text = text
-        self._start_user_turn(text)
+        self._start_user_turn(text, source="text")
         if self._dg_ws is None:
             return
         await self._dg_ws.send(json.dumps({"type": "InjectUserMessage", "content": text}))
@@ -785,6 +1078,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
 
     # -- deepgram_rx --
 
+    @_traced("deepgram_rx")
     async def _receive_from_deepgram(self, dg_ws: Any) -> None:
         """Handshake, then dispatch Deepgram events and queue agent audio."""
         await self._handshake(dg_ws)
@@ -810,6 +1104,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
 
         if etype == "Welcome":
             self._request_id = evt.get("request_id")
+            self._trace.set_session_attribute("deepgram.request_id", self._request_id)
         elif etype == "SettingsApplied":
             self._settings_applied.set()
         elif etype == "ConversationText":
@@ -841,6 +1136,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
         elif etype == "EndOfTurn":
             # Flux end-of-turn (or "manual" after InjectUserMessage): a new response follows
             self._drop_agent_audio = False
+            self._trace.on_end_of_turn(str(evt.get("trigger") or "unknown"))
             self._logv("deepgram", f"EndOfTurn (trigger={evt.get('trigger')})")
         elif etype == "LatencyReport":
             self._on_latency_report(evt)
@@ -857,10 +1153,20 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                 f"[{self.call_id[:8]}] [deepgram] Warning: "
                 f"{evt.get('code', '')} {evt.get('description') or evt.get('message', '')}"
             )
+            self._trace.event(
+                "deepgram.warning",
+                {
+                    "code": str(evt.get("code", "")),
+                    "description": str(evt.get("description") or evt.get("message", "")),
+                },
+            )
         elif etype == "Error":
             self._loge(
                 "deepgram",
                 f"Error: {evt.get('code', '')} {evt.get('description') or evt.get('message', '')}",
+            )
+            self._trace.error(
+                str(evt.get("code", "")), str(evt.get("description") or evt.get("message", ""))
             )
             return False
         else:
@@ -880,6 +1186,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                 continue
             if key.endswith("latency"):
                 report[f"{key}_ms"] = round(value * 1000)
+                self._trace.on_latency(key, value)
             else:
                 report[key] = value
         if not report:
@@ -927,6 +1234,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
         was_playing = self._is_playing
         if was_playing:
             self._barge_in_count += 1
+            self._trace.event("barge_in", {"cleared_queue_items": cleared})
             self._emit_turn_complete(barge_in=True)
             self._drop_agent_audio = True
         self._is_playing = False
@@ -935,9 +1243,13 @@ You can use the caller's phone number for SMS or callbacks without asking."""
             f"{'barge-in' if was_playing else 'UserStartedSpeaking (idle)'}: cleared={cleared}",
         )
 
-    def _start_user_turn(self, text: str) -> None:
-        """Begin a new user turn: bump the counter, reset per-turn state, emit user_text."""
+    def _start_user_turn(self, text: str, source: str = "audio") -> None:
+        """Begin a new user turn: bump the counter, reset per-turn state, emit user_text.
+
+        ``source`` (trace attribute): ``audio`` (ConversationText user) or ``text`` (injected).
+        """
         self._turn_count += 1
+        self._trace.start_turn(self._turn_count, text, source=source)
         self._turn_user_text = text
         self._turn_agent_text = ""
         self._turn_latency = self._empty_latency()
@@ -984,22 +1296,31 @@ You can use the caller's phone number for SMS or callbacks without asking."""
                 continue
             fn_id = fn.get("id", "")
             name = fn.get("name", "")
+            # tool.<name> span: FunctionCallRequest -> FunctionCallResponse sent
+            span = self._trace.start_tool(name, fn_id, fn.get("arguments", ""))
+            status = "cancelled"
+            result: dict[str, Any] | None = None
             try:
-                result = await asyncio.wait_for(
-                    self._handle_function_call(name, fn.get("arguments", "")), timeout=10
-                )
-            except (TimeoutError, asyncio.TimeoutError):
-                self._loge("tool", f"{name} timed out")
-                result = {"error": "function timed out"}
-            response = {
-                "type": "FunctionCallResponse",
-                "id": fn_id,
-                "name": name,
-                "content": json.dumps(result),
-            }
-            if self._dg_ws is not None:
-                await self._dg_ws.send(json.dumps(response))
-                self._last_dg_send = time.monotonic()
+                try:
+                    result = await asyncio.wait_for(
+                        self._handle_function_call(name, fn.get("arguments", "")), timeout=10
+                    )
+                    status = "error" if "error" in result else str(result.get("status", "ok"))
+                except (TimeoutError, asyncio.TimeoutError):
+                    self._loge("tool", f"{name} timed out")
+                    result = {"error": "function timed out"}
+                    status = "timeout"
+                response = {
+                    "type": "FunctionCallResponse",
+                    "id": fn_id,
+                    "name": name,
+                    "content": json.dumps(result),
+                }
+                if self._dg_ws is not None:
+                    await self._dg_ws.send(json.dumps(response))
+                    self._last_dg_send = time.monotonic()
+            finally:
+                self._trace.end_tool(span, status, result)
 
     async def _handle_function_call(self, name: str, arguments: Any) -> dict[str, Any]:
         """Execute a function call and return the result."""
@@ -1112,6 +1433,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
 
     # -- plivo_tx --
 
+    @_traced("plivo_tx")
     async def _send_to_plivo(self) -> None:
         """Send queued audio to Plivo in 160-byte (20ms) chunks, plus checkpoints."""
         try:
@@ -1159,6 +1481,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
 
     async def _send_play_audio(self, chunk: bytes) -> None:
         """Send one playAudio message to Plivo and update TTFS metrics."""
+        self._trace.on_play_audio(self._plivo_tx_chunks)
         message = {
             "event": "playAudio",
             "media": {
@@ -1226,6 +1549,18 @@ You can use the caller's phone number for SMS or callbacks without asking."""
             f"[{self.call_id[:8]}] turn {self._turn_count} complete"
             f"{' (barge-in)' if barge_in else ''}"
         )
+        self._trace.end_turn(
+            {
+                "turn": self._turn_count,
+                "user_text": _truncate(self._turn_user_text or ""),
+                "agent_text": _truncate(self._turn_agent_text or ""),
+                "barge_in": barge_in,
+                "playback_ms": playback_ms,
+                **{f"deepgram.{k}": v for k, v in self._turn_latency_report.items()},
+            },
+            barge_in=barge_in,
+            tx_chunks=self._plivo_tx_chunks,
+        )
 
     def _emit_session_end(self) -> None:
         """Emit the session_end summary event (always logged, even in quiet mode)."""
@@ -1271,6 +1606,7 @@ async def run_agent(
     parent_call_id: str = "",
     sip_headers: dict[str, str] | None = None,
     hangup_callback: Callable[[], Awaitable[None]] | None = None,
+    saved_agent_models: dict[str, str] | None = None,
 ) -> None:
     """Run a voice agent session for an inbound call."""
     agent = DeepgramVoiceAgent(
@@ -1284,5 +1620,6 @@ async def run_agent(
         parent_call_id=parent_call_id,
         sip_headers=sip_headers,
         hangup_callback=hangup_callback,
+        saved_agent_models=saved_agent_models,
     )
     await agent.run()

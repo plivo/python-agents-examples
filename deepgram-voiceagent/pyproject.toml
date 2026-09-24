@@ -23,7 +23,6 @@ observability = [
     "opentelemetry-api>=1.20.0",
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-exporter-otlp>=1.20.0",
-    "opentelemetry-instrumentation-httpx>=0.44b0",
     "traceloop-sdk>=0.30.0",
 ]
 streaming = [
@@ -37,6 +36,7 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
     "faster-whisper>=1.2.1",
+    "opentelemetry-sdk>=1.20.0",
 ]
 
 # Example category (read by scripts/validate-example.sh). Managed voice-agent

@@ -163,7 +163,7 @@ Three concurrent asyncio tasks, following the canonical `FIRST_COMPLETED` patter
 | When | File | What it does |
 |---|---|---|
 | Module import | `inbound/agent.py`, `outbound/agent.py` | `load_dotenv()`, read the `DEEPGRAM_*` config, load `system_prompt.md`, define `FUNCTION_DEFINITIONS`. No network calls. |
-| Server start: `uv run python -m inbound.server` | `inbound/server.py` → `main()` | Logging sinks (text/JSON/file/Redis) and optional OTel are set up when the module loads. Then `describe_deepgram_agent()` logs the active path, e.g. `Deepgram agent: inline (listen=flux-general-en, think=open_ai/gpt-4.1-mini, speak=aura-2-thalia-en)` or `Deepgram agent: reusable config <uuid> …`. On the reusable path, `verify_deepgram_agent_id()` looks the UUID up in the API key's Deepgram project (`GET /v1/projects`, then `/projects/{id}/agents/{uuid}`) and **exits with code 1 if it isn't found**. It warns and starts anyway if it can't check (network error, key without `agent:read`). Then `configure_plivo_webhooks()` creates or updates the Plivo application and assigns `PLIVO_PHONE_NUMBER` when `PUBLIC_URL` is set, then uvicorn starts. |
+| Server start: `uv run python -m inbound.server` | `inbound/server.py` → `main()` | Logging sinks (text/JSON/file/Redis) and optional OTel are set up when the module loads. Then `describe_deepgram_agent()` logs the active path, e.g. `Deepgram agent: inline (listen=flux-general-en, think=open_ai/gpt-4.1-mini, speak=aura-2-thalia-en)` or `Deepgram agent: reusable config <uuid> …`. On the reusable path, `verify_deepgram_agent_id()` looks the UUID up in the API key's Deepgram project (`GET /v1/projects`, then `/projects/{id}/agents/{uuid}`) and **exits with code 1 if it isn't found**; when found, it keeps the config's model names for trace attributes. It warns and starts anyway if it can't check (network error, key without `agent:read`). Then `configure_plivo_webhooks()` creates or updates the Plivo application and assigns `PLIVO_PHONE_NUMBER` when `PUBLIC_URL` is set, then uvicorn starts. |
 | Server start: `uv run python -m outbound.server` | `outbound/server.py` → `main()` | Same agent-path log line and reusable-config ID check, then uvicorn. There is no number auto-config, because answer and hangup URLs are passed per call. |
 | `POST /outbound/call` | `outbound/server.py` | `CallManager.create_call()` builds the per-call prompt and greeting, then Plivo `calls.create` dials the number. |
 | Plivo answers (`/answer` or `/outbound/answer`) | `server.py` | Returns `<Stream bidirectional keepCallAlive>` XML that points Plivo at `/ws`. Call metadata travels in `?body=`. |
@@ -367,7 +367,16 @@ To add a function, append a `{"name", "description", "parameters"}` JSON-schema 
 
 ## Observability
 
-Each structured event is a loguru record bound with `event=<name>` and `call_id` (the Plivo `ParentCallUUID` when present, otherwise the stream's `callId`). Records go to stderr (text), or JSON on stderr with `LOG_FORMAT=json`, plus an optional JSON file sink (`LOG_FILE`, 100 MB rotation, 7-day retention) and Redis Streams (`REDIS_EVENTS_URL` → `XADD` to `REDIS_STREAM_KEY`, maxlen ~10000; needs `--extra streaming`).
+Two independent outputs. Only the console log is on by default:
+
+| Output | Where it goes | Who uses it | Enable |
+|--------|---------------|-------------|--------|
+| **Structured loguru events** (`call_answered`, `user_text`, `agent_text`, `turn_complete`, `session_end`) | the console (stderr; text, or JSON with `LOG_FORMAT=json`), a JSONL file (`LOG_FILE`, 100 MB rotation, 7-day retention), and the Redis stream `voice-agent:events` (`REDIS_EVENTS_URL` → `XADD` to `REDIS_STREAM_KEY`, maxlen ~10000) | Dashboards and the hosting app read the Redis stream for live transcripts and per-turn metrics; the file and JSON console output feed log pipelines | Console always; `LOG_FILE`; `REDIS_EVENTS_URL` + `--extra streaming` |
+| **OpenTelemetry spans** (tracer `voice-agent`) | Any OTLP backend (Jaeger, Grafana Tempo, Honeycomb, Datadog, …) over OTLP gRPC | Latency debugging: where a turn's time went, per call | `uv sync --extra observability` and set `OTEL_EXPORTER_OTLP_ENDPOINT` |
+
+### Structured events
+
+Each event is a loguru record bound with `event=<name>` and `call_id` (the Plivo `ParentCallUUID` when present, otherwise the stream's `callId`).
 
 | Event | When | Key fields |
 |-------|------|------------|
@@ -387,7 +396,73 @@ Latency fields come from Deepgram `LatencyReport` messages (seconds, converted t
 | `normal` (default) | `Welcome`, `SettingsApplied` time and flush counts, first audio in/out, user/agent text per turn, tool calls and results, barge-ins, `playedStream` + playback time, TTFS, hangup |
 | `quiet` | Only structured events, session start, warnings (`Warning`, `InjectionRefused`) and errors |
 
-OpenTelemetry: run `uv sync --extra observability`. The agent wraps `run()` in a single `session` span (tracer `voice-agent`, attribute `call_id` = first 8 characters). Spans are exported over OTLP gRPC only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. The server also enables Traceloop (OpenLLMetry) and httpx auto-instrumentation when those packages are installed.
+### OpenTelemetry spans
+
+Without the `observability` extra, `opentelemetry` fails to import and every tracing hook is a no-op (one attribute check per hook, no errors). With it installed but no `OTEL_EXPORTER_OTLP_ENDPOINT`, spans are created and dropped. `server.py` also initialises Traceloop (OpenLLMetry) when `traceloop-sdk` is installed. It is only an optional export destination: the LLM runs inside Deepgram and no LLM SDK or httpx client is on the call path, so it adds no spans of its own.
+
+The LLM, STT and TTS all run inside Deepgram, so the spans are built from the events it sends back, plus client-side timing for tools and playback:
+
+```
+session                         whole call: run()
+│   call_id, leg_call_id, gen_ai.system="deepgram", gen_ai.request.model,
+│   deepgram.think.provider, deepgram.listen.model, deepgram.speak.model,
+│   deepgram.agent_config (UUID or "inline"), deepgram.request_id
+│   events: deepgram.error (+ status ERROR), deepgram.warning when no turn is open
+├── plivo_rx                    task: Plivo audio/text/playedStream in
+├── deepgram_rx                 task: Deepgram events + agent audio in
+├── plivo_tx                    task: playAudio + checkpoints out
+├── turn                        turn 1 = greeting: SettingsApplied -> its turn_complete
+│   └── playback                first playAudio -> playedStream (interrupted=true on barge-in)
+└── turn                        user turn: EndOfTurn / ConversationText(user) / injected text
+    │   turn, call_id, turn.source (greeting|audio|text), eot.trigger, user_text,
+    │   agent_text, barge_in, playback_ms, turn.completed, deepgram.<key>_ms (LatencyReport)
+    │   events: barge_in, deepgram.warning (e.g. SLOW_THINK_REQUEST)
+    ├── stt                     stt_latency          (audio turns only)
+    ├── llm                     ttt_tool_latency     (the pass that called a tool)
+    ├── tool.check_order_status FunctionCallRequest -> FunctionCallResponse sent
+    │                           tool.name, tool.call_id, tool.arguments, tool.result, tool.status
+    ├── llm                     ttt_text_latency     (ttt_token_latency if text is absent)
+    ├── tts                     tts_latency
+    └── playback                first playAudio of the turn -> playedStream
+```
+
+A turn ends when `turn_complete` is emitted. It also ends with `turn.completed=false` if the next turn starts first (`turn.ended_by="next_turn"`) or the call ends mid-turn (`turn.ended_by="session_end"`), so no span is left open. Task spans cancelled at teardown carry `cancelled=true`; they are not marked as errors.
+
+Live trace (real Deepgram, inline config, greeting plus one injected question; start offset from session start, then duration):
+
+```
+session                  +    0ms  21983ms  gpt-4.1-mini, flux-general-en, aura-2-thalia-en, inline
+  plivo_rx               +  297ms  21649ms
+  deepgram_rx            +  297ms  21652ms  cancelled=true
+  plivo_tx               +  298ms  21651ms
+  turn                   +  413ms   8359ms  turn=1 source=greeting playback_ms=4547
+    playback             +  524ms   8248ms  interrupted=false
+  turn                   + 9274ms  12126ms  turn=2 source=text eot.trigger=manual
+    llm                  + 9312ms    729ms  ttt_tool_latency
+    llm                  + 9325ms   1327ms  ttt_text_latency
+    tool.check_order_status +10041ms   1ms  status=processing {"order_number":"TF-123456"}
+    tts                  +10655ms    124ms  tts_latency
+    playback             +10755ms  10645ms  interrupted=false
+```
+
+**What Deepgram exposes, and what it doesn't:**
+
+| Signal | Exposed | Used for |
+|--------|---------|----------|
+| Final user / assistant text (`ConversationText`) | Yes | `user_text`, `agent_text` |
+| End of turn (`EndOfTurn` with `trigger`), `UserStartedSpeaking` | Yes | `turn` start, `eot.trigger`, `barge_in` |
+| Stage durations (`LatencyReport`: `stt_latency`, `ttt_token/text/tool_latency`, `tts_latency`, `total_latency`, in seconds) | Yes | `stt` / `llm` / `tts` spans, `deepgram.*_ms` |
+| Tool calls (`FunctionCallRequest`), answered client-side | Yes | `tool.<name>` spans |
+| `AgentAudioDone`, `Warning`, `Error` | Yes | checkpoint, span events, session status |
+| Playback (Plivo `checkpoint` / `playedStream`) | Plivo | `playback` spans |
+| Token counts, cost | No | — |
+| Raw LLM request / response | No | — |
+| Interim transcripts, STT confidence | No | — |
+| Per-stage start/end timestamps | No (durations only) | stt/llm/tts start times are back-computed |
+
+**Span placement is approximate.** `stt`, `llm` and `tts` end when their `LatencyReport` arrives and start that duration earlier, so they show how long each stage took, not exactly when it ran. The client measures arrival, which trails Deepgram's own clock by network time. `stt` uses the last `stt_latency` received within 2s before end of turn (Deepgram sends one roughly per audio frame). `ttt_text_latency` is counted from end of turn, so on a tool turn it overlaps the tool pass and the tool call. `tool.*` and `playback` are timed on the client from the messages it sends and receives.
+
+**Models on the reusable-config path.** With a config UUID, the `DEEPGRAM_*` model env vars don't describe the saved config. At startup `verify_deepgram_agent_id()` already fetches the config, so it also reads the listen/think/speak models from it (configs are immutable, so they can't go stale) and `server.py` passes them to `run_agent(saved_agent_models=...)`. No network call is made per call. If the check could not run or failed, the model attributes read `saved-config`.
 
 ## Configuration
 
@@ -446,9 +521,9 @@ Only the default row went through the full Plivo call suites. For any other comb
 ## Dependencies
 
 - Runtime: `fastapi`, `uvicorn[standard]`, `websockets>=15.0`, `plivo`, `httpx` (the reusable-config ID check at startup), `python-dotenv`, `python-multipart`, `loguru`, `numpy`, `scipy`, `phonenumbers`. No torch, Silero, ONNX, OpenAI or Deepgram SDK.
-- `observability` extra: `opentelemetry-api`, `opentelemetry-sdk`, `opentelemetry-exporter-otlp`, `opentelemetry-instrumentation-httpx`, `traceloop-sdk`.
+- `observability` extra: `opentelemetry-api`, `opentelemetry-sdk`, `opentelemetry-exporter-otlp`, `traceloop-sdk`.
 - `streaming` extra: `redis[hiredis]`.
-- `dev` group: `ruff`, `pre-commit`, `pytest`, `pytest-asyncio`, `faster-whisper` (the tests also use the runtime `httpx`).
+- `dev` group: `ruff`, `pre-commit`, `pytest`, `pytest-asyncio`, `faster-whisper`, `opentelemetry-sdk` (the span-tree unit tests use its in-memory exporter; the tests also use the runtime `httpx`).
 
 ## Pricing
 

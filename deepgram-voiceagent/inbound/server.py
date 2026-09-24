@@ -118,16 +118,9 @@ except ImportError:
 try:
     from traceloop.sdk import Traceloop
 
+    # Optional export destination only: the LLM runs inside Deepgram, so it adds no LLM spans.
     Traceloop.init(app_name="deepgram-voiceagent")
     logger.info("OpenLLMetry (Traceloop) auto-instrumentation enabled")
-except ImportError:
-    pass
-
-try:
-    from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
-
-    HTTPXClientInstrumentor().instrument()
-    logger.info("httpx auto-instrumentation enabled")
 except ImportError:
     pass
 
@@ -433,6 +426,7 @@ async def websocket_endpoint(
             parent_call_id=call_data.get("parent_call_uuid", ""),
             sip_headers=call_data.get("sip_headers"),
             hangup_callback=functools.partial(_hangup_call, call_id),
+            saved_agent_models=_saved_agent_models or None,
         )
 
     except WebSocketDisconnect:
@@ -491,6 +485,35 @@ def _deepgram_get(path: str) -> dict:
     return resp.json()
 
 
+# listen/think/speak models of the reusable config, parsed from the body that
+# verify_deepgram_agent_id() fetches at startup (configs are immutable, so this cannot go
+# stale). Passed to run_agent() for trace attributes only; {} if the check didn't succeed.
+_saved_agent_models: dict[str, str] = {}
+
+
+def _saved_config_models(body: dict) -> dict[str, str]:
+    """Models from a GET .../agents/{uuid} body (``config`` is a JSON string); {} if unparseable."""
+
+    def provider(config: dict, section: str) -> dict:
+        value = config.get(section) or {}
+        if isinstance(value, list):  # Deepgram accepts a list of fallback providers
+            value = value[0] if value else {}
+        return value.get("provider") or {}
+
+    try:
+        config = body.get("config")
+        config = json.loads(config) if isinstance(config, str) else config
+        models = {
+            "listen_model": provider(config, "listen").get("model"),
+            "think_provider": provider(config, "think").get("type"),
+            "think_model": provider(config, "think").get("model"),
+            "speak_model": provider(config, "speak").get("model"),
+        }
+    except (AttributeError, TypeError, ValueError):
+        return {}
+    return {key: str(value) for key, value in models.items() if value}
+
+
 def verify_deepgram_agent_id(agent_id: str) -> bool:
     """Fail-fast startup check: does the reusable agent config UUID exist?
 
@@ -502,7 +525,9 @@ def verify_deepgram_agent_id(agent_id: str) -> bool:
     """
     try:
         project_id = _deepgram_get("/projects")["projects"][0]["project_id"]
-        _deepgram_get(f"/projects/{project_id}/agents/{agent_id}")
+        body = _deepgram_get(f"/projects/{project_id}/agents/{agent_id}")
+        _saved_agent_models.clear()
+        _saved_agent_models.update(_saved_config_models(body))
         return True
     except httpx.HTTPStatusError as e:
         if e.response.status_code in (400, 404):
