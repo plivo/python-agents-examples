@@ -11,8 +11,8 @@ These tests:
 6. Ask the agent to end the call and verify the server closes the WebSocket
 
 Every test runs twice: ``[inline]`` (Settings carries the agent block) and ``[saved]``
-(a saved agent config is published for the module, the server runs with
-DEEPGRAM_INBOUND_AGENT_ID set, and the config is always deleted afterwards).
+(a reusable agent config is created for the module with the README's create body, the
+server runs with DEEPGRAM_INBOUND_AGENT_ID set, and the config is always deleted afterwards).
 
 Requirements:
     - Valid DEEPGRAM_API_KEY in .env
@@ -43,6 +43,8 @@ import websockets
 from dotenv import load_dotenv
 
 from tests.helpers import (
+    create_agent_config,
+    delete_agent_config,
     ensure_ffmpeg_on_path,
     log_messages,
     read_log_events,
@@ -219,19 +221,14 @@ async def plivo_call(call_uuid: str):
 def server_process(request):
     """Start the inbound server on TEST_PORT (SIGTERM -> wait(5) -> SIGKILL on teardown).
 
-    ``saved`` publishes a saved agent config first and always deletes it afterwards.
+    ``saved`` creates a reusable agent config first and always deletes it afterwards.
     """
-    from inbound.agent import DeepgramAPIError, delete_agent_config, publish_agent_config
-
     # No Plivo credentials: end_call must not try a REST hangup of a fake call
     env = {"PLIVO_AUTH_ID": "", "PLIVO_AUTH_TOKEN": "", "PUBLIC_URL": ""}
     env["DEEPGRAM_INBOUND_AGENT_ID"] = ""
     if request.param == "saved":
-        try:
-            env["DEEPGRAM_INBOUND_AGENT_ID"] = publish_agent_config()
-        except DeepgramAPIError as e:
-            pytest.skip(f"cannot publish a saved agent config: {e}")
-        print(f"\n[saved config] published {env['DEEPGRAM_INBOUND_AGENT_ID']}")
+        env["DEEPGRAM_INBOUND_AGENT_ID"] = create_agent_config("inbound")
+        print(f"\n[saved config] created {env['DEEPGRAM_INBOUND_AGENT_ID']}")
     try:
         proc = start_server("inbound.server", TEST_PORT, LOG_PATH, env)
         print(f"\n[server] mode={request.param} logs: {LOG_PATH}")
@@ -360,6 +357,11 @@ class TestE2ELive:
         async with plivo_call("test-e2e-mode") as call:
             await call.collect_response(timeout=20)
         expected = f"settings: saved agent config {config_id}" if config_id else "settings: inline"
+        startup = (
+            f"Deepgram agent: reusable config {config_id}"
+            if config_id
+            else "Deepgram agent: inline (listen="
+        )
         deadline = time.monotonic() + 5.0
         ends: list[dict] = []
         while time.monotonic() < deadline and not ends:
@@ -368,7 +370,9 @@ class TestE2ELive:
                 e for e in read_log_events(LOG_PATH, "session_end") if e["call_id"] == call.call_id
             ]
         print(f"\n[{mode}] session_end agent_config={ends and ends[0].get('agent_config')}")
-        assert any(expected in m for m in log_messages(LOG_PATH)), expected
+        messages = log_messages(LOG_PATH)
+        assert any(m.startswith(startup) for m in messages), startup
+        assert any(expected in m for m in messages), expected
         assert ends, "No session_end for this call"
         assert ends[0]["agent_config"] == (config_id or "inline")
 

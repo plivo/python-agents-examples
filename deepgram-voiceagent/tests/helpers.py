@@ -119,6 +119,75 @@ def log_messages(log_path: Path) -> list[str]:
     return [r.get("message", "") for r in read_log_records(log_path)]
 
 
+# =============================================================================
+# Deepgram reusable agent configurations (REST) — live Path 2 tests only
+# =============================================================================
+
+DEEPGRAM_API_URL = "https://api.deepgram.com/v1"
+
+
+def readme_publish_script(direction: str) -> str:
+    """The Python half of the README's create command for ``direction`` (one source of truth).
+
+    It is the body of the ``uv run python - <<'EOF' | curl ...`` heredoc in "Creating a
+    reusable config" and prints the create body ``{"config": "<json>", "metadata": {...}}``.
+    """
+    readme = (PROJECT_DIR / "README.md").read_text()
+    marker = f"from {direction}.agent import DeepgramVoiceAgent"
+    start = readme.rindex("import json\n", 0, readme.index(marker))
+    return readme[start : readme.index("\nEOF\n", start) + 1]
+
+
+def readme_publish_body(direction: str, env: dict[str, str] | None = None) -> dict:
+    """Run the README's create script and return the body it would POST."""
+    result = subprocess.run(
+        [sys.executable, "-"],
+        input=readme_publish_script(direction),
+        capture_output=True,
+        text=True,
+        cwd=PROJECT_DIR,
+        env=env,
+        timeout=60,
+        check=True,
+    )
+    return json.loads(result.stdout)
+
+
+def _deepgram_rest(method: str, path: str, body: dict | None = None):
+    response = httpx.request(
+        method,
+        f"{DEEPGRAM_API_URL}{path}",
+        json=body,
+        headers={"Authorization": f"Token {os.environ['DEEPGRAM_API_KEY']}"},
+        timeout=15,
+    )
+    if response.status_code == 403:
+        pytest.skip(f"DEEPGRAM_API_KEY lacks agent:read/agent:write: {response.text}")
+    response.raise_for_status()
+    return response.json() if response.content else None
+
+
+def deepgram_project_id() -> str:
+    """The first project the key can see (as in the README)."""
+    return _deepgram_rest("GET", "/projects")["projects"][0]["project_id"]
+
+
+def create_agent_config(direction: str) -> str:
+    """POST the README's create body for ``direction``; return the new config's UUID."""
+    created = _deepgram_rest(
+        "POST", f"/projects/{deepgram_project_id()}/agents", readme_publish_body(direction)
+    )
+    return created["agent_uuid"]
+
+
+def list_agent_configs() -> list[dict]:
+    return _deepgram_rest("GET", f"/projects/{deepgram_project_id()}/agents")
+
+
+def delete_agent_config(agent_uuid: str) -> None:
+    _deepgram_rest("DELETE", f"/projects/{deepgram_project_id()}/agents/{agent_uuid}")
+
+
 def list_live_call_ids(client: plivo.RestClient) -> list[str]:
     """Return the UUIDs of all live calls on the account."""
     try:

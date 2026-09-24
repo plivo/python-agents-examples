@@ -24,17 +24,15 @@ Pipeline logging is controlled by the LOG_LEVEL env var:
   normal  — key events: turn lifecycle, transcripts, latencies (default)
   quiet   — errors and session start/end only
 
-Saved agent configuration (opt-in): with DEEPGRAM_INBOUND_AGENT_ID set, Settings
-references that saved config by UUID instead of carrying the agent block inline, and
-the per-call context (UpdatePrompt) and greeting (InjectAgentMessage) are sent right
-after SettingsApplied. Manage saved configs without starting a server:
-
-  uv run python -m inbound.agent --publish | --list | --delete <uuid>
+Two ways to define the agent, chosen by DEEPGRAM_INBOUND_AGENT_ID:
+  inline (default, empty) — Settings.agent carries the full definition built here
+  reusable config (a UUID) — Settings.agent is that UUID; the per-call context
+      (UpdatePrompt) and greeting (InjectAgentMessage) follow SettingsApplied.
+Creating a reusable config is a one-off REST call; see the README.
 """
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import base64
 import binascii
@@ -43,10 +41,7 @@ import functools
 import json
 import os
 import random
-import sys
 import time
-import urllib.error
-import urllib.request
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -118,13 +113,9 @@ DEEPGRAM_THINK_MODEL = os.getenv("DEEPGRAM_THINK_MODEL", "gpt-4.1-mini")
 DEEPGRAM_THINK_TEMPERATURE = float(os.getenv("DEEPGRAM_THINK_TEMPERATURE", "0.7"))
 DEEPGRAM_SPEAK_MODEL = os.getenv("DEEPGRAM_SPEAK_MODEL", "aura-2-thalia-en")
 
-# Saved ("reusable") agent configuration — opt-in, empty = inline Settings.
-# Publish one with `uv run python -m inbound.agent --publish` (needs the agent:write scope).
+# Reusable agent configuration UUID (created once via Deepgram's REST API, see the
+# README). Empty = inline: Settings carries the full agent definition built below.
 DEEPGRAM_INBOUND_AGENT_ID = os.getenv("DEEPGRAM_INBOUND_AGENT_ID", "").strip()
-# Project for --publish/--list/--delete; empty = the only project the key can see
-DEEPGRAM_PROJECT_ID = os.getenv("DEEPGRAM_PROJECT_ID", "").strip()
-DEEPGRAM_API_URL = "https://api.deepgram.com/v1"  # REST API for the saved-config CLI
-AGENT_DIRECTION = "inbound"
 
 PLIVO_CHUNK_SIZE = 160  # 20ms of μ-law 8kHz mono
 SETTINGS_TIMEOUT_S = 10.0  # Max wait for Welcome + SettingsApplied
@@ -351,218 +342,6 @@ def _build_speak_provider() -> dict[str, Any]:
     return provider
 
 
-def build_agent_config(prompt: str | None = None) -> dict[str, Any]:
-    """The Settings ``agent`` block, without greeting or per-call context.
-
-    ``--publish`` stores exactly this as the saved agent configuration (static base
-    prompt). Inline mode passes the per-call prompt and adds ``greeting`` on top.
-    """
-    return {
-        "listen": {"provider": _build_listen_provider()},
-        "think": {
-            "provider": {
-                "type": DEEPGRAM_THINK_PROVIDER,
-                "model": DEEPGRAM_THINK_MODEL,
-                "temperature": DEEPGRAM_THINK_TEMPERATURE,
-            },
-            "prompt": SYSTEM_PROMPT if prompt is None else prompt,
-            "functions": FUNCTION_DEFINITIONS,
-        },
-        "speak": {"provider": _build_speak_provider()},
-    }
-
-
-# =============================================================================
-# Saved agent configurations (REST: /v1/projects/{project_id}/agents)
-# =============================================================================
-
-
-class DeepgramAPIError(RuntimeError):
-    """A Deepgram management REST call failed (``status`` is the HTTP code, if any)."""
-
-    def __init__(self, message: str, status: int | None = None) -> None:
-        super().__init__(message)
-        self.status = status
-
-
-def _deepgram_api(method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-    """Call the Deepgram management REST API and return the decoded JSON body."""
-    request = urllib.request.Request(
-        f"{DEEPGRAM_API_URL}{path}",
-        data=json.dumps(body).encode() if body is not None else None,
-        method=method,
-        headers={"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            raw = response.read()
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode(errors="replace")
-        with contextlib.suppress(ValueError, AttributeError):
-            err = json.loads(detail)
-            code = err.get("err_code") or err.get("category") or ""
-            detail = f"{code} {err.get('err_msg') or err.get('message') or ''}".strip()
-        message = f"{method} {path} -> HTTP {e.code}: {detail}"
-        if e.code == 403:
-            message += (
-                " (saved agent configurations need a DEEPGRAM_API_KEY with the "
-                "agent:write scope to publish/delete and agent:read to list)"
-            )
-        raise DeepgramAPIError(message, status=e.code) from e
-    except urllib.error.URLError as e:
-        raise DeepgramAPIError(f"{method} {path} failed: {e.reason}") from e
-    return json.loads(raw) if raw else {}
-
-
-def resolve_project_id() -> str:
-    """DEEPGRAM_PROJECT_ID, else the single project this API key can see."""
-    if DEEPGRAM_PROJECT_ID:
-        return DEEPGRAM_PROJECT_ID
-    projects = _deepgram_api("GET", "/projects").get("projects", [])
-    if len(projects) == 1:
-        return projects[0]["project_id"]
-    if not projects:
-        raise DeepgramAPIError("this DEEPGRAM_API_KEY sees no Deepgram projects")
-    ids = ", ".join(str(p.get("project_id")) for p in projects)
-    raise DeepgramAPIError(
-        f"this DEEPGRAM_API_KEY sees {len(projects)} projects ({ids}); set DEEPGRAM_PROJECT_ID"
-    )
-
-
-def publish_agent_config(project_id: str | None = None) -> str:
-    """Create a saved agent configuration from build_agent_config(); return its UUID."""
-    project_id = project_id or resolve_project_id()
-    body = {
-        "config": json.dumps(build_agent_config()),  # the API takes the config as a JSON string
-        "metadata": {"example": EXAMPLE_NAME, "direction": AGENT_DIRECTION},
-    }
-    created = _deepgram_api("POST", f"/projects/{project_id}/agents", body)
-    # Live API returns agent_uuid; the docs say agent_id — accept both
-    agent_id = created.get("agent_uuid") or created.get("agent_id")
-    if not agent_id:
-        raise DeepgramAPIError(f"create returned no agent_uuid: {created}")
-    return str(agent_id)
-
-
-def list_agent_configs(project_id: str | None = None) -> list[dict[str, Any]]:
-    """List the project's saved agent configurations (the API returns a plain list)."""
-    listed = _deepgram_api("GET", f"/projects/{project_id or resolve_project_id()}/agents")
-    return listed if isinstance(listed, list) else listed.get("agents", [])
-
-
-def delete_agent_config(agent_id: str, project_id: str | None = None) -> None:
-    """Delete a saved agent configuration (configs are immutable; old ones pile up)."""
-    _deepgram_api("DELETE", f"/projects/{project_id or resolve_project_id()}/agents/{agent_id}")
-
-
-def get_agent_config(agent_id: str, project_id: str | None = None) -> dict[str, Any]:
-    """Fetch a saved agent configuration's ``agent`` block (the API returns it as a string)."""
-    got = _deepgram_api("GET", f"/projects/{project_id or resolve_project_id()}/agents/{agent_id}")
-    config = got.get("config", {})
-    return json.loads(config) if isinstance(config, str) else config
-
-
-# Env var -> the saved-config field it sets when --publish runs
-_PUBLISHED_ENV_FIELDS: dict[str, tuple[str, ...]] = {
-    "DEEPGRAM_LISTEN_MODEL": ("listen", "provider", "model"),
-    "DEEPGRAM_LISTEN_EOT_THRESHOLD": ("listen", "provider", "eot_threshold"),
-    "DEEPGRAM_LISTEN_EOT_TIMEOUT_MS": ("listen", "provider", "eot_timeout_ms"),
-    "DEEPGRAM_LISTEN_LANGUAGE": ("listen", "provider", "language"),
-    "DEEPGRAM_THINK_PROVIDER": ("think", "provider", "type"),
-    "DEEPGRAM_THINK_MODEL": ("think", "provider", "model"),
-    "DEEPGRAM_THINK_TEMPERATURE": ("think", "provider", "temperature"),
-    "DEEPGRAM_SPEAK_MODEL": ("speak", "provider", "model"),
-}
-
-
-def _dig(config: dict[str, Any], *path: str) -> Any:
-    for key in path:
-        if not isinstance(config, dict):
-            return None
-        config = config.get(key)
-    return config
-
-
-def describe_agent_config(config: dict[str, Any]) -> str:
-    """One-line summary of an agent block's models, for startup logs."""
-    think = _dig(config, "think", "provider") or {}
-    functions = _dig(config, "think", "functions") or []
-    return (
-        f"listen={_dig(config, 'listen', 'provider', 'model')} "
-        f"think={think.get('type')}/{think.get('model')} "
-        f"speak={_dig(config, 'speak', 'provider', 'model')} functions={len(functions)}"
-    )
-
-
-def saved_config_drift(saved: dict[str, Any]) -> list[str]:
-    """How a saved config differs from what --publish would create from this code/env now.
-
-    Model env vars are compared only when explicitly set (a deployment may set just the
-    agent id). Prompt and functions always come from the deployed code, so any
-    difference there is real drift.
-    """
-    current = build_agent_config()
-    warnings = []
-    for env_name, path in _PUBLISHED_ENV_FIELDS.items():
-        if env_name not in os.environ:
-            continue
-        now, published = _dig(current, *path), _dig(saved, *path)
-        if now != published:
-            warnings.append(
-                f"{env_name}={os.environ[env_name]} is ignored in saved mode: the saved config "
-                f"has {'.'.join(path)}={published!r}. Re-publish to apply it."
-            )
-    saved_functions = _dig(saved, "think", "functions") or []
-    if saved_functions != FUNCTION_DEFINITIONS:
-        saved_names = {f.get("name") for f in saved_functions}
-        code_names = {f["name"] for f in FUNCTION_DEFINITIONS}
-        warnings.append(
-            "Saved config functions differ from FUNCTION_DEFINITIONS in the code "
-            f"(only in saved: {sorted(saved_names - code_names)}, "
-            f"only in code: {sorted(code_names - saved_names)}). Re-publish to sync them."
-        )
-    if _dig(saved, "think", "prompt") != _dig(current, "think", "prompt"):
-        warnings.append(
-            "Saved config prompt differs from the code's base prompt "
-            "(system_prompt.md / SYSTEM_PROMPT). Re-publish to apply prompt changes."
-        )
-    return warnings
-
-
-def check_saved_agent_config(agent_id: str | None = None) -> bool:
-    """Server startup check of the Deepgram agent settings mode.
-
-    Inline mode: log the models from env. Saved mode: fetch the saved config, log what
-    it actually contains and warn about drift from the code/env. Returns False when the
-    id does not resolve (every call would fail), so the server should not start.
-    """
-    agent_id = DEEPGRAM_INBOUND_AGENT_ID if agent_id is None else agent_id
-    env_var = f"DEEPGRAM_{AGENT_DIRECTION.upper()}_AGENT_ID"
-    if not agent_id:
-        logger.info(
-            f"Deepgram agent settings: inline ({describe_agent_config(build_agent_config())})"
-        )
-        return True
-    try:
-        saved = get_agent_config(agent_id)
-    except DeepgramAPIError as e:
-        if e.status in (400, 404):
-            logger.error(
-                f"{env_var}={agent_id} is not a saved agent configuration ({e}). Every call "
-                f"would fail (Deepgram replies INTERNAL_SERVER_ERROR). Publish one with "
-                f"`uv run python -m {AGENT_DIRECTION}.agent --publish` or unset {env_var}."
-            )
-            return False
-        logger.warning(f"Could not verify {env_var}={agent_id}: {e}. Using it unverified.")
-        return True
-    logger.info(
-        f"Deepgram agent settings: saved config {agent_id} ({describe_agent_config(saved)})"
-    )
-    for warning in saved_config_drift(saved):
-        logger.warning(warning)
-    return True
-
-
 @dataclass(frozen=True)
 class _Checkpoint:
     """Marker placed in the send queue behind the last audio chunk of a response.
@@ -606,7 +385,7 @@ class DeepgramVoiceAgent:
         self.sip_headers = sip_headers or {}
         self.hangup_callback = hangup_callback
         self._stream_id = stream_id  # Plivo stream ID for checkpoint/clearAudio events
-        # Saved agent configuration UUID ("" = inline Settings)
+        # Reusable agent configuration UUID ("" = inline Settings)
         self.agent_config_id = (
             DEEPGRAM_INBOUND_AGENT_ID if agent_config_id is None else agent_config_id
         )
@@ -716,9 +495,11 @@ You can use the caller's phone number for SMS or callbacks without asking."""
     def _build_settings(self) -> dict[str, Any]:
         """Build the Deepgram Voice Agent Settings message.
 
-        Saved mode references the saved agent configuration by UUID (all-or-nothing:
-        no inline agent fields may be mixed in). Inline mode sends build_agent_config()
-        with the per-call prompt plus the greeting.
+        Reusable config: ``agent`` is the saved configuration's UUID (all-or-nothing: no
+        inline agent fields may be mixed in). Inline: ``agent`` is the full definition —
+        listen/think/speak providers, the per-call prompt, FUNCTION_DEFINITIONS and the
+        greeting. The README's publish command stores this inline block, minus the
+        greeting, as a reusable config.
 
         Never add ``agent.language`` or ``speak.provider.language`` — Deepgram
         rejects them with an Error and the session dies.
@@ -734,9 +515,20 @@ You can use the caller's phone number for SMS or callbacks without asking."""
         if self.agent_config_id:
             settings["agent"] = self.agent_config_id
             return settings
-        agent = build_agent_config(prompt=self._build_system_prompt())
-        agent["greeting"] = self.initial_message
-        settings["agent"] = agent
+        settings["agent"] = {
+            "listen": {"provider": _build_listen_provider()},
+            "think": {
+                "provider": {
+                    "type": DEEPGRAM_THINK_PROVIDER,
+                    "model": DEEPGRAM_THINK_MODEL,
+                    "temperature": DEEPGRAM_THINK_TEMPERATURE,
+                },
+                "prompt": self._build_system_prompt(),
+                "functions": FUNCTION_DEFINITIONS,
+            },
+            "speak": {"provider": _build_speak_provider()},
+            "greeting": self.initial_message,
+        }
         return settings
 
     async def _personalize_saved_session(self, dg_ws: Any) -> None:
@@ -1492,57 +1284,3 @@ async def run_agent(
         hangup_callback=hangup_callback,
     )
     await agent.run()
-
-
-# =============================================================================
-# Saved-config CLI: uv run python -m inbound.agent --publish | --list | --delete <uuid>
-# (never starts a server)
-# =============================================================================
-
-
-def main(argv: list[str] | None = None) -> int:
-    """Publish, list or delete saved agent configurations for this direction."""
-    parser = argparse.ArgumentParser(
-        prog=f"python -m {AGENT_DIRECTION}.agent",
-        description=f"Manage saved Deepgram agent configurations for {AGENT_DIRECTION} calls.",
-    )
-    action = parser.add_mutually_exclusive_group(required=True)
-    action.add_argument(
-        "--publish", action="store_true", help="create a config from this module's settings"
-    )
-    action.add_argument("--list", action="store_true", help="list the project's saved configs")
-    action.add_argument("--delete", metavar="UUID", help="delete a saved config")
-    args = parser.parse_args(argv)
-
-    if not DEEPGRAM_API_KEY:
-        print("error: DEEPGRAM_API_KEY is not set", file=sys.stderr)
-        return 2
-    env_var = f"DEEPGRAM_{AGENT_DIRECTION.upper()}_AGENT_ID"
-    try:
-        if args.publish:
-            agent_id = publish_agent_config()
-            print(
-                f"Published {AGENT_DIRECTION} agent config {agent_id} "
-                f"(listen={DEEPGRAM_LISTEN_MODEL}, "
-                f"think={DEEPGRAM_THINK_PROVIDER}/{DEEPGRAM_THINK_MODEL}, "
-                f"speak={DEEPGRAM_SPEAK_MODEL})"
-            )
-            print("Set this in .env to use it:")
-            print(f"{env_var}={agent_id}")
-        elif args.list:
-            configs = list_agent_configs()
-            if not configs:
-                print("No saved agent configurations in this project.")
-            for cfg in configs:
-                print(f"{cfg.get('agent_uuid') or cfg.get('agent_id')}  {cfg.get('metadata', {})}")
-        else:
-            delete_agent_config(args.delete)
-            print(f"Deleted agent config {args.delete}")
-    except DeepgramAPIError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

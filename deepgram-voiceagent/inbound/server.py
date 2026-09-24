@@ -23,7 +23,14 @@ from fastapi.responses import Response
 from loguru import logger
 from plivo import plivoxml
 
-from inbound.agent import check_saved_agent_config, run_agent
+from inbound.agent import (
+    DEEPGRAM_INBOUND_AGENT_ID,
+    DEEPGRAM_LISTEN_MODEL,
+    DEEPGRAM_SPEAK_MODEL,
+    DEEPGRAM_THINK_MODEL,
+    DEEPGRAM_THINK_PROVIDER,
+    run_agent,
+)
 from utils import (
     TunnelError,
     normalize_phone_number,
@@ -465,6 +472,19 @@ def _configure_plivo_for_tunnel(phone: str) -> None:
         )
 
 
+def describe_deepgram_agent() -> str:
+    """One line naming the active agent path. Reads agent.py constants; no network calls."""
+    if DEEPGRAM_INBOUND_AGENT_ID:
+        return (
+            f"Deepgram agent: reusable config {DEEPGRAM_INBOUND_AGENT_ID} (models, prompt and "
+            "functions come from the saved config; DEEPGRAM_* model env vars are not used)"
+        )
+    return (
+        f"Deepgram agent: inline (listen={DEEPGRAM_LISTEN_MODEL}, "
+        f"think={DEEPGRAM_THINK_PROVIDER}/{DEEPGRAM_THINK_MODEL}, speak={DEEPGRAM_SPEAK_MODEL})"
+    )
+
+
 def main() -> None:
     """Run the inbound server."""
     parser = argparse.ArgumentParser(description="Deepgram Voice Agent inbound server")
@@ -477,10 +497,7 @@ def main() -> None:
     args = parser.parse_args()
 
     logger.info(f"Starting Deepgram Voice Agent Inbound Agent on port {SERVER_PORT}")
-
-    # Verify the Deepgram agent settings once, before accepting calls
-    if not check_saved_agent_config():
-        raise SystemExit(1)
+    logger.info(describe_deepgram_agent())
 
     if args.tunnel:
         _start_tunnel()

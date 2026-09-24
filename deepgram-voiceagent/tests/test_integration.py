@@ -22,12 +22,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import json
 import math
 import os
 import struct
 import time
 import uuid
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -1358,6 +1361,175 @@ class TestUnitServerRoutes:
 
 SAVED_UUID = "11111111-2222-3333-4444-555555555555"
 
+# sha256 of the exact Settings wire JSON (json.dumps(_build_settings())) captured at 7a7a78c,
+# before the refactor, with default models, a frozen clock and CALL_ID (see INLINE_CASES)
+INLINE_SETTINGS_SHA256 = {
+    "inbound|caller=": "f8c554713f9ed7fd13d6745344557f93b9ce0261809e4c5637a3dea69185b87f",
+    "inbound|caller=+15551234567": (
+        "f33419bbdb46b83b93f02570d6cb153723a0af1230479186fff4f82955fb9c8d"
+    ),
+    "outbound|campaign=False|caller=": (
+        "1b84b56c05e54ea21f0b09578a398855d11b4f655580f939e87e1b99b862317e"
+    ),
+    "outbound|campaign=False|caller=+15551234567": (
+        "4528d4355a314c9ac0a6a78317ecdc501aac63fd703530b93d48c3c39f749446"
+    ),
+    "outbound|campaign=True|caller=": (
+        "c6bc66a3cf7e7e9b4f43b3164f98aabd7d8296c531f204058bf2e3e226e78bb5"
+    ),
+    "outbound|campaign=True|caller=+15551234567": (
+        "f86a00ac586b817d30c0d3b0f5e86513abddb8b6fbc095e0bcf2a1da3af5fbc7"
+    ),
+    "outbound|default": "6c411dda5ff5ccb2335231f5d42308d80ab7b987af5a34017aba8003133a68cc",
+}
+
+# sha256 of the config string the removed `--publish` CLI sent at 7a7a78c (default env)
+PUBLISHED_CONFIG_SHA256 = {
+    "inbound": "61191cfbf2c69e83f3f270e55eefb187972a2956f76c56112ff623ba7e005c47",
+    "outbound": "871d4cc494065a22b1878e8947695c900a839f8b40c0c166ecd7d4a02b5c7545",
+}
+
+_DEFAULT_INBOUND_GREETING = (
+    "Hi, this is Alex from TechFlow. I'm built with the Deepgram Voice Agent API "
+    "on Plivo. How can I help you today?"
+)
+_CAMPAIGN = {
+    "opening_reason": "you asked about TechFlow Pro pricing",
+    "objective": "book a demo",
+    "context": "Lead from the pricing page",
+}
+
+
+class _FrozenDatetime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 1, 2, 15, 4, 5)
+
+
+@pytest.fixture
+def default_agent_modules(monkeypatch):
+    """inbound/outbound agent modules with default models, prompts and a frozen clock."""
+    from inbound import agent as inbound_mod
+    from outbound import agent as outbound_mod
+
+    defaults = {
+        "DEEPGRAM_LISTEN_MODEL": "flux-general-en",
+        "DEEPGRAM_LISTEN_EOT_THRESHOLD": 0.7,
+        "DEEPGRAM_LISTEN_EOT_TIMEOUT_MS": 5000,
+        "DEEPGRAM_LISTEN_LANGUAGE": "",
+        "DEEPGRAM_THINK_PROVIDER": "open_ai",
+        "DEEPGRAM_THINK_MODEL": "gpt-4.1-mini",
+        "DEEPGRAM_THINK_TEMPERATURE": 0.7,
+        "DEEPGRAM_SPEAK_MODEL": "aura-2-thalia-en",
+    }
+    for mod in (inbound_mod, outbound_mod):
+        monkeypatch.setattr(mod, "datetime", _FrozenDatetime)
+        for name, value in defaults.items():
+            monkeypatch.setattr(mod, name, value)
+    inbound_prompt = (Path(inbound_mod.__file__).parent / "system_prompt.md").read_text().strip()
+    monkeypatch.setattr(inbound_mod, "SYSTEM_PROMPT", inbound_prompt)
+    monkeypatch.setattr(outbound_mod, "SYSTEM_PROMPT", outbound_mod._OUTBOUND_PROMPT_TEMPLATE)
+    return inbound_mod, outbound_mod
+
+
+class TestUnitInlineSettingsSnapshot:
+    """Path 1 (inline): Settings wire JSON is byte-identical to the pre-refactor snapshots."""
+
+    @staticmethod
+    def _wire_sha256(agent) -> str:
+        return hashlib.sha256(json.dumps(agent._build_settings()).encode()).hexdigest()
+
+    @pytest.mark.parametrize("caller", ["", "+15551234567"])
+    def test_inbound(self, default_agent_modules, caller):
+        inbound_mod, _ = default_agent_modules
+        agent = inbound_mod.DeepgramVoiceAgent(
+            None,
+            CALL_ID,
+            from_number=caller,
+            initial_message=_DEFAULT_INBOUND_GREETING,
+            agent_config_id="",
+        )
+        assert self._wire_sha256(agent) == INLINE_SETTINGS_SHA256[f"inbound|caller={caller}"]
+
+    @pytest.mark.parametrize("campaign", [False, True])
+    @pytest.mark.parametrize("caller", ["", "+15551234567"])
+    def test_outbound(self, default_agent_modules, campaign, caller):
+        _, outbound_mod = default_agent_modules
+        fields = _CAMPAIGN if campaign else {}
+        record = outbound_mod.CallManager().create_call("+15551234567", **fields)
+        agent = outbound_mod.DeepgramVoiceAgent(
+            None,
+            CALL_ID,
+            from_number=caller,
+            system_prompt=record.system_prompt,
+            initial_message=record.initial_message,
+            agent_config_id="",
+            **fields,
+        )
+        key = f"outbound|campaign={campaign}|caller={caller}"
+        assert self._wire_sha256(agent) == INLINE_SETTINGS_SHA256[key]
+
+    def test_outbound_without_record(self, default_agent_modules):
+        _, outbound_mod = default_agent_modules
+        agent = outbound_mod.DeepgramVoiceAgent(None, CALL_ID, agent_config_id="")
+        assert self._wire_sha256(agent) == INLINE_SETTINGS_SHA256["outbound|default"]
+
+
+class TestUnitStartupLog:
+    """server.py logs which agent path is active, from agent.py constants, with no REST call."""
+
+    SERVERS = (
+        ("inbound.server", "DEEPGRAM_INBOUND_AGENT_ID"),
+        ("outbound.server", "DEEPGRAM_OUTBOUND_AGENT_ID"),
+    )
+
+    @pytest.mark.parametrize(("module", "var"), SERVERS)
+    def test_inline_path(self, monkeypatch, module, var):
+        import importlib
+
+        server = importlib.import_module(module)
+        monkeypatch.setattr(server, var, "")
+        monkeypatch.setattr(server, "DEEPGRAM_LISTEN_MODEL", "flux-general-en")
+        monkeypatch.setattr(server, "DEEPGRAM_THINK_PROVIDER", "anthropic")
+        monkeypatch.setattr(server, "DEEPGRAM_THINK_MODEL", "claude-haiku-4-5")
+        monkeypatch.setattr(server, "DEEPGRAM_SPEAK_MODEL", "aura-2-thalia-en")
+        assert server.describe_deepgram_agent() == (
+            "Deepgram agent: inline (listen=flux-general-en, "
+            "think=anthropic/claude-haiku-4-5, speak=aura-2-thalia-en)"
+        )
+
+    @pytest.mark.parametrize(("module", "var"), SERVERS)
+    def test_reusable_path(self, monkeypatch, module, var):
+        import importlib
+
+        server = importlib.import_module(module)
+        monkeypatch.setattr(server, var, SAVED_UUID)
+        line = server.describe_deepgram_agent()
+        assert line.startswith(f"Deepgram agent: reusable config {SAVED_UUID} ")
+        assert "model env vars are not used" in line
+
+    @pytest.mark.parametrize(("module", "var"), SERVERS)
+    def test_main_logs_the_path_without_network(self, monkeypatch, captured_messages, module, var):
+        import importlib
+        import socket
+        import sys
+
+        server = importlib.import_module(module)
+        monkeypatch.setattr(server, var, SAVED_UUID)
+        monkeypatch.setattr(server, "PUBLIC_URL", "", raising=False)
+        monkeypatch.setattr(sys, "argv", [module])
+        started = []
+        monkeypatch.setattr(server.uvicorn, "run", lambda *a, **k: started.append(True))
+
+        def no_network(*_args, **_kwargs):
+            raise AssertionError("server startup must not open network connections")
+
+        monkeypatch.setattr(socket, "create_connection", no_network)
+        monkeypatch.setattr(socket.socket, "connect", no_network)
+        server.main()
+        assert started == [True]
+        assert any(f"Deepgram agent: reusable config {SAVED_UUID}" in m for m in captured_messages)
+
 
 def make_outbound_agent(**kwargs: Any):
     """Build an outbound agent wired to fake Plivo + Deepgram sockets."""
@@ -1648,8 +1820,32 @@ class TestUnitPlivoAutoConfig:
             await server._create_call(fake, from_="1", to_="2", answer_url="https://x")
 
 
+@pytest.fixture(scope="module")
+def readme_bodies() -> dict[str, dict[str, Any]]:
+    """Create bodies printed by the README's reusable-config commands (run as subprocesses)."""
+    from tests.helpers import readme_publish_body
+
+    env = {k: v for k, v in os.environ.items() if k not in _AGENT_ENV_VARS}
+    return {d: readme_publish_body(d, env=env) for d in ("inbound", "outbound")}
+
+
+# Env vars that shape the agent definition; cleared for the snapshot comparisons
+_AGENT_ENV_VARS = (
+    "DEEPGRAM_LISTEN_MODEL",
+    "DEEPGRAM_LISTEN_EOT_THRESHOLD",
+    "DEEPGRAM_LISTEN_EOT_TIMEOUT_MS",
+    "DEEPGRAM_LISTEN_LANGUAGE",
+    "DEEPGRAM_THINK_PROVIDER",
+    "DEEPGRAM_THINK_MODEL",
+    "DEEPGRAM_THINK_TEMPERATURE",
+    "DEEPGRAM_SPEAK_MODEL",
+    "SYSTEM_PROMPT",
+    "AGENT_GREETING",
+)
+
+
 class TestUnitSavedAgentConfig:
-    """Saved-mode Settings, build_agent_config() and the saved-mode handshake."""
+    """Path 2 (reusable config): Settings shape, handshake order, README create body."""
 
     def test_saved_settings_reference_uuid_only(self):
         agent, _, _ = make_agent(agent_config_id=SAVED_UUID)
@@ -1674,43 +1870,52 @@ class TestUnitSavedAgentConfig:
         assert make_agent()[0]._settings_mode() == "inline"
 
     @pytest.mark.parametrize("direction", ["inbound", "outbound"])
-    def test_build_agent_config_is_static(self, direction):
+    def test_readme_create_body_is_static_agent_definition(self, readme_bodies, direction):
         import importlib
 
         agent_mod = importlib.import_module(f"{direction}.agent")
-        config = agent_mod.build_agent_config()
+        body = readme_bodies[direction]
+        assert set(body) == {"config", "metadata"}, "create requires config + metadata"
+        assert isinstance(body["config"], str), "the API takes config as a JSON string"
+        assert body["metadata"] == {"example": "deepgram-voiceagent", "direction": direction}
+        config = json.loads(body["config"])
         assert set(config) == {"listen", "think", "speak"}, "no greeting in a saved config"
         assert config["think"]["functions"] == agent_mod.FUNCTION_DEFINITIONS
         prompt = config["think"]["prompt"]
         assert "Current Call Context" not in prompt
         assert "{{" not in prompt
         assert _find_keys(config, "language") == []
-        json.dumps(config)
 
-    def test_inbound_config_prompt_is_system_prompt(self):
-        from inbound.agent import SYSTEM_PROMPT, build_agent_config
+    def test_readme_inbound_prompt_is_system_prompt(self, readme_bodies):
+        from inbound.agent import SYSTEM_PROMPT
 
-        assert build_agent_config()["think"]["prompt"] == SYSTEM_PROMPT
+        assert json.loads(readme_bodies["inbound"]["config"])["think"]["prompt"] == SYSTEM_PROMPT
 
-    def test_outbound_config_prompt_points_at_this_call(self):
-        from outbound.agent import build_agent_config
-
-        prompt = build_agent_config()["think"]["prompt"]
+    def test_readme_outbound_prompt_points_at_this_call(self, readme_bodies):
+        prompt = json.loads(readme_bodies["outbound"]["config"])["think"]["prompt"]
         assert prompt.count('"This Call"') >= 3  # opening reason, objective, context
 
-    def test_inline_settings_are_agent_config_plus_greeting_and_context(self):
-        from inbound.agent import SYSTEM_PROMPT, build_agent_config
+    def test_readme_create_body_matches_pre_refactor_publish(self, readme_bodies):
+        """Byte-identical to what the removed ``--publish`` CLI sent at 7a7a78c (default env)."""
+        for direction, digest in PUBLISHED_CONFIG_SHA256.items():
+            config = readme_bodies[direction]["config"]
+            assert hashlib.sha256(config.encode()).hexdigest() == digest, direction
+
+    def test_inline_settings_are_create_body_plus_greeting_and_context(self, readme_bodies):
+        from inbound.agent import SYSTEM_PROMPT
 
         agent, _, _ = make_agent(initial_message="Hello from a test.")
         context = agent._build_call_context()
         assert "+15551234567" in context
-        assert agent._build_settings()["agent"] == {
-            **build_agent_config(prompt=SYSTEM_PROMPT + context),
-            "greeting": "Hello from a test.",
-        }
+        inline = agent._build_settings()["agent"]
+        assert inline.pop("greeting") == "Hello from a test."
+        assert inline["think"].pop("prompt") == SYSTEM_PROMPT + context
+        published = json.loads(readme_bodies["inbound"]["config"])
+        del published["think"]["prompt"]
+        assert inline == published
 
-    def test_outbound_inline_settings_are_agent_config_plus_greeting_and_context(self):
-        from outbound.agent import CallManager, build_agent_config
+    def test_outbound_inline_settings_use_record_prompt_and_greeting(self):
+        from outbound.agent import CallManager
 
         record = CallManager().create_call(phone_number="+1555", opening_reason="a demo")
         agent, _ = make_outbound_agent(
@@ -1718,10 +1923,9 @@ class TestUnitSavedAgentConfig:
             initial_message=record.initial_message,
             opening_reason="a demo",
         )
-        assert agent._build_settings()["agent"] == {
-            **build_agent_config(prompt=record.system_prompt + agent._build_call_context()),
-            "greeting": record.initial_message,
-        }
+        inline = agent._build_settings()["agent"]
+        assert inline["greeting"] == record.initial_message
+        assert inline["think"]["prompt"] == record.system_prompt + agent._build_call_context()
 
     async def test_saved_handshake_sends_context_then_greeting_then_flushes(self):
         agent, plivo_ws, dg = make_agent(
@@ -1845,177 +2049,6 @@ class TestUnitSavedAgentConfig:
             "ctx",
         )
         assert seen["initial_message"] == record.initial_message
-
-
-class _FakeHTTPResponse:
-    def __init__(self, payload: Any) -> None:
-        self._raw = json.dumps(payload).encode() if payload is not None else b""
-
-    def read(self) -> bytes:
-        return self._raw
-
-    def __enter__(self) -> _FakeHTTPResponse:
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        return None
-
-
-@pytest.fixture
-def fake_deepgram_rest(monkeypatch):
-    """Replace urllib.request.urlopen: route -> JSON payload (or an exception to raise)."""
-    import urllib.request
-
-    requests: list[Any] = []
-    routes: dict[tuple[str, str], Any] = {}
-
-    def urlopen(request, timeout=None):
-        requests.append(request)
-        path = request.full_url.split("/v1", 1)[1]
-        result = routes[(request.get_method(), path)]
-        if isinstance(result, BaseException):
-            raise result
-        return _FakeHTTPResponse(result)
-
-    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
-    return routes, requests
-
-
-def _http_error(code: int, payload: dict[str, Any]):
-    import io
-    import urllib.error
-
-    return urllib.error.HTTPError(
-        "https://api.deepgram.com/v1/x", code, "err", {}, io.BytesIO(json.dumps(payload).encode())
-    )
-
-
-class TestUnitSavedConfigPublish:
-    """publish/list/delete + project-id resolution against a mocked REST API."""
-
-    @pytest.fixture(autouse=True)
-    def _key(self, monkeypatch):
-        from inbound import agent as inbound_mod
-        from outbound import agent as outbound_mod
-
-        for mod in (inbound_mod, outbound_mod):
-            monkeypatch.setattr(mod, "DEEPGRAM_API_KEY", "test-key")
-            monkeypatch.setattr(mod, "DEEPGRAM_PROJECT_ID", "proj-1")
-
-    @pytest.mark.parametrize("id_field", ["agent_uuid", "agent_id"])
-    def test_publish_payload(self, fake_deepgram_rest, id_field):
-        from inbound.agent import EXAMPLE_NAME, build_agent_config, publish_agent_config
-
-        routes, requests = fake_deepgram_rest
-        routes[("POST", "/projects/proj-1/agents")] = {id_field: "new-uuid"}
-        assert publish_agent_config() == "new-uuid"
-
-        (request,) = requests
-        assert request.get_header("Authorization") == "Token test-key"
-        body = json.loads(request.data)
-        assert isinstance(body["config"], str), "config must be a JSON string"
-        assert json.loads(body["config"]) == build_agent_config()
-        assert body["metadata"] == {"example": EXAMPLE_NAME, "direction": "inbound"}
-
-    def test_outbound_publish_payload(self, fake_deepgram_rest):
-        from outbound.agent import build_agent_config, publish_agent_config
-
-        routes, requests = fake_deepgram_rest
-        routes[("POST", "/projects/proj-1/agents")] = {"agent_uuid": "out-uuid"}
-        assert publish_agent_config() == "out-uuid"
-        body = json.loads(requests[0].data)
-        config = json.loads(body["config"])
-        assert config == build_agent_config()
-        assert "greeting" not in config
-        assert "{{" not in config["think"]["prompt"]
-        assert body["metadata"]["direction"] == "outbound"
-
-    def test_publish_without_uuid_in_response_fails(self, fake_deepgram_rest):
-        from inbound.agent import DeepgramAPIError, publish_agent_config
-
-        routes, _ = fake_deepgram_rest
-        routes[("POST", "/projects/proj-1/agents")] = {"something": "else"}
-        with pytest.raises(DeepgramAPIError, match="agent_uuid"):
-            publish_agent_config()
-
-    def test_403_names_the_missing_scope(self, fake_deepgram_rest):
-        from inbound.agent import DeepgramAPIError, publish_agent_config
-
-        routes, _ = fake_deepgram_rest
-        routes[("POST", "/projects/proj-1/agents")] = _http_error(
-            403, {"err_code": "INSUFFICIENT_PERMISSIONS", "err_msg": "Missing scope"}
-        )
-        with pytest.raises(DeepgramAPIError) as excinfo:
-            publish_agent_config()
-        message = str(excinfo.value)
-        assert "HTTP 403" in message
-        assert "INSUFFICIENT_PERMISSIONS" in message
-        assert "agent:write" in message
-
-    def test_project_id_from_env_needs_no_lookup(self, fake_deepgram_rest):
-        from inbound.agent import resolve_project_id
-
-        assert resolve_project_id() == "proj-1"
-        assert fake_deepgram_rest[1] == []
-
-    def test_single_project_is_used(self, fake_deepgram_rest, monkeypatch):
-        from inbound import agent as agent_mod
-
-        monkeypatch.setattr(agent_mod, "DEEPGRAM_PROJECT_ID", "")
-        routes, _ = fake_deepgram_rest
-        routes[("GET", "/projects")] = {"projects": [{"project_id": "only", "name": "x"}]}
-        assert agent_mod.resolve_project_id() == "only"
-
-    @pytest.mark.parametrize(
-        ("projects", "match"),
-        [
-            ([{"project_id": "a"}, {"project_id": "b"}], "set DEEPGRAM_PROJECT_ID"),
-            ([], "no Deepgram projects"),
-        ],
-    )
-    def test_ambiguous_or_missing_project_errors(
-        self, fake_deepgram_rest, monkeypatch, projects, match
-    ):
-        from inbound import agent as agent_mod
-
-        monkeypatch.setattr(agent_mod, "DEEPGRAM_PROJECT_ID", "")
-        routes, _ = fake_deepgram_rest
-        routes[("GET", "/projects")] = {"projects": projects}
-        with pytest.raises(agent_mod.DeepgramAPIError, match=match):
-            agent_mod.resolve_project_id()
-
-    def test_list_and_delete(self, fake_deepgram_rest):
-        from inbound.agent import delete_agent_config, list_agent_configs
-
-        routes, requests = fake_deepgram_rest
-        routes[("GET", "/projects/proj-1/agents")] = [{"agent_uuid": "a", "metadata": {}}]
-        routes[("DELETE", "/projects/proj-1/agents/a")] = {}
-        assert list_agent_configs() == [{"agent_uuid": "a", "metadata": {}}]
-        delete_agent_config("a")
-        assert requests[-1].get_method() == "DELETE"
-
-    def test_cli_publish_prints_env_line(self, fake_deepgram_rest, capsys):
-        from outbound.agent import main
-
-        routes, _ = fake_deepgram_rest
-        routes[("POST", "/projects/proj-1/agents")] = {"agent_uuid": "cli-uuid"}
-        assert main(["--publish"]) == 0
-        assert "DEEPGRAM_OUTBOUND_AGENT_ID=cli-uuid" in capsys.readouterr().out
-
-    def test_cli_reports_api_errors(self, fake_deepgram_rest, capsys):
-        from inbound.agent import main
-
-        routes, _ = fake_deepgram_rest
-        routes[("DELETE", "/projects/proj-1/agents/x")] = _http_error(404, {"err_msg": "nope"})
-        assert main(["--delete", "x"]) == 1
-        assert "HTTP 404" in capsys.readouterr().err
-
-    def test_cli_requires_api_key(self, monkeypatch, capsys):
-        from inbound import agent as agent_mod
-
-        monkeypatch.setattr(agent_mod, "DEEPGRAM_API_KEY", "")
-        assert agent_mod.main(["--list"]) == 2
-        assert "DEEPGRAM_API_KEY" in capsys.readouterr().err
 
 
 # =============================================================================
@@ -2207,14 +2240,11 @@ def spoken_digits(text: str) -> str:
 
 @pytest.fixture(scope="module")
 def saved_config_id():
-    """Publish a real inbound saved agent config for this module; ALWAYS delete it."""
-    from inbound.agent import DeepgramAPIError, delete_agent_config, publish_agent_config
+    """Create a real inbound reusable config with the README body; ALWAYS delete it."""
+    from tests.helpers import create_agent_config, delete_agent_config
 
-    try:
-        config_id = publish_agent_config()
-    except DeepgramAPIError as e:
-        pytest.skip(f"cannot publish a saved agent config: {e}")
-    print(f"\n[saved config] published {config_id}")
+    config_id = create_agent_config("inbound")
+    print(f"\n[saved config] created {config_id}")
     try:
         yield config_id
     finally:
@@ -2222,122 +2252,9 @@ def saved_config_id():
         print(f"\n[saved config] deleted {config_id}")
 
 
-class TestUnitSavedConfigStartupCheck:
-    """check_saved_agent_config(): server startup verification of the agent settings mode."""
-
-    AGENT_ID = "11111111-2222-3333-4444-555555555555"
-
-    @pytest.fixture(autouse=True)
-    def _key(self, monkeypatch):
-        from inbound import agent as inbound_mod
-        from outbound import agent as outbound_mod
-
-        for mod in (inbound_mod, outbound_mod):
-            monkeypatch.setattr(mod, "DEEPGRAM_API_KEY", "test-key")
-            monkeypatch.setattr(mod, "DEEPGRAM_PROJECT_ID", "proj-1")
-        for name in inbound_mod._PUBLISHED_ENV_FIELDS:
-            monkeypatch.delenv(name, raising=False)
-
-    def _route(self, routes, config):
-        routes[("GET", f"/projects/proj-1/agents/{self.AGENT_ID}")] = {
-            "agent_uuid": self.AGENT_ID,
-            "config": json.dumps(config),
-            "metadata": {},
-        }
-
-    def test_inline_mode_makes_no_api_call(self, fake_deepgram_rest, captured_messages):
-        from inbound.agent import check_saved_agent_config
-
-        _routes, requests = fake_deepgram_rest
-        assert check_saved_agent_config(agent_id="") is True
-        assert requests == []
-        assert any("Deepgram agent settings: inline" in m for m in captured_messages)
-
-    def test_saved_config_matching_code_passes_without_warnings(
-        self, fake_deepgram_rest, captured_messages
-    ):
-        from inbound.agent import build_agent_config, check_saved_agent_config
-
-        routes, _ = fake_deepgram_rest
-        self._route(routes, build_agent_config())
-        assert check_saved_agent_config(agent_id=self.AGENT_ID) is True
-        assert any(f"saved config {self.AGENT_ID}" in m for m in captured_messages)
-        assert not any("Re-publish" in m for m in captured_messages)
-
-    def test_explicit_model_env_var_that_differs_is_reported(self, monkeypatch):
-        from inbound import agent as agent_mod
-
-        published = agent_mod.build_agent_config()
-        monkeypatch.setenv("DEEPGRAM_THINK_MODEL", "gpt-5.4-mini")
-        monkeypatch.setattr(agent_mod, "DEEPGRAM_THINK_MODEL", "gpt-5.4-mini")
-        (warning,) = agent_mod.saved_config_drift(published)
-        assert "DEEPGRAM_THINK_MODEL=gpt-5.4-mini is ignored" in warning
-        assert "'gpt-4.1-mini'" in warning
-
-    def test_unset_model_env_vars_are_not_compared(self, monkeypatch):
-        """A deployment that sets only the agent id must not get model warnings."""
-        from inbound import agent as agent_mod
-
-        published = agent_mod.build_agent_config()
-        published["think"]["provider"]["model"] = "claude-haiku-4-5"
-        assert agent_mod.saved_config_drift(published) == []
-
-    def test_prompt_and_function_drift_reported(self):
-        from inbound import agent as agent_mod
-
-        published = agent_mod.build_agent_config()
-        published["think"]["prompt"] = "an older prompt"
-        published["think"]["functions"] = published["think"]["functions"][:-1]
-        warnings = agent_mod.saved_config_drift(published)
-        assert any("prompt differs" in w for w in warnings)
-        assert any("only in code: ['end_call']" in w for w in warnings)
-
-    @pytest.mark.parametrize("status", [400, 404])
-    def test_unknown_agent_id_fails_startup(self, fake_deepgram_rest, captured_messages, status):
-        from inbound.agent import check_saved_agent_config
-
-        routes, _ = fake_deepgram_rest
-        routes[("GET", f"/projects/proj-1/agents/{self.AGENT_ID}")] = _http_error(
-            status, {"category": "NOT_FOUND", "message": "agent not found"}
-        )
-        assert check_saved_agent_config(agent_id=self.AGENT_ID) is False
-        assert any("DEEPGRAM_INBOUND_AGENT_ID" in m and "--publish" in m for m in captured_messages)
-
-    def test_unverifiable_agent_id_warns_but_starts(self, fake_deepgram_rest, captured_messages):
-        from inbound.agent import check_saved_agent_config
-
-        routes, _ = fake_deepgram_rest
-        routes[("GET", f"/projects/proj-1/agents/{self.AGENT_ID}")] = _http_error(
-            403, {"category": "INSUFFICIENT_PERMISSIONS", "message": "no agent:read"}
-        )
-        assert check_saved_agent_config(agent_id=self.AGENT_ID) is True
-        assert any("Using it unverified" in m for m in captured_messages)
-
-    def test_outbound_check_uses_outbound_env_var(self, fake_deepgram_rest, captured_messages):
-        from outbound.agent import check_saved_agent_config
-
-        routes, _ = fake_deepgram_rest
-        routes[("GET", f"/projects/proj-1/agents/{self.AGENT_ID}")] = _http_error(404, {})
-        assert check_saved_agent_config(agent_id=self.AGENT_ID) is False
-        assert any("DEEPGRAM_OUTBOUND_AGENT_ID" in m for m in captured_messages)
-
-    @pytest.mark.parametrize("module", ["inbound.server", "outbound.server"])
-    def test_server_refuses_to_start_when_check_fails(self, monkeypatch, module):
-        import importlib
-
-        server = importlib.import_module(module)
-        started = []
-        monkeypatch.setattr(server, "check_saved_agent_config", lambda: False)
-        monkeypatch.setattr(server, "PUBLIC_URL", "", raising=False)
-        monkeypatch.setattr(server.uvicorn, "run", lambda *a, **k: started.append(True))
-        with pytest.raises(SystemExit):
-            server.main()
-        assert started == []
-
-
 @pytest.mark.skipif(not DEEPGRAM_API_KEY, reason="DEEPGRAM_API_KEY not configured")
 class TestDeepgramSavedConfigIntegration:
-    """Publish a real saved agent config, connect with ``agent: <uuid>``, always delete it."""
+    """Create a real reusable agent config, connect with ``agent: <uuid>``, always delete it."""
 
     CALLER = "+14155550123"
 
@@ -2382,7 +2299,8 @@ class TestDeepgramSavedConfigIntegration:
                     return result
 
     async def test_saved_config_is_listed(self, saved_config_id):
-        from inbound.agent import EXAMPLE_NAME, list_agent_configs
+        from inbound.agent import EXAMPLE_NAME
+        from tests.helpers import list_agent_configs
 
         configs = {c.get("agent_uuid"): c for c in list_agent_configs()}
         assert saved_config_id in configs

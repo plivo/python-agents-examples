@@ -4,7 +4,7 @@ Plivo bidirectional audio streaming bridged over raw `websockets` + asyncio (no 
 - Models are `.env` config passed verbatim into Settings. Defaults: listen Deepgram Flux `flux-general-en` (`version: v2`, `eot_threshold` 0.7, `eot_timeout_ms` 5000) for end-of-turn detection with no client-side VAD; think `open_ai` `gpt-4.1-mini` hosted by Deepgram with 5 client-side functions (`end_call`/`transfer_call` use `defer_until_eot`); speak Aura-2 `aura-2-thalia-en`.
 - Barge-in on Deepgram `UserStartedSpeaking` while audio is playing: Deepgram cancels its LLM/TTS; the client drains the send queue, sends Plivo `clearAudio` and drops late agent audio until the next user end-of-turn (`ConversationText` user / `EndOfTurn`).
 - Playback end is tracked with Plivo `checkpoint`/`playedStream`; `end_call` hangs up via Plivo REST `calls.delete` after the goodbye's checkpoint is played (15s fallback deadline).
-- Optional saved agent configuration: with `DEEPGRAM_INBOUND_AGENT_ID`/`DEEPGRAM_OUTBOUND_AGENT_ID` set, Settings sends `agent: <uuid>` (a config published from this code via `python -m inbound.agent --publish`) and the per-call context (`UpdatePrompt`) and greeting (`InjectAgentMessage`) follow `SettingsApplied`.
+- Two agent-definition paths per direction: inline (default) sends the full `agent` block in Settings with `agent.greeting`; with `DEEPGRAM_INBOUND_AGENT_ID`/`DEEPGRAM_OUTBOUND_AGENT_ID` set to a Deepgram reusable agent config UUID, Settings sends `agent: "<uuid>"`, then `UpdatePrompt` (per-call context; outbound adds a "This Call" campaign section) and `InjectAgentMessage` (greeting) follow `SettingsApplied`.
 
 ## Features
 
@@ -17,7 +17,7 @@ Plivo bidirectional audio streaming bridged over raw `websockets` + asyncio (no 
 - **Graceful hangup**: the goodbye plays in full, the checkpoint is acknowledged, and then the call is hung up via REST.
 - **Inbound and outbound**: the inbound server auto-configures the Plivo application and number webhooks on startup; the outbound server passes per-call answer/hangup URLs and tracks status by call and campaign.
 - **Structured events**: `call_answered`, `user_text`, `agent_text`, `turn_complete` (with Deepgram `LatencyReport` fields) and `session_end`.
-- **Saved agent configurations (optional)**: publish the agent block once from code and reference it by UUID per direction; see [Saved agent configurations](#saved-agent-configurations-optional).
+- **Inline or reusable agent config**: send the agent definition in every `Settings` (default), or store it once in your Deepgram project and reference it by UUID; see [Choosing a path](#choosing-a-path-inline-vs-reusable-agent-config).
 - **Text injection**: Plivo `{"event": "text", "text": "..."}` messages are forwarded as Deepgram `InjectUserMessage` (used by the E2E tests).
 
 ## Prerequisites
@@ -97,7 +97,7 @@ deepgram-voiceagent/
 ├── inbound/
 │   ├── __init__.py
 │   ├── agent.py            # DeepgramVoiceAgent, FUNCTION_DEFINITIONS, _build_settings(), run_agent()
-│   ├── server.py           # FastAPI: /, /answer, /ws, /hangup, /fallback, /hold + _hangup_call()
+│   ├── server.py           # FastAPI: /, /answer, /ws, /hangup, /fallback, /hold + _hangup_call(), Plivo auto-config, startup log of the agent path
 │   └── system_prompt.md    # Inbound system prompt
 ├── outbound/
 │   ├── __init__.py
@@ -108,7 +108,7 @@ deepgram-voiceagent/
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py
-│   ├── helpers.py          # ngrok, recording, transcription
+│   ├── helpers.py          # ngrok, recording, transcription, Deepgram agent-config REST helpers for live tests
 │   ├── test_integration.py # Unit + local + Deepgram/Plivo integration
 │   ├── test_observability.py
 │   ├── test_e2e_live.py    # Real Deepgram, no phone call
@@ -162,14 +162,14 @@ Three concurrent asyncio tasks, following the canonical `FIRST_COMPLETED` patter
 
 | When | File | What it does |
 |---|---|---|
-| Module import | `inbound/agent.py`, `outbound/agent.py` | `load_dotenv()`, read the `DEEPGRAM_*` config, load `system_prompt.md`, define `FUNCTION_DEFINITIONS` and `build_agent_config()`. No network calls. |
-| Server start: `uv run python -m inbound.server` | `inbound/server.py` → `main()` | Logging sinks (text/JSON/file/Redis) and optional OTel are set up when the module loads. Then `check_saved_agent_config()` runs (see [Startup check](#startup-check)), then `configure_plivo_webhooks()` creates or updates the Plivo application and assigns `PLIVO_PHONE_NUMBER` when `PUBLIC_URL` is set, then uvicorn starts. |
-| Server start: `uv run python -m outbound.server` | `outbound/server.py` → `main()` | Same startup check, then uvicorn. There is no number auto-config, because answer and hangup URLs are passed per call. |
+| Module import | `inbound/agent.py`, `outbound/agent.py` | `load_dotenv()`, read the `DEEPGRAM_*` config, load `system_prompt.md`, define `FUNCTION_DEFINITIONS`. No network calls. |
+| Server start: `uv run python -m inbound.server` | `inbound/server.py` → `main()` | Logging sinks (text/JSON/file/Redis) and optional OTel are set up when the module loads. Then `describe_deepgram_agent()` logs the active path, e.g. `Deepgram agent: inline (listen=flux-general-en, think=open_ai/gpt-4.1-mini, speak=aura-2-thalia-en)` or `Deepgram agent: reusable config <uuid> …` (no Deepgram API call), then `configure_plivo_webhooks()` creates or updates the Plivo application and assigns `PLIVO_PHONE_NUMBER` when `PUBLIC_URL` is set, then uvicorn starts. |
+| Server start: `uv run python -m outbound.server` | `outbound/server.py` → `main()` | Same agent-path log line, then uvicorn. There is no number auto-config, because answer and hangup URLs are passed per call. |
 | `POST /outbound/call` | `outbound/server.py` | `CallManager.create_call()` builds the per-call prompt and greeting, then Plivo `calls.create` dials the number. |
 | Plivo answers (`/answer` or `/outbound/answer`) | `server.py` | Returns `<Stream bidirectional keepCallAlive>` XML that points Plivo at `/ws`. Call metadata travels in `?body=`. |
-| Each call (`/ws`) | `server.py` → `run_agent()` in `agent.py` | Accepts the WebSocket, reads Plivo's `start` event, then runs `DeepgramVoiceAgent.run()`. That opens a **new** Deepgram WebSocket for the call, sends Settings (inline block or saved UUID), personalizes a saved session, and runs the `plivo_rx` / `deepgram_rx` / `plivo_tx` tasks until the call ends. There is no Deepgram connection before a call arrives. |
+| Each call (`/ws`) | `server.py` → `run_agent()` in `agent.py` | Accepts the WebSocket, reads Plivo's `start` event, then runs `DeepgramVoiceAgent.run()`. That opens a **new** Deepgram WebSocket for the call, sends Settings (inline block or reusable config UUID), sends `UpdatePrompt` + `InjectAgentMessage` on the reusable path, and runs the `plivo_rx` / `deepgram_rx` / `plivo_tx` tasks until the call ends. There is no Deepgram connection before a call arrives. |
 | `end_call` tool | `agent.py` → `hangup_callback` | After the goodbye has played, the agent calls `_hangup_call()` from `server.py`, which hangs up via the Plivo REST API. Plivo credentials never leave `server.py`. |
-| Manual CLI: `uv run python -m inbound.agent --publish` / `--list` / `--delete` | `agent.py` → `main()` | Manages saved agent configurations over the Deepgram REST API. No server is started. |
+| One-off setup (optional): create a reusable config | your shell → Deepgram REST API | The `curl` commands in [Creating a reusable config](#creating-a-reusable-config) post this example's agent definition once. The example contains no code for it; servers only read the UUID from the env var. |
 | Shared helpers | `utils.py` | μ-law codec, resampling, `plivo_to_deepgram` / `deepgram_to_plivo` (pass-through), phone normalization. |
 
 ## Audio Formats
@@ -217,84 +217,113 @@ Three concurrent asyncio tasks, following the canonical `FIRST_COMPLETED` patter
 - `agent.greeting` is spoken **verbatim** by TTS; it is not an instruction to the LLM. The outbound `CallManager.create_call()` therefore builds a literal greeting from `opening_reason`, or uses `DEFAULT_OUTBOUND_GREETING`.
 - Do **not** add `agent.language` or `speak.provider.language`. With this configuration Deepgram replies with an `Error` and the session ends.
 - `eot_threshold` sets how confident Flux must be before ending the turn; lower values reply faster but risk cutting the caller off. `eot_timeout_ms` forces an end of turn after that much silence, whatever the confidence.
-- `build_agent_config()` returns the `agent` block without `greeting` and without call context. Inline mode is `build_agent_config(prompt=<per-call prompt>)` plus `greeting`; `--publish` stores `build_agent_config()` as is.
+- This is Path 1 (inline). With a reusable config UUID set, `agent` is just that UUID string; see [Choosing a path](#choosing-a-path-inline-vs-reusable-agent-config).
 
-## Saved agent configurations (optional)
+## Choosing a path: inline vs reusable agent config
 
-Deepgram can store the `agent` block of Settings as a reusable **agent configuration** under your project, identified by a UUID. Settings then carries `"agent": "<uuid>"` instead of the inline block. This example supports it opt-in, per direction; with the variables empty (the default) nothing changes.
+The agent definition (listen/think/speak providers, prompt, functions) can reach Deepgram in two ways. You choose per direction with one env var; nothing else in the code changes.
 
-Use it when:
+| | Path 1: inline (default) | Path 2: reusable agent config |
+|---|---|---|
+| **How to choose** | `DEEPGRAM_INBOUND_AGENT_ID` / `DEEPGRAM_OUTBOUND_AGENT_ID` empty | Set the var to a config UUID |
+| **Where the config lives** | This repo: `DEEPGRAM_*` env vars, `system_prompt.md`, `FUNCTION_DEFINITIONS`, built by `_build_settings()` on every call | Your Deepgram project, stored once from this repo's code (see below) |
+| **Good for** | Development, one deployment, changes shipped with the code | Several deployments pinned to one config, per-customer configs, A/B tests, rollback by switching a UUID |
+| **How to change the config** | Edit env/code, restart | Create a new config, point the env var at the new UUID, restart, delete the old one (configs are immutable) |
+| **Greeting latency** (after `SettingsApplied`, measured) | ~0.1 s (`agent.greeting`) | ~0.6 s (`InjectAgentMessage`) |
+| **Tested on real Plivo calls** | ✅ | ✅ |
 
-- several servers or deployments should run the **same pinned config**, and you want to see which one a call used (`session_end.agent_config`);
-- you want **rollback by switching an ID**: publish a new config, point the env var at it, and point it back if needed.
-
-Trade-offs:
-
-- **Immutable.** Only metadata can change. Any change to the prompt, functions or models means publishing a new UUID and updating the env var. Old configs stay until you delete them.
-- **API only.** There is no console UI for these configs. Create, list and delete them through the REST API (this example's CLI wraps it).
-- **Visible to every project member.** Never put secrets in the prompt or function definitions.
-- **Per-call context arrives after connect.** Reference by UUID is all-or-nothing: you cannot mix it with inline `agent` fields. The caller context (and, for outbound calls, the campaign details) is appended with `UpdatePrompt`, and the greeting is sent with `InjectAgentMessage`. Both go out right after `SettingsApplied`, before buffered caller audio is flushed. In live checks the injected greeting started about 0.6 s after `SettingsApplied`, against about 0.1 s for an inline `agent.greeting`. The delay comes from `InjectAgentMessage` itself, not from `UpdatePrompt`.
-- **Env config is baked in at publish time.** The saved config captures the `DEEPGRAM_LISTEN_*`, `DEEPGRAM_THINK_*` and `DEEPGRAM_SPEAK_*` values and `SYSTEM_PROMPT` as they were when you ran `--publish`. Changing those env vars later has no effect until you publish again.
-
-### Publish, use, delete
-
-```bash
-# Create a config from this code's settings (no server is started); prints the UUID and the .env line
-uv run python -m inbound.agent --publish     # -> DEEPGRAM_INBOUND_AGENT_ID=<uuid>
-uv run python -m outbound.agent --publish    # -> DEEPGRAM_OUTBOUND_AGENT_ID=<uuid>
-
-# List the project's configs (UUID + metadata), delete old ones
-uv run python -m inbound.agent --list
-uv run python -m inbound.agent --delete <uuid>
+```
+Path 1: inline                                 Path 2: reusable config
+Welcome                                        Welcome
+Settings {agent: {listen, think, speak,        Settings {agent: "<uuid>"}
+  prompt + call context, functions, greeting}} SettingsApplied
+SettingsApplied                                UpdatePrompt        (call context; outbound: "This Call")
+greeting audio                                 InjectAgentMessage  (greeting)
+                                               greeting audio
 ```
 
-Put the printed line in `.env` and restart the server. The session start log shows `settings: saved agent config <uuid>` (or `settings: inline`). The project comes from `DEEPGRAM_PROJECT_ID`, or else from the single project that `GET /v1/projects` returns for the key. If the key sees several projects, the CLI stops and asks you to set `DEEPGRAM_PROJECT_ID`. Each config is created with the metadata `{"example": "deepgram-voiceagent", "direction": "inbound" | "outbound"}`.
+On Path 2 a UUID reference is all-or-nothing: no inline `agent` fields can be mixed in. So right after `SettingsApplied`, and before buffered caller audio is flushed, the agent appends the per-call context with `UpdatePrompt` and speaks the greeting with `InjectAgentMessage`. The injected greeting comes back as `ConversationText` (assistant) plus `AgentAudioDone`, like an inline greeting, so it is still turn 1. The extra ~0.5 s comes from `InjectAgentMessage`, not from `UpdatePrompt`. The session start log shows `settings: saved agent config <uuid>` or `settings: inline`, and `session_end.agent_config` carries the UUID or `inline`.
 
-**Key scopes.** Creating and deleting configs needs a `DEEPGRAM_API_KEY` with the `agent:write` scope, and listing needs `agent:read`. A key without these scopes gets `403 INSUFFICIENT_PERMISSIONS`, which the CLI reports along with the missing scope. Running calls against a saved config uses the same single key; no separate admin key is needed.
+[Deepgram's reusable agent configurations](https://developers.deepgram.com/docs/reusable-agent-configurations) exist so that an agent definition can be stored once and referenced by ID instead of being resent in every `Settings`. Deepgram lists these use cases: per-customer configs, regional or regulatory compliance, A/B testing voices or prompts, and multi-agent architectures.
 
-**What is published.** The published config is `build_agent_config()`: the listen, think and speak providers, `FUNCTION_DEFINITIONS` and the static base prompt. It has no greeting and no per-call context.
+With a UUID set, Deepgram receives **only the UUID**. The `DEEPGRAM_LISTEN_*`, `DEEPGRAM_THINK_*`, `DEEPGRAM_SPEAK_*` vars, `system_prompt.md` / `SYSTEM_PROMPT` and `FUNCTION_DEFINITIONS` matter only at the moment you create the config. `AGENT_GREETING` (inbound), the `CallManager` greeting and the per-call context still apply on every call.
 
-- **Inbound:** the base prompt is `system_prompt.md` (or `SYSTEM_PROMPT`). Each call appends the `## Current Call Context` block (caller number, call ID, time) with `UpdatePrompt`, then injects `AGENT_GREETING`.
-- **Outbound:** the template's `{{opening_reason}}`, `{{objective}}` and `{{context}}` placeholders are replaced with pointers such as `[the objective under "This Call" below]`. Each call appends a `## This Call` section with `UpdatePrompt`. That section holds the greeting already spoken, the opening reason, the objective and the additional context, followed by the call context. The `CallManager` greeting is then injected. Inline mode still renders the template exactly as before.
+### Creating a reusable config
 
-### Startup check
+This is a one-off setup step, done with Deepgram's REST API. The example has no admin code for it; the server only reads the UUID. The key needs the `agent:write` scope to create or delete and `agent:read` to list. Run from this directory:
 
-When the server starts (`main()` in `inbound/server.py` / `outbound/server.py`, before uvicorn accepts calls), it runs `check_saved_agent_config()` from the matching `agent.py`:
+```bash
+set -a && source .env && set +a   # DEEPGRAM_API_KEY (and any DEEPGRAM_* model vars) in the shell
 
-- **Inline mode** (no agent ID): it logs `Deepgram agent settings: inline (listen=… think=… speak=… functions=5)` and makes no API call.
-- **Saved mode**: it fetches the config (`GET .../agents/{uuid}`, which needs `agent:read`) and logs the models the config actually contains. It then warns about drift between the config and what `--publish` would create from the deployed code and env:
-  - a model env var that is **explicitly set** but differs from the config, e.g. `DEEPGRAM_THINK_MODEL=gpt-5.4-mini is ignored in saved mode: the saved config has think.provider.model='gpt-4.1-mini'. Re-publish to apply it.`;
-  - a base prompt or `FUNCTION_DEFINITIONS` that differs from the code (function names only in the config or only in the code are listed).
-- **Unknown ID** (404/400): the server logs how to fix it and **exits with code 1**. Without the check, Deepgram would answer every call's Settings with `INTERNAL_SERVER_ERROR` ("resolving agent ID") and each call would end without a greeting.
-- **Can't verify** (e.g. a key without `agent:read`, or a network error): it logs a warning and starts anyway.
+# Project id (the first project; pick another from the list if your key sees several)
+export DEEPGRAM_PROJECT_ID=$(curl -s https://api.deepgram.com/v1/projects \
+  -H "Authorization: Token $DEEPGRAM_API_KEY" \
+  | uv run python -c 'import json, sys; print(json.load(sys.stdin)["projects"][0]["project_id"])')
+```
 
-### How the agent ID and the model env vars interact
+Each command below prints this example's own inline agent definition (from `_build_settings()`, without the greeting or per-call context) as the create body and posts it. It returns `{"agent_uuid": "<uuid>"}`; put that UUID in `.env` and restart the server.
 
-With an agent ID set, Deepgram receives **only the ID**. The model env vars matter only when `--publish` runs, because that is when their values are copied into the config. The inbound direction is shown here; outbound works the same with `DEEPGRAM_OUTBOUND_AGENT_ID`.
+**Inbound** (`DEEPGRAM_INBOUND_AGENT_ID`):
 
-| # | `DEEPGRAM_INBOUND_AGENT_ID` | Model env vars | Settings sent to Deepgram | Models used on calls | Startup check |
-|---|---|---|---|---|---|
-| 1 | unset | unset | full inline `agent` block | defaults (`flux-general-en`, `open_ai`/`gpt-4.1-mini`, `aura-2-thalia-en`) | logs "inline" |
-| 2 | unset | e.g. `DEEPGRAM_THINK_MODEL=gpt-5.4-mini` | inline block with that model | `gpt-5.4-mini` (after restart) | logs "inline" |
-| 3 | set | unset, or equal to the published values | `"agent": "<uuid>"`, then `UpdatePrompt` + `InjectAgentMessage` | the values in effect at `--publish` time | logs the saved models |
-| 4 | set | changed after publishing | the UUID only | still the published models | ⚠️ warns that the env var is ignored |
-| 5 | set | `system_prompt.md` / `SYSTEM_PROMPT` or `FUNCTION_DEFINITIONS` changed without re-publishing | the UUID only | the published prompt and functions | ⚠️ warns about prompt/function drift |
-| 6 | set to a deleted or wrong ID | any | — | — | ❌ server exits with code 1 |
-| 7 | inbound set, outbound unset | set | inbound: UUID; outbound: inline | inbound: published models; outbound: current env | each server checks its own direction |
-| 8 | either | `AGENT_GREETING` set | inline: `agent.greeting`; saved: `InjectAgentMessage` | n/a | n/a |
-| 9 | n/a | `DEEPGRAM_PROJECT_ID` | not used on calls | n/a | used by the check and by `--publish`/`--list`/`--delete` |
+```bash
+uv run python - <<'EOF' | curl -sS -X POST "https://api.deepgram.com/v1/projects/$DEEPGRAM_PROJECT_ID/agents" \
+  -H "Authorization: Token $DEEPGRAM_API_KEY" -H "Content-Type: application/json" -d @-
+import json
+from inbound.agent import DeepgramVoiceAgent
 
-To change a model or the prompt in saved mode: run `--publish` again (you get a new UUID), put the new UUID in the env var, restart the server, and delete the old config.
+agent = DeepgramVoiceAgent(websocket=None, call_id="publish", agent_config_id="")
+config = agent._build_settings()["agent"]
+del config["greeting"]  # sent per call with InjectAgentMessage
+meta = {"example": "deepgram-voiceagent", "direction": "inbound"}
+print(json.dumps({"config": json.dumps(config), "metadata": meta}))
+EOF
+```
 
-**Turn handling.** The injected greeting comes back as `ConversationText` (role `assistant`) followed by `AgentAudioDone`, the same events as an inline greeting. It therefore still counts as turn 1 and emits `agent_text` and `turn_complete`.
+**Outbound** (`DEEPGRAM_OUTBOUND_AGENT_ID`). The saved prompt cannot hold one call's campaign details, so the template's `{{opening_reason}}`, `{{objective}}` and `{{context}}` are filled with pointers to the `## This Call` section. Each call appends that section with `UpdatePrompt`: the greeting already spoken, the opening reason, the objective and the extra context, followed by the call context.
 
-Behaviour verified live (2026-09-23):
+```bash
+uv run python - <<'EOF' | curl -sS -X POST "https://api.deepgram.com/v1/projects/$DEEPGRAM_PROJECT_ID/agents" \
+  -H "Authorization: Token $DEEPGRAM_API_KEY" -H "Content-Type: application/json" -d @-
+import json
+from outbound.agent import DeepgramVoiceAgent, build_outbound_prompt
 
-- `POST /v1/projects/{project_id}/agents` with `{"config": "<agent block as a JSON string>", "metadata": {...}}` returns `{"agent_uuid": "..."}`. Deepgram's docs say `agent_id`, so the code accepts both.
-- `GET .../agents` returns a plain JSON list. `GET .../agents/{uuid}` returns `agent_uuid`, `member_id`, `api_version`, `config` and `metadata`. `DELETE .../agents/{uuid}` returns 200.
-- In a UUID session, `UpdatePrompt` gets a `PromptUpdated` reply and **appends** to the saved prompt. The LLM answered "What phone number am I calling from?" using the appended caller number.
-- `InjectAgentMessage` is spoken verbatim. A saved config without `greeting` stays silent until it arrives.
-- Client-side functions from the saved config arrive as `FunctionCallRequest` exactly as in inline mode, and `FunctionCallResponse` works unchanged.
+prompt = build_outbound_prompt(
+    opening_reason='[the opening reason under "This Call" below]',
+    objective='[the objective under "This Call" below]',
+    context='See "This Call" below.',
+)
+agent = DeepgramVoiceAgent(
+    websocket=None, call_id="publish", system_prompt=prompt, agent_config_id=""
+)
+config = agent._build_settings()["agent"]
+del config["greeting"]  # sent per call with InjectAgentMessage
+meta = {"example": "deepgram-voiceagent", "direction": "outbound"}
+print(json.dumps({"config": json.dumps(config), "metadata": meta}))
+EOF
+```
+
+List and delete:
+
+```bash
+curl -s "https://api.deepgram.com/v1/projects/$DEEPGRAM_PROJECT_ID/agents" \
+  -H "Authorization: Token $DEEPGRAM_API_KEY"
+
+curl -sS -X DELETE "https://api.deepgram.com/v1/projects/$DEEPGRAM_PROJECT_ID/agents/<uuid>" \
+  -H "Authorization: Token $DEEPGRAM_API_KEY"
+```
+
+**Tools caveat.** The function schemas live in the Deepgram config, but the handlers run in `agent.py` (`_handle_function_call()`). A reusable config must reference only tools this example implements, which the commands above guarantee because they copy `FUNCTION_DEFINITIONS`. If a config offers a tool that `agent.py` does not implement and the LLM calls it, the call does not crash: the agent replies with a `FunctionCallResponse` whose content is `{"error": "Unknown function: <name>"}`, and the LLM carries on. The reverse also holds: a tool missing from the config is never called. Without `end_call` in the config, for example, the agent can't hang up. After editing `FUNCTION_DEFINITIONS`, create a new config.
+
+### Facts verified live (2026-09-23)
+
+- The create response field is `agent_uuid` (Deepgram's docs say `agent_id`).
+- Create requires `metadata` as well as `config` (a JSON **string**). Without `metadata` it returns `400 missing field 'metadata'`.
+- List returns a plain JSON list (`[]` when empty). `DELETE .../agents/{uuid}` returns 200.
+- Configs are immutable. `PUT .../agents/{uuid}` updates only `metadata`, which is required. A `config` in the `PUT` body is silently ignored, and the response is still 200.
+- There is no console UI for these configs yet; use the REST API.
+- Configs, including their prompts, and variables are visible to all members of the project. Don't put secrets in them.
+- The API key needs `agent:write` to create and delete, and `agent:read` to list. Without them, the API returns `403 INSUFFICIENT_PERMISSIONS`. Calls that use a config need only the normal key.
+- In a UUID session, `UpdatePrompt` gets a `PromptUpdated` reply and **appends** to the saved prompt. The LLM answered "What phone number am I calling from?" from the appended caller number. `InjectAgentMessage` is spoken verbatim, and a config without `greeting` stays silent until it arrives. Client-side functions arrive as `FunctionCallRequest` exactly as they do inline.
 
 ## Outbound Call API
 
@@ -334,7 +363,7 @@ The functions are declared in `agent.think.functions` without an `endpoint`, so 
 | `transfer_call(department, reason)` | Transfer to a human (mock; no Plivo transfer) | yes |
 | `end_call(reason, resolution)` | Handled inline: sets the pending hangup, returns `{"status": "call_ending"}` | yes |
 
-To add a function, append a `{"name", "description", "parameters"}` JSON-schema entry to `FUNCTION_DEFINITIONS` and a branch in `DeepgramVoiceAgent._handle_function_call()`, in both `inbound/agent.py` and `outbound/agent.py`. `arguments` may arrive as a JSON string or a dict. Whatever the handler returns is serialized with `json.dumps` into `FunctionCallResponse.content`; a timeout returns `{"error": "function timed out"}`.
+To add a function, append a `{"name", "description", "parameters"}` JSON-schema entry to `FUNCTION_DEFINITIONS` and a branch in `DeepgramVoiceAgent._handle_function_call()`, in both `inbound/agent.py` and `outbound/agent.py`. On the reusable-config path, create a new config afterwards so Deepgram offers the new schema (see the [tools caveat](#creating-a-reusable-config)). `arguments` may arrive as a JSON string or a dict. Whatever the handler returns is serialized with `json.dumps` into `FunctionCallResponse.content`; a timeout returns `{"error": "function timed out"}`.
 
 ## Observability
 
@@ -346,7 +375,7 @@ Each structured event is a loguru record bound with `event=<name>` and `call_id`
 | `user_text` | `ConversationText{user}` or a Plivo `text` injection (its Deepgram echo is deduplicated) | `call_id`, `turn`, `text` |
 | `agent_text` | Each `ConversationText{assistant}` | `call_id`, `turn`, `text` |
 | `turn_complete` | `playedStream` for the turn's checkpoint (or `AgentAudioDone` when there is no `streamId`), or a barge-in | `call_id`, `turn`, `barge_in`, `user_text`, `agent_text`, `plivo_rx_bytes`, `plivo_tx_chunks`, `playback_ms`, `total_latency_ms`, `tts_latency_ms`, `ttt_latency_ms`, `latency_report` |
-| `session_end` | Teardown | `call_id`, `duration_s`, `turns`, `barge_ins`, `errors`, `ttfs_avg_ms`, `ttfs_samples`, `rx_bytes`, `tx_chunks`, `deepgram_request_id` |
+| `session_end` | Teardown | `call_id`, `duration_s`, `turns`, `barge_ins`, `errors`, `ttfs_avg_ms`, `ttfs_samples`, `rx_bytes`, `tx_chunks`, `deepgram_request_id`, `agent_config` (UUID or `inline`) |
 
 Latency fields come from Deepgram `LatencyReport` messages (seconds, converted to ms). Every numeric key is merged into `latency_report` as `<key>_ms` (`stt_latency_ms`, `ttt_token_latency_ms`, `ttt_text_latency_ms`, `ttt_tool_latency_ms`, `tts_latency_ms`, `total_latency_ms`), and the report resets at each new user turn. `total_latency_ms` and `tts_latency_ms` are copied to the top-level fields; `ttt_latency_ms` takes `ttt_text_latency`. `AgentStartedSpeaking` latencies are also read if Deepgram sends them. `playback_ms` is the time from sending the checkpoint to `playedStream`. TTFS is measured on the client, from `ConversationText{user}` (or text injection) to the next `playAudio` chunk.
 
@@ -375,9 +404,8 @@ OpenTelemetry: run `uv sync --extra observability`. The agent wraps `run()` in a
 | `DEEPGRAM_THINK_TEMPERATURE` | `agent.think.provider.temperature` | `0.7` |
 | `DEEPGRAM_SPEAK_MODEL` | `agent.speak.provider.model` (`flux-*` voices also send `version: v2`) | `aura-2-thalia-en` |
 | `AGENT_GREETING` | Inbound greeting, spoken verbatim (outbound ignores it) | `Hi, this is Alex from TechFlow. I'm built with the Deepgram Voice Agent API on Plivo. How can I help you today?` |
-| `DEEPGRAM_INBOUND_AGENT_ID` | Saved agent config UUID for inbound calls (`inbound.agent --publish`); empty = inline Settings | — |
-| `DEEPGRAM_OUTBOUND_AGENT_ID` | Saved agent config UUID for outbound calls (`outbound.agent --publish`); empty = inline Settings | — |
-| `DEEPGRAM_PROJECT_ID` | Project for `--publish`/`--list`/`--delete`; empty = the key's only project | — |
+| `DEEPGRAM_INBOUND_AGENT_ID` | Reusable agent config UUID for inbound calls (see [Creating a reusable config](#creating-a-reusable-config)); empty = inline Settings | — |
+| `DEEPGRAM_OUTBOUND_AGENT_ID` | Reusable agent config UUID for outbound calls; empty = inline Settings | — |
 | `SYSTEM_PROMPT` | Inbound: replaces `system_prompt.md`. Outbound: used only when no `CallManager` record is found (records always use `build_outbound_prompt()`) | — |
 | `PLIVO_AUTH_ID` | Plivo Auth ID | Required |
 | `PLIVO_AUTH_TOKEN` | Plivo Auth Token | Required |
@@ -450,12 +478,12 @@ uv run pytest tests/test_integration.py tests/test_observability.py -v -k unit
 # Local server + direct Deepgram handshake/greeting (needs DEEPGRAM_API_KEY)
 uv run pytest tests/test_integration.py -v -k "local or Deepgram"
 
-# Saved agent config: publish -> connect by UUID -> UpdatePrompt/InjectAgentMessage -> delete
-# (needs agent:read/agent:write scopes; skipped with the reason otherwise)
+# Reusable agent config: create (README body) -> connect by UUID -> UpdatePrompt/InjectAgentMessage
+# -> delete (needs agent:read/agent:write scopes; skipped with the reason otherwise)
 uv run pytest tests/test_integration.py -v -s -k SavedConfigIntegration
 
 # E2E with real Deepgram, no phone call (greeting, text question, end_call).
-# Runs every test twice: [inline] and [saved] (publishes a config for the run, then deletes it)
+# Runs every test twice: [inline] and [saved] (creates a config for the run, then deletes it)
 uv run pytest tests/test_e2e_live.py -v -s
 
 # Real calls (need Plivo creds, PLIVO_TEST_NUMBER, ngrok)
@@ -510,6 +538,11 @@ Deepgram expects `Authorization: Token <key>`, not `Bearer`. Also check that the
 ### `Error` right after `Settings`
 
 A field in `Settings` is invalid. The most common cause is an `agent.language` or `speak.provider.language` field, which this configuration rejects. Other causes are an unknown model id or provider type (`DEEPGRAM_LISTEN_MODEL`, `DEEPGRAM_THINK_PROVIDER`/`DEEPGRAM_THINK_MODEL`, `DEEPGRAM_SPEAK_MODEL`) or a malformed function schema. The `Error` event's `description` field names the problem.
+
+### Reusable config: every call fails, or old models/prompt are used
+
+- The server does not check the UUID at startup; it only logs `Deepgram agent: reusable config <uuid>`. A deleted or mistyped UUID makes Deepgram reply to each call's `Settings` with an `Error` (`INTERNAL_SERVER_ERROR`, "resolving agent ID"), and the call ends without a greeting. List the project's configs (see [Creating a reusable config](#creating-a-reusable-config)) and fix the env var, or empty it to go back to inline.
+- Changes to `DEEPGRAM_*` model vars, `system_prompt.md` or `FUNCTION_DEFINITIONS` have no effect on this path, because the config was fixed when it was created. Create a new config, switch the UUID and restart.
 
 ### Silence on the call / no greeting
 
