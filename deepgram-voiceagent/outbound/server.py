@@ -140,7 +140,33 @@ _tunnel_proc = None  # cloudflared process started by --tunnel
 
 # Per-call context accepted on the answer_url query string (all optional)
 CALL_DETAIL_PARAMS = ("opening_reason", "objective", "context")
+
+# Startup "Ready!" line: logged once uvicorn accepts connections
+READY_PROBE_TIMEOUT_S = 30.0
+READY_PROBE_INTERVAL_S = 0.1
 READY_EXAMPLE_OPENING_REASON = "you requested a demo"
+
+
+async def _wait_until_serving(port: int, timeout_s: float = READY_PROBE_TIMEOUT_S) -> bool:
+    """True once a local TCP connect to ``port`` succeeds.
+
+    The lifespan startup hook runs before uvicorn binds the port, so "Ready" must wait
+    for a real connection rather than trust the hook.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while True:
+        try:
+            _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        except OSError:
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(READY_PROBE_INTERVAL_S)
+            continue
+        writer.close()
+        with contextlib.suppress(OSError):
+            await writer.wait_closed()
+        return True
 
 
 def ready_message(tunnel: bool = False) -> str:
@@ -172,11 +198,24 @@ def ready_message(tunnel: bool = False) -> str:
     return "\n".join(lines)
 
 
+async def _log_ready_when_serving() -> None:
+    if await _wait_until_serving(SERVER_PORT, READY_PROBE_TIMEOUT_S):
+        logger.info(ready_message(tunnel=_tunnel_proc is not None))
+    else:
+        logger.warning(f"Server did not accept connections on port {SERVER_PORT}; no Ready line")
+
+
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Stop the --tunnel process on shutdown (runs on Ctrl+C and SIGTERM alike)."""
-    yield
-    stop_tunnel(_tunnel_proc)
+    """Log "Ready!" once serving; stop the --tunnel process on shutdown (Ctrl+C / SIGTERM)."""
+    ready_task = asyncio.create_task(_log_ready_when_serving())
+    try:
+        yield
+    finally:
+        ready_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await ready_task
+        stop_tunnel(_tunnel_proc)
 
 
 app = FastAPI(
@@ -503,7 +542,6 @@ def main() -> None:
             "PUBLIC_URL is not set: Plivo cannot reach /outbound/answer. "
             "Set PUBLIC_URL or use --tunnel"
         )
-    logger.info(ready_message(tunnel=args.tunnel))
     uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT, log_level="info")
 
 

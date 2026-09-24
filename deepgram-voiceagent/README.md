@@ -65,11 +65,11 @@ What `--tunnel` does:
 1. Starts `cloudflared tunnel --url http://localhost:$SERVER_PORT`. The quick tunnel needs no Cloudflare account.
 2. Uses the `https://<random>.trycloudflare.com` URL as `PUBLIC_URL`.
 3. Points your Plivo number at it, creating or updating the `Deepgram_VoiceAgent` Plivo application. Plivo only accepts a URL once it can resolve the hostname, so for a new tunnel the server retries in the background for up to 3 minutes. In testing this took about 70 s.
-4. Logs `Ready! Call +<number>` once Plivo accepts the URL.
+4. Logs `Ready! Call +<number> to talk to the agent (Ctrl+C to stop)` once the server accepts connections and Plivo has accepted the URL.
 
 Call the number. Ctrl+C stops the server and the tunnel. The URL changes on every run and the number is re-pointed each time.
 
-For outbound calls, run `uv run python -m outbound.server --tunnel`. It logs a ready-to-paste cURL for Plivo's Make Call API with this server's answer URL; see [Outbound Calls](#outbound-calls). In short:
+For outbound calls, run `uv run python -m outbound.server --tunnel`. Once it accepts connections it logs `Ready!` with a ready-to-paste cURL for Plivo's Make Call API with this server's answer URL; see [Outbound Calls](#outbound-calls). In short:
 
 ```bash
 set -a && source .env && set +a   # PLIVO_AUTH_ID / PLIVO_AUTH_TOKEN in the shell
@@ -167,8 +167,8 @@ Three concurrent asyncio tasks, following the canonical `FIRST_COMPLETED` patter
 | When | File | What it does |
 |---|---|---|
 | Module import | `inbound/agent.py`, `outbound/agent.py` | `load_dotenv()`, read the `DEEPGRAM_*` config, load `system_prompt.md`, define `FUNCTION_DEFINITIONS`. No network calls. |
-| Server start: `uv run python -m inbound.server` | `inbound/server.py` → `main()` | Logging sinks (text/JSON/file/Redis) and optional OTel are set up when the module loads. Then `describe_deepgram_agent()` logs the active path, e.g. `Deepgram agent: inline (listen=flux-general-en, think=open_ai/gpt-4.1-mini, speak=aura-2-thalia-en)` or `Deepgram agent: reusable config <uuid> …`. On the reusable path, `verify_deepgram_agent_id()` looks the UUID up in the API key's Deepgram project (`GET /v1/projects`, then `/projects/{id}/agents/{uuid}`) and **exits with code 1 if it isn't found**; when found, it keeps the config's model names for trace attributes. It warns and starts anyway if it can't check (network error, key without `agent:read`). Then `configure_plivo_webhooks()` creates or updates the Plivo application and assigns `PLIVO_PHONE_NUMBER` when `PUBLIC_URL` is set, then uvicorn starts. |
-| Server start: `uv run python -m outbound.server` | `outbound/server.py` → `main()` | Same agent-path log line and reusable-config ID check, then uvicorn. It logs a cURL for Plivo's Make Call API with this server's answer URL. There is no number auto-config, because you pass the answer and hangup URLs with each call. |
+| Server start: `uv run python -m inbound.server` | `inbound/server.py` → `main()` | Logging sinks (text/JSON/file/Redis) and optional OTel are set up when the module loads. Then `describe_deepgram_agent()` logs the active path, e.g. `Deepgram agent: inline (listen=flux-general-en, think=open_ai/gpt-4.1-mini, speak=aura-2-thalia-en)` or `Deepgram agent: reusable config <uuid> …`. On the reusable path, `verify_deepgram_agent_id()` looks the UUID up in the API key's Deepgram project (`GET /v1/projects`, then `/projects/{id}/agents/{uuid}`) and **exits with code 1 if it isn't found**; when found, it keeps the config's model names for trace attributes. It warns and starts anyway if it can't check (network error, key without `agent:read`). Then `configure_plivo_webhooks()` creates or updates the Plivo application and assigns `PLIVO_PHONE_NUMBER` when `PUBLIC_URL` is set (with `--tunnel`, in a background thread that retries until Plivo accepts the new URL), then uvicorn starts. `Ready! Call +N to talk to the agent (Ctrl+C to stop)` is logged once, when both the server accepts connections (a local TCP connect to `SERVER_PORT`; the lifespan hook runs before uvicorn binds) and the Plivo setup succeeded. No Ready line if the Plivo setup fails or is skipped. |
+| Server start: `uv run python -m outbound.server` | `outbound/server.py` → `main()` | Same agent-path log line and reusable-config ID check, then uvicorn. Once the server accepts connections it logs `Ready!` with a cURL for Plivo's Make Call API and this server's answer URL, ending with `(Ctrl+C to stop)`. There is no number auto-config, because you pass the answer and hangup URLs with each call. |
 | You place a call (Plivo Make Call API) | your shell / backend → Plivo | `POST https://api.plivo.com/v1/Account/{auth_id}/Call/` with `from`, `to`, `answer_url=<PUBLIC_URL>/outbound/answer?opening_reason=…&objective=…&context=…` and optional `hangup_url`. The server has no dial endpoint and keeps no call records. |
 | Plivo answers (`/answer` or `/outbound/answer`) | `server.py` | Returns `<Stream bidirectional keepCallAlive>` XML that points Plivo at `/ws`. Call metadata (and, outbound, the `answer_url` call details) travels in `?body=`. |
 | Each call (`/ws`) | `server.py` → `run_agent()` in `agent.py` | Accepts the WebSocket, reads Plivo's `start` event, then runs `DeepgramVoiceAgent.run()`. That opens a **new** Deepgram WebSocket for the call, sends Settings (inline block or reusable config UUID), sends `UpdatePrompt` + `InjectAgentMessage` on the reusable path, and runs the `plivo_rx` / `deepgram_rx` / `plivo_tx` tasks until the call ends. There is no Deepgram connection before a call arrives. |
@@ -349,7 +349,7 @@ your shell / backend ──POST /v1/Account/{auth_id}/Call/──► Plivo ─�
 | `/ws` | WebSocket | Plivo audio stream; runs the agent |
 | `/` | GET | Health check |
 
-On startup the server logs the cURL below with its own `PUBLIC_URL` and `PLIVO_PHONE_NUMBER` filled in. Credentials stay shell references (`set -a && source .env && set +a` exports them):
+Once it accepts connections, the server logs a `Ready!` line with the cURL below, its own `PUBLIC_URL` and `PLIVO_PHONE_NUMBER` filled in. Credentials stay shell references (`set -a && source .env && set +a` exports them):
 
 ```bash
 curl -X POST "https://api.plivo.com/v1/Account/$PLIVO_AUTH_ID/Call/" \

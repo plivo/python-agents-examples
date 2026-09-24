@@ -1990,6 +1990,180 @@ class TestUnitPlivoAutoConfig:
         assert stopped == ["fake-proc"]
 
 
+@contextlib.contextmanager
+def _listening_port():
+    """A local port that accepts TCP connections (the kernel completes the handshake)."""
+    import socket
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(8)
+    try:
+        yield sock.getsockname()[1]
+    finally:
+        sock.close()
+
+
+def _closed_port() -> int:
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _ready_lines(messages: list[str]) -> list[str]:
+    return [m for m in messages if m.startswith("Ready!")]
+
+
+INBOUND_READY = "Ready! Call +14155550123 to talk to the agent (Ctrl+C to stop)"
+
+
+class TestUnitReadyLine:
+    """Startup "Ready!" lines: logged once, only when the server accepts connections
+    (and, inbound, the Plivo number is configured)."""
+
+    def test_inbound_server_up_first_then_plivo(self, captured_messages):
+        from inbound.server import ReadyLine
+
+        ready = ReadyLine()
+        ready.serving()
+        assert _ready_lines(captured_messages) == []
+        ready.plivo_configured("14155550123")
+        assert _ready_lines(captured_messages) == [INBOUND_READY]
+
+    def test_inbound_plivo_first_then_server_up(self, captured_messages):
+        from inbound.server import ReadyLine
+
+        ready = ReadyLine()
+        ready.plivo_configured("14155550123")
+        assert _ready_lines(captured_messages) == []
+        ready.serving()
+        assert _ready_lines(captured_messages) == [INBOUND_READY]
+
+    def test_inbound_logged_exactly_once(self, captured_messages):
+        import threading
+
+        from inbound.server import ReadyLine
+
+        ready = ReadyLine()
+        threads = [
+            threading.Thread(target=ready.serving if i % 2 else ready.plivo_configured, args=a)
+            for i, a in enumerate([("14155550123",), (), ("14155550123",), ()] * 10)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        ready.serving()
+        ready.plivo_configured("14155550123")
+        assert _ready_lines(captured_messages) == [INBOUND_READY]
+
+    def test_inbound_no_line_without_plivo(self, captured_messages):
+        from inbound.server import ReadyLine
+
+        ReadyLine().serving()
+        assert _ready_lines(captured_messages) == []
+
+    async def test_wait_until_serving(self):
+        from inbound import server
+
+        with _listening_port() as port:
+            assert await server._wait_until_serving(port, timeout_s=2)
+        assert not await server._wait_until_serving(_closed_port(), timeout_s=0.2)
+
+    @staticmethod
+    def _run_main(monkeypatch, server, configured: bool, tunnel: bool = False):
+        """Run inbound main() with uvicorn replaced by the app's lifespan on a live port."""
+        import sys
+
+        monkeypatch.setattr(server, "_ready", server.ReadyLine())
+        monkeypatch.setattr(server, "DEEPGRAM_INBOUND_AGENT_ID", "")
+        monkeypatch.setattr(server, "PLIVO_PHONE_NUMBER", "+1 415 555 0123")
+        monkeypatch.setattr(server, "PUBLIC_URL", "https://example.invalid")
+        monkeypatch.setattr(server, "configure_plivo_webhooks", lambda **_kw: configured)
+        monkeypatch.setattr(sys, "argv", ["inbound.server", *(["--tunnel"] if tunnel else [])])
+        monkeypatch.setattr(server, "_start_tunnel", lambda: None)
+
+        def fake_uvicorn_run(app, **_kwargs):
+            async def serve():
+                with _listening_port() as port:
+                    monkeypatch.setattr(server, "SERVER_PORT", port)
+                    async with server._lifespan(app):
+                        await asyncio.sleep(0.3)
+
+            asyncio.run(serve())
+
+        monkeypatch.setattr(server.uvicorn, "run", fake_uvicorn_run)
+        server.main()
+
+    def test_inbound_fixed_url_plivo_before_uvicorn(self, monkeypatch, captured_messages):
+        from inbound import server
+
+        self._run_main(monkeypatch, server, configured=True)
+        assert _ready_lines(captured_messages) == [INBOUND_READY]
+        # Plivo was configured before uvicorn started, yet Ready waited for the server
+        assert captured_messages.index(INBOUND_READY) > captured_messages.index(
+            "Configuring Plivo webhooks..."
+        )
+
+    def test_inbound_fixed_url_plivo_failure_no_line(self, monkeypatch, captured_messages):
+        from inbound import server
+
+        self._run_main(monkeypatch, server, configured=False)
+        assert _ready_lines(captured_messages) == []
+        assert "Plivo auto-configuration failed. Configure manually." in captured_messages
+
+    def test_inbound_tunnel_plivo_after_server_up(self, monkeypatch, captured_messages):
+        from inbound import server
+
+        threads: list[Any] = []
+        monkeypatch.setattr(
+            server.threading, "Thread", lambda **kw: threads.append(kw) or _NoThread()
+        )
+        self._run_main(monkeypatch, server, configured=True, tunnel=True)
+        assert _ready_lines(captured_messages) == []  # server up, Plivo not yet accepted
+        (thread,) = threads
+        thread["target"](*thread["args"])  # the background configure finishes later
+        assert _ready_lines(captured_messages) == [INBOUND_READY]
+
+    def test_inbound_tunnel_plivo_failure_no_line(self, monkeypatch, captured_messages):
+        from inbound import server
+
+        monkeypatch.setattr(server, "_ready", server.ReadyLine())
+        monkeypatch.setattr(server, "configure_plivo_webhooks", lambda **_kw: False)
+        server._ready.serving()
+        server._configure_plivo_for_tunnel("14155550123")
+        assert _ready_lines(captured_messages) == []
+        assert any("Plivo did not accept" in m for m in captured_messages)
+
+    async def test_outbound_logged_once_when_serving(self, monkeypatch, captured_messages):
+        from outbound import server
+
+        monkeypatch.setattr(server, "PUBLIC_URL", "https://example.invalid")
+        with _listening_port() as port:
+            monkeypatch.setattr(server, "SERVER_PORT", port)
+            async with server._lifespan(server.app):
+                await asyncio.sleep(0.3)
+        ready = _ready_lines(captured_messages)
+        assert ready == [server.ready_message()]
+        assert ready[0].endswith("(Ctrl+C to stop)")
+
+    async def test_outbound_no_line_when_not_serving(self, monkeypatch, captured_messages):
+        from outbound import server
+
+        monkeypatch.setattr(server, "SERVER_PORT", _closed_port())
+        monkeypatch.setattr(server, "READY_PROBE_TIMEOUT_S", 0.2)
+        await server._log_ready_when_serving()
+        assert _ready_lines(captured_messages) == []
+        assert any("no Ready line" in m for m in captured_messages)
+
+
+class _NoThread:
+    def start(self) -> None:
+        pass
+
+
 @pytest.fixture(scope="module")
 def readme_bodies() -> dict[str, dict[str, Any]]:
     """Create bodies printed by the README's reusable-config commands (run as subprocesses)."""

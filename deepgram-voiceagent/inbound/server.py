@@ -137,12 +137,85 @@ TUNNEL_URL_ACCEPT_TIMEOUT_S = 180.0
 TUNNEL_URL_RETRY_INTERVAL_S = 5.0
 _tunnel_proc = None  # cloudflared process started by --tunnel
 
+# Startup "Ready!" line: needs the server accepting connections AND the Plivo number set up
+READY_PROBE_TIMEOUT_S = 30.0
+READY_PROBE_INTERVAL_S = 0.1
+
+
+class ReadyLine:
+    """Logs ``Ready! Call +N ...`` exactly once, when both conditions hold.
+
+    The two conditions arrive in either order and from different threads: ``serving()``
+    from the lifespan probe on the event loop, ``plivo_configured()`` from main() (fixed
+    PUBLIC_URL) or the --tunnel background thread. Neither is called if its step fails,
+    so a failed or skipped Plivo setup logs no Ready line.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._serving = False
+        self._phone = ""
+        self._logged = False
+
+    def serving(self) -> None:
+        with self._lock:
+            self._serving = True
+            self._log_if_ready()
+
+    def plivo_configured(self, phone: str) -> None:
+        with self._lock:
+            self._phone = phone
+            self._log_if_ready()
+
+    def _log_if_ready(self) -> None:
+        if self._serving and self._phone and not self._logged:
+            self._logged = True
+            logger.info(f"Ready! Call +{self._phone} to talk to the agent (Ctrl+C to stop)")
+
+
+_ready = ReadyLine()
+
+
+async def _wait_until_serving(port: int, timeout_s: float = READY_PROBE_TIMEOUT_S) -> bool:
+    """True once a local TCP connect to ``port`` succeeds.
+
+    The lifespan startup hook runs before uvicorn binds the port, so "Ready" must wait
+    for a real connection rather than trust the hook.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    while True:
+        try:
+            _reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        except OSError:
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(READY_PROBE_INTERVAL_S)
+            continue
+        writer.close()
+        with contextlib.suppress(OSError):
+            await writer.wait_closed()
+        return True
+
+
+async def _mark_serving_when_up() -> None:
+    if await _wait_until_serving(SERVER_PORT, READY_PROBE_TIMEOUT_S):
+        _ready.serving()
+    else:
+        logger.warning(f"Server did not accept connections on port {SERVER_PORT}; no Ready line")
+
 
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Stop the --tunnel process on shutdown (runs on Ctrl+C and SIGTERM alike)."""
-    yield
-    stop_tunnel(_tunnel_proc)
+    """Probe for "Ready!"; stop the --tunnel process on shutdown (Ctrl+C and SIGTERM alike)."""
+    ready_task = asyncio.create_task(_mark_serving_when_up())
+    try:
+        yield
+    finally:
+        ready_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await ready_task
+        stop_tunnel(_tunnel_proc)
 
 
 app = FastAPI(
@@ -460,7 +533,7 @@ def _start_tunnel() -> None:
 def _configure_plivo_for_tunnel(phone: str) -> None:
     """Background: wait until Plivo accepts the tunnel URL, then point the number at it."""
     if configure_plivo_webhooks(wait_for_url_s=TUNNEL_URL_ACCEPT_TIMEOUT_S):
-        logger.info(f"Ready! Call +{phone} to talk to the agent (Ctrl+C to stop)")
+        _ready.plivo_configured(phone)
     else:
         logger.warning(
             f"Plivo did not accept {PUBLIC_URL} within {TUNNEL_URL_ACCEPT_TIMEOUT_S:.0f}s. "
@@ -589,7 +662,7 @@ def main() -> None:
             # Serve calls right away; the number is pointed here once Plivo accepts the URL
             threading.Thread(target=_configure_plivo_for_tunnel, args=(phone,), daemon=True).start()
         elif configure_plivo_webhooks():
-            logger.info(f"Ready! Call +{phone} to test")
+            _ready.plivo_configured(phone)  # logged once uvicorn accepts connections
         else:
             logger.warning("Plivo auto-configuration failed. Configure manually.")
     else:

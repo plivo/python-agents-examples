@@ -205,6 +205,10 @@ class TestOutboundCall:
         meta = json.loads(base64.b64decode(body.split("body=")[1].split("<")[0]))
         assert {k: meta[k] for k in CALL_DETAILS} == CALL_DETAILS
 
+        ready = [m for m in log_messages(LOG_PATH) if m.startswith("Ready! Place a call")]
+        assert len(ready) == 1, ready
+        assert f"{ngrok_tunnel}/outbound/answer?opening_reason=" in ready[0]
+
     def test_outbound_call_full_cycle(
         self, server_process, ngrok_tunnel, plivo_client, bleg_app_id
     ):
