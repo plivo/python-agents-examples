@@ -55,7 +55,8 @@ def start_server(
     Skips the calling test if the health check doesn't come up within 15s.
     """
     env = os.environ.copy()
-    env["SERVER_PORT"] = str(port)
+    env["SERVER_PORT"] = str(port)  # inbound.server
+    env["OUTBOUND_SERVER_PORT"] = str(port)  # outbound.server
     env.setdefault("LOG_FORMAT", "json")
     for key, value in (env_overrides or {}).items():
         env[key] = value
