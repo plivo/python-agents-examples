@@ -1229,6 +1229,27 @@ class TestUnitOutboundCallDetails:
         assert seen["prompt"] == agent_mod.build_outbound_prompt("a demo", "", "VIP")
 
 
+class TestUnitSystemPromptSource:
+    """system_prompt.md is the only prompt source; a SYSTEM_PROMPT env var is ignored."""
+
+    @pytest.mark.parametrize(
+        ("direction", "attribute"),
+        [("inbound", "SYSTEM_PROMPT"), ("outbound", "_OUTBOUND_PROMPT_TEMPLATE")],
+    )
+    def test_env_var_does_not_override_file(self, monkeypatch, direction, attribute):
+        import importlib.util
+        import sys
+
+        monkeypatch.setenv("SYSTEM_PROMPT", "You are a pirate.")
+        path = Path(__file__).parent.parent / direction / "agent.py"
+        spec = importlib.util.spec_from_file_location(f"{direction}_agent_env_prompt", path)
+        mod = importlib.util.module_from_spec(spec)
+        monkeypatch.setitem(sys.modules, spec.name, mod)  # dataclasses look it up
+        spec.loader.exec_module(mod)
+        expected = (path.parent / "system_prompt.md").read_text().strip()
+        assert getattr(mod, attribute) == expected
+
+
 class TestUnitCallContextLabels:
     """#1: the call context names each number by its role in the call's direction."""
 
@@ -1500,8 +1521,6 @@ def default_agent_modules(monkeypatch):
         monkeypatch.setattr(mod, "datetime", _FrozenDatetime)
         for name, value in defaults.items():
             monkeypatch.setattr(mod, name, value)
-    inbound_prompt = (Path(inbound_mod.__file__).parent / "system_prompt.md").read_text().strip()
-    monkeypatch.setattr(inbound_mod, "SYSTEM_PROMPT", inbound_prompt)
     return inbound_mod, outbound_mod
 
 
@@ -1990,7 +2009,6 @@ _AGENT_ENV_VARS = (
     "DEEPGRAM_THINK_MODEL",
     "DEEPGRAM_THINK_TEMPERATURE",
     "DEEPGRAM_SPEAK_MODEL",
-    "SYSTEM_PROMPT",
     "AGENT_GREETING",
 )
 

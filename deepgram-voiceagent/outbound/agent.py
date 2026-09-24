@@ -388,6 +388,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "normal").lower()
 # System Prompt + Greeting
 # =============================================================================
 
+# The only prompt source: edit the file, or mount another file over it (see the README).
 _OUTBOUND_PROMPT_TEMPLATE = (Path(__file__).parent / "system_prompt.md").read_text().strip()
 
 # Deepgram speaks agent.greeting verbatim via TTS — literal text, not an LLM instruction.

@@ -92,8 +92,8 @@ Legacy: `gpt4.1-deepgramnova3-elevenflashv2.5-vapi` predates this rule and is st
 │   └── system_prompt.md      # System prompt for inbound calls
 ├── outbound/
 │   ├── __init__.py
-│   ├── agent.py              # Same agent class + OutboundCallRecord, CallManager
-│   ├── server.py             # FastAPI: /outbound/call, /outbound/ws, etc.
+│   ├── agent.py              # Same agent class + outbound prompt/greeting rendered from per-call context
+│   ├── server.py             # FastAPI: /outbound/answer (answer_url context → <Stream>), /outbound/hangup, /ws
 │   └── system_prompt.md      # System prompt for outbound calls
 ├── utils.py                  # Audio conversion, VAD (if native), phone utils
 ├── tests/
@@ -125,12 +125,20 @@ Constants live where they are consumed:
 **`agent.py`** owns:
 - API keys, model names, voice names, API URLs
 - `PLIVO_CHUNK_SIZE = 160` (used in `_send_to_plivo`)
-- `SYSTEM_PROMPT` (loaded from `system_prompt.md`)
+- `SYSTEM_PROMPT` (loaded only from `system_prompt.md`; no env override, see "System Prompt")
 
 **`utils.py`** owns only what its functions consume:
 - Audio sample rates: `PLIVO_SAMPLE_RATE`, `{API}_SAMPLE_RATE`, `VAD_SAMPLE_RATE`
 - VAD params (native only): `VAD_START_THRESHOLD`, `VAD_END_THRESHOLD`, `VAD_MIN_SILENCE_MS`, `VAD_CHUNK_SAMPLES`
 - `DEFAULT_COUNTRY_CODE`
+
+## System Prompt
+
+The system prompt is loaded only from `inbound/system_prompt.md` / `outbound/system_prompt.md`. No `SYSTEM_PROMPT` (or similar) env override: it is a second source of truth, the env is shared by both directions, and multi-line prompts don't fit env files / `docker --env-file`. Customise by editing the file, or by mounting another file over it (e.g. `docker run -v ./my_prompt.md:/app/inbound/system_prompt.md …`).
+
+## Outbound Calls
+
+New examples use the simple outbound path: Plivo Make Call API → `answer_url` (`/outbound/answer?opening_reason=…&objective=…&context=…`, per-call context as query params) → `<Stream>` (context in the base64 `body`) → `/ws` → agent renders prompt + greeting. The server has no dial endpoint and no `CallManager`/campaign/status tracking; `/outbound/hangup` only logs. Reference: `deepgram-voiceagent/`. Existing examples with `CallManager`, `OutboundCallRecord` and `POST /outbound/call` are legacy; don't add them to new ones.
 
 ## utils.py Requirements
 
@@ -285,11 +293,12 @@ Run: `uv run pytest tests/test_integration.py -v -k "unit"` (offline)
 - **Primary reference**: `grok3-voice-native/` — complete native example with Silero VAD
 - `grok3-voice-native/utils.py` — SileroVADProcessor class, audio conversion
 - `grok3-voice-native/inbound/agent.py` — native agent pattern with VAD + barge-in
-- `grok3-voice-native/outbound/agent.py` — OutboundCallRecord, CallManager pattern
+- `grok3-voice-native/outbound/agent.py` — legacy `CallManager` outbound pattern; do not copy it into new examples (see "Outbound Calls")
 - `grok3-voice-native/tests/` — full test suite to replicate
 - `gemini2.5-live-native-no-vad/` — alternative native pattern (SDK-based, server-side VAD, no client-side VAD)
 - `gemini2.5-live-pipecat/inbound/agent.py` — framework Pipeline reference
 - `deepgram-voiceagent/` — managed voice-agent platform reference (raw WebSocket bridge, platform-side turn detection, checkpoint-based playback tracking)
+- `deepgram-voiceagent/outbound/` — outbound reference: Plivo Make Call API → `answer_url` query params → `<Stream>` → agent
 
 ## README Demo Description (Required)
 

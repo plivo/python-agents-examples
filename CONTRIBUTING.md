@@ -75,8 +75,8 @@ Each example project should be a self-contained directory at the repository root
 │   ├── server.py       # FastAPI: /answer, /ws, /hangup
 │   └── system_prompt.md
 ├── outbound/
-│   ├── agent.py        # Same agent + OutboundCallRecord, CallManager
-│   ├── server.py       # FastAPI: /outbound/call, /outbound/ws
+│   ├── agent.py        # Same agent + prompt/greeting from per-call context
+│   ├── server.py       # FastAPI: /outbound/answer, /outbound/hangup, /ws (calls placed via Plivo Make Call API)
 │   └── system_prompt.md
 ├── utils.py            # Audio conversion, VAD, phone utils
 ├── tests/              # Unit, integration, e2e, live call tests

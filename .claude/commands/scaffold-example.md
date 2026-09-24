@@ -88,11 +88,11 @@ Copy `grok3-voice-native/inbound/server.py` → `{example-name}/inbound/server.p
 - Replace Plivo app name (`Grok_Voice_Agent` → `{NewAgent}_Voice_Agent`)
 - Keep ALL routes, webhook logic, and WebSocket handling identical
 
-Do the same for `grok3-voice-native/outbound/server.py` → `{example-name}/outbound/server.py`.
+For `outbound/server.py`, follow `deepgram-voiceagent/outbound/server.py` (the simple path in CLAUDE.md "Outbound Calls"): `/`, `/outbound/answer` (reads `opening_reason`/`objective`/`context` from the query string into the `<Stream>` body), `/outbound/hangup` (logs only), `/ws`. Do not copy `POST /outbound/call`, status/campaign routes or `CallManager` from `grok3-voice-native`.
 
 ### 4. Create system prompts
 
-Copy `grok3-voice-native/inbound/system_prompt.md` and `outbound/system_prompt.md` as starting templates. The user can customize these later.
+Copy `grok3-voice-native/inbound/system_prompt.md` and `outbound/system_prompt.md` as starting templates. The user can customize these later. These files are the only prompt source: no `SYSTEM_PROMPT` env override (see CLAUDE.md "System Prompt").
 
 ### 5. Create agent.py skeletons
 
@@ -103,13 +103,13 @@ Copy `grok3-voice-native/inbound/system_prompt.md` and `outbound/system_prompt.m
   - All method bodies have `# TODO: Implement {api}-specific logic` comments
   - Include the tool functions (check_order_status, send_sms, etc.) from reference
   - Include public `run_agent()` function
-- `outbound/agent.py`: Same skeleton + `OutboundCallRecord`, `CallManager`, `determine_outcome` from `grok3-voice-native/outbound/agent.py`
+- `outbound/agent.py`: Same skeleton + `build_outbound_prompt()` / greeting rendered from the per-call context (`opening_reason`, `objective`, `context`) that `run_agent()` receives. No `CallManager`, `OutboundCallRecord` or `determine_outcome` (legacy); follow `deepgram-voiceagent/outbound/`
 
 **For framework orchestration**:
 - `inbound/agent.py`: Skeleton with `run_agent()` function that assembles a Pipeline
   - `# TODO: Configure {framework} services and pipeline` comments
   - No custom agent class (framework handles task management)
-- `outbound/agent.py`: Similar skeleton + `OutboundCallRecord`, `CallManager`
+- `outbound/agent.py`: Similar skeleton + prompt/greeting rendered from the per-call context (no `CallManager`)
 
 ### 6. Create utils.py
 

@@ -70,7 +70,7 @@ Skip if credentials not configured: `pytestmark = pytest.mark.skipif(...)`
 Similar to test_live_call.py but for outbound:
 1. Start outbound server subprocess
 2. Start ngrok tunnel
-3. POST to `/outbound/call` with PLIVO_TEST_NUMBER
+3. Place the call with Plivo's Make Call API (`client.calls.create(from_=PLIVO_PHONE_NUMBER, to_=PLIVO_TEST_NUMBER, answer_url=<tunnel>/outbound/answer?opening_reason=..., ...)`)
 4. Wait for call to connect
 5. Record, transcribe, verify greeting
 

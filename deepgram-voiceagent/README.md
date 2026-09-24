@@ -251,7 +251,7 @@ On Path 2 a UUID reference is all-or-nothing: no inline `agent` fields can be mi
 
 [Deepgram's reusable agent configurations](https://developers.deepgram.com/docs/reusable-agent-configurations) exist so that an agent definition can be stored once and referenced by ID instead of being resent in every `Settings`. Deepgram lists these use cases: per-customer configs, regional or regulatory compliance, A/B testing voices or prompts, and multi-agent architectures.
 
-With a UUID set, Deepgram receives **only the UUID**. The `DEEPGRAM_LISTEN_*`, `DEEPGRAM_THINK_*`, `DEEPGRAM_SPEAK_*` vars, `system_prompt.md` / `SYSTEM_PROMPT` and `FUNCTION_DEFINITIONS` matter only at the moment you create the config. `AGENT_GREETING` (inbound), the outbound greeting and "This Call" details, and the per-call context still apply on every call.
+With a UUID set, Deepgram receives **only the UUID**. The `DEEPGRAM_LISTEN_*`, `DEEPGRAM_THINK_*`, `DEEPGRAM_SPEAK_*` vars, the prompt file (`inbound/system_prompt.md`; outbound: `outbound/system_prompt.md` rendered by `build_outbound_prompt()` with pointers to "This Call") and `FUNCTION_DEFINITIONS` matter only at the moment you create the config. `AGENT_GREETING` (inbound), the outbound greeting and "This Call" details, and the per-call context still apply on every call.
 
 ### Creating a reusable config
 
@@ -500,7 +500,6 @@ session                  +    0ms  21983ms  gpt-4.1-mini, flux-general-en, aura-
 | `AGENT_GREETING` | Inbound greeting, spoken verbatim (outbound ignores it) | `Hi, this is Alex from TechFlow. I'm built with the Deepgram Voice Agent API on Plivo. How can I help you today?` |
 | `DEEPGRAM_INBOUND_AGENT_ID` | Reusable agent config UUID for inbound calls (see [Creating a reusable config](#creating-a-reusable-config)); empty = inline Settings | — |
 | `DEEPGRAM_OUTBOUND_AGENT_ID` | Reusable agent config UUID for outbound calls; empty = inline Settings | — |
-| `SYSTEM_PROMPT` | Inbound: replaces `system_prompt.md`. Outbound: used only when no `CallManager` record is found (records always use `build_outbound_prompt()`) | — |
 | `PLIVO_AUTH_ID` | Plivo Auth ID | Required |
 | `PLIVO_AUTH_TOKEN` | Plivo Auth Token | Required |
 | `PLIVO_PHONE_NUMBER` | Plivo number (inbound auto-config; outbound: the `from` shown in the startup cURL) | Required |
@@ -514,6 +513,21 @@ session                  +    0ms  21983ms  gpt-4.1-mini, flux-general-en, aura-
 | `REDIS_EVENTS_URL` | Redis URL for the Streams sink | — |
 | `REDIS_STREAM_KEY` | Redis stream key | `voice-agent:events` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP endpoint for tracing | — |
+
+### System prompt
+
+Each direction has one prompt source: `inbound/system_prompt.md` and `outbound/system_prompt.md`. There is no `SYSTEM_PROMPT` env var. The env file is shared by both directions, and a multi-line prompt doesn't fit an env file or `docker --env-file`. To customise a prompt, edit the file. To customise it in Docker without editing the repo, mount your own file over it (the image's `WORKDIR` is `/app`):
+
+```bash
+docker run -v "$PWD/my_prompt.md:/app/inbound/system_prompt.md:ro" \
+  -p 8000:8000 --env-file .env -e PUBLIC_URL=https://your-host.example.com deepgram-voiceagent
+
+docker run -v "$PWD/my_outbound_prompt.md:/app/outbound/system_prompt.md:ro" \
+  -p 8000:8000 --env-file .env -e PUBLIC_URL=https://your-host.example.com deepgram-voiceagent \
+  uv run python -m outbound.server
+```
+
+The outbound file is a template: keep `{{greeting}}`, `{{opening_reason}}`, `{{objective}}` and `{{context}}` where the per-call values should go (any you leave out are simply not used). On the reusable-config path the prompt is fixed when the config is created, so create a new config after changing it.
 
 ## Model Configuration
 
