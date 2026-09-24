@@ -2678,6 +2678,154 @@ class TestUnitSavedAgentConfig:
 
 
 # =============================================================================
+# UNIT TESTS - ngrok helper (subprocess / httpx mocked; nothing is started or killed)
+# =============================================================================
+
+
+class _FakeNgrokProc:
+    """Stands in for the Popen handle of the ngrok agent start_ngrok starts."""
+
+    def __init__(self, exits_on_terminate: bool = True) -> None:
+        self.exits_on_terminate = exits_on_terminate
+        self.returncode: int | None = None
+        self.calls: list[str] = []
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.calls.append("terminate")
+        if self.exits_on_terminate:
+            self.returncode = -15
+
+    def kill(self) -> None:
+        self.calls.append("kill")
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.calls.append(f"wait({timeout})")
+        if self.returncode is None:
+            import subprocess
+
+            raise subprocess.TimeoutExpired("ngrok", timeout or 0)
+        return self.returncode
+
+
+# Kill-by-name commands, split so a grep for them finds nothing in this repo
+_KILL_BY_NAME = ("p" + "kill", "kill" + "all")
+
+
+class TestUnitNgrokHelper:
+    """start_ngrok/stop_ngrok never kill by name and only stop their own process."""
+
+    @pytest.fixture
+    def ngrok_env(self, monkeypatch):
+        import subprocess
+
+        from tests import helpers
+
+        env: dict[str, Any] = {"run": [], "popen": [], "procs": []}
+
+        def fake_run(cmd, *args, **kwargs):
+            env["run"].append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="4242\n", stderr="")
+
+        def fake_popen(cmd, *args, **kwargs):
+            env["popen"].append(list(cmd))
+            proc = _FakeNgrokProc()
+            env["procs"].append(proc)
+            return proc
+
+        monkeypatch.setattr(helpers.subprocess, "run", fake_run)
+        monkeypatch.setattr(helpers.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(helpers.time, "sleep", lambda _s: None)
+        return env
+
+    @staticmethod
+    def _tunnels(port: int) -> httpx.Response:
+        tunnel = {
+            "proto": "https",
+            "public_url": "https://ours.ngrok.app",
+            "config": {"addr": f"http://localhost:{port}"},
+        }
+        return httpx.Response(200, json={"tunnels": [tunnel]})
+
+    def test_skips_when_ngrok_api_responds(self, monkeypatch, ngrok_env):
+        from tests import helpers
+
+        monkeypatch.setattr(helpers.httpx, "get", lambda *_a, **_k: self._tunnels(9999))
+        with pytest.raises(pytest.skip.Exception, match=r"already running \(pid 4242\)"):
+            helpers.start_ngrok(18000)
+        assert ngrok_env["popen"] == [], "must not start a second ngrok agent"
+        assert ngrok_env["run"] == [["pgrep", "-f", "ngrok"]]
+
+    def test_starts_own_agent_and_never_kills_by_name(self, monkeypatch, ngrok_env):
+        from tests import helpers
+
+        responses = iter([httpx.ConnectError("refused"), self._tunnels(18000)])
+
+        def fake_get(*_a, **_k):
+            item = next(responses)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        monkeypatch.setattr(helpers.httpx, "get", fake_get)
+        proc, url = helpers.start_ngrok(18000)
+        assert url == "https://ours.ngrok.app"
+        assert ngrok_env["popen"] == [[helpers.NGROK_BIN, "http", "18000"]]
+        assert proc is ngrok_env["procs"][0] and proc.calls == []
+        for cmd in ngrok_env["run"]:
+            assert cmd[0] not in _KILL_BY_NAME, cmd
+
+    def test_failure_path_stops_only_its_own_process(self, monkeypatch, ngrok_env):
+        from tests import helpers
+
+        def refused(*_a, **_k):
+            raise httpx.ConnectError("refused")
+
+        monkeypatch.setattr(helpers.httpx, "get", refused)
+        with pytest.raises(pytest.skip.Exception, match="did not start"):
+            helpers.start_ngrok(18000)
+        assert ngrok_env["procs"][0].calls[0] == "terminate"
+        assert all(cmd[0] not in _KILL_BY_NAME for cmd in ngrok_env["run"])
+
+    def test_teardown_terminates_only_its_own_process(self, ngrok_env):
+        from tests import helpers
+
+        proc = _FakeNgrokProc()
+        helpers.stop_ngrok(proc)
+        assert proc.calls == ["terminate", "wait(5)"]
+        assert ngrok_env["run"] == [] and ngrok_env["popen"] == []
+
+    def test_teardown_kills_own_process_if_terminate_times_out(self, ngrok_env):
+        from tests import helpers
+
+        proc = _FakeNgrokProc(exits_on_terminate=False)
+        helpers.stop_ngrok(proc)
+        assert proc.calls == ["terminate", "wait(5)", "kill", "wait(None)"]
+        assert ngrok_env["run"] == []
+
+    def test_teardown_of_exited_process_is_a_no_op(self, ngrok_env):
+        from tests import helpers
+
+        proc = _FakeNgrokProc()
+        proc.returncode = 0
+        helpers.stop_ngrok(proc)
+        assert proc.calls == []
+
+    def test_no_kill_by_name_anywhere_in_tests(self):
+        tests_dir = Path(__file__).parent
+        offenders = [
+            f"{path.name}:{n}"
+            for path in sorted(tests_dir.glob("*.py"))
+            for n, line in enumerate(path.read_text().splitlines(), 1)
+            if any(needle in line for needle in _KILL_BY_NAME)
+        ]
+        assert offenders == []
+
+
+# =============================================================================
 # LOCAL INTEGRATION TESTS (real server subprocess + real Deepgram)
 # =============================================================================
 

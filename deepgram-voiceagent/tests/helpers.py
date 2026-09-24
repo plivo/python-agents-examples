@@ -21,7 +21,7 @@ import pytest
 from plivo.utils.signature_v3 import construct_get_url, construct_post_url, get_signature_v3
 
 NGROK_BIN = os.getenv("NGROK_BIN", "ngrok")
-NGROK_API = "http://localhost:4040/api/tunnels"
+NGROK_API = "http://127.0.0.1:4040/api/tunnels"
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 
@@ -288,15 +288,40 @@ def upsert_application(
     return client.applications.create(app_name=app_name, **params)["app_id"]
 
 
-def start_ngrok(port: int) -> tuple[subprocess.Popen, str]:
-    """Start ngrok tunnel and return (process, public_url).
+def _running_ngrok_pids() -> list[str]:
+    """PIDs of ngrok processes on this machine (read-only ``pgrep``; for messages only)."""
+    try:
+        out = subprocess.run(["pgrep", "-f", "ngrok"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return out.stdout.split()
 
-    Kills any existing ngrok processes first to avoid picking up
-    a stale tunnel on a different port.
+
+def _ngrok_agent_running() -> bool:
+    """True if an ngrok agent already answers on its local API (``NGROK_API``)."""
+    try:
+        httpx.get(NGROK_API, timeout=1.0)
+    except httpx.HTTPError:
+        return False
+    return True
+
+
+def start_ngrok(port: int) -> tuple[subprocess.Popen, str]:
+    """Start our own ngrok tunnel to ``port`` and return (process, public_url).
+
+    Never kills other ngrok processes: an agent already running on this machine belongs
+    to another session or to a manual tunnel, and killing it would break that session's
+    calls. ngrok's free plan allows only one agent session at a time, so instead of
+    starting a second agent this skips the test when one is already up (its local API
+    answers on ``NGROK_API``). Only the process started here is ever stopped, through its
+    own ``Popen`` handle (``stop_ngrok``), on the failure path and at teardown.
     """
-    # Kill existing ngrok processes to avoid port conflicts
-    subprocess.run(["pkill", "-f", "ngrok"], capture_output=True)
-    time.sleep(1)
+    if _ngrok_agent_running():
+        pids = ", ".join(_running_ngrok_pids()) or "unknown"
+        pytest.skip(
+            f"ngrok is already running (pid {pids}), probably another session or a manual "
+            "tunnel; stop it and re-run"
+        )
 
     proc = subprocess.Popen(
         [NGROK_BIN, "http", str(port)],
@@ -306,37 +331,37 @@ def start_ngrok(port: int) -> tuple[subprocess.Popen, str]:
 
     public_url = None
     for _ in range(30):
+        if proc.poll() is not None:  # our agent exited (bad auth, session limit, ...)
+            break
         try:
             resp = httpx.get(NGROK_API, timeout=1.0)
             if resp.status_code == 200:
-                tunnels = resp.json().get("tunnels", [])
-                for t in tunnels:
-                    if t.get("proto") == "https":
-                        # Verify tunnel points to the correct port
-                        addr = t.get("config", {}).get("addr", "")
-                        if str(port) in addr:
-                            public_url = t["public_url"]
-                            break
+                for t in resp.json().get("tunnels", []):
+                    addr = t.get("config", {}).get("addr", "")
+                    if t.get("proto") == "https" and str(port) in addr:
+                        public_url = t["public_url"]
+                        break
                 if public_url:
                     break
-        except Exception:
+        except (httpx.HTTPError, ValueError):
             pass
         time.sleep(0.5)
 
     if not public_url:
-        proc.terminate()
-        proc.wait()
+        stop_ngrok(proc)
         pytest.skip("ngrok did not start or no HTTPS tunnel found")
 
     return proc, public_url
 
 
 def stop_ngrok(proc: subprocess.Popen) -> None:
-    """Stop ngrok process."""
+    """Stop the ngrok process started by ``start_ngrok`` (only that one, by its handle)."""
+    if proc.poll() is not None:
+        return
+    proc.terminate()
     try:
-        proc.terminate()
         proc.wait(timeout=5)
-    except Exception:
+    except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
 
