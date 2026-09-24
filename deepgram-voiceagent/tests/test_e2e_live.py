@@ -49,8 +49,10 @@ from tests.helpers import (
     log_messages,
     read_log_events,
     server_log_path,
+    signed_webhook,
     start_server,
     stop_server,
+    stream_url_from_xml,
 )
 from utils import ulaw_to_pcm
 
@@ -60,7 +62,9 @@ ensure_ffmpeg_on_path()
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 
 TEST_PORT = 18001
-TEST_WS_URL = f"ws://localhost:{TEST_PORT}/ws"
+TEST_HTTP_URL = f"http://localhost:{TEST_PORT}"
+# Plivo auth token the local server checks webhook signatures and /ws tokens with
+TEST_AUTH_TOKEN = "test-plivo-auth-token"
 LOG_PATH = server_log_path("e2e_live_server")
 
 pytestmark = pytest.mark.skipif(not DEEPGRAM_API_KEY, reason="DEEPGRAM_API_KEY not configured")
@@ -198,10 +202,16 @@ class SimulatedPlivo:
 
 @contextlib.asynccontextmanager
 async def plivo_call(call_uuid: str):
-    body = base64.b64encode(
-        json.dumps({"call_uuid": call_uuid, "from": "+15551234567", "to": "+16572338892"}).encode()
-    ).decode()
-    async with websockets.connect(f"{TEST_WS_URL}?body={body}", close_timeout=3) as ws:
+    # Answer webhook signed as Plivo signs it; its <Stream> URL carries the /ws token
+    answer = await asyncio.to_thread(
+        signed_webhook,
+        "POST",
+        f"{TEST_HTTP_URL}/answer",
+        TEST_AUTH_TOKEN,
+        {"CallUUID": call_uuid, "From": "+15551234567", "To": "+16572338892"},
+    )
+    assert answer.status_code == 200, answer.text
+    async with websockets.connect(stream_url_from_xml(answer.text), close_timeout=3) as ws:
         call = SimulatedPlivo(ws)
         await call.start()
         try:
@@ -221,8 +231,15 @@ def server_process(request):
 
     ``saved`` creates a reusable agent config first and always deletes it afterwards.
     """
-    # No Plivo credentials: end_call must not try a REST hangup of a fake call
-    env = {"PLIVO_AUTH_ID": "", "PLIVO_AUTH_TOKEN": "", "PUBLIC_URL": ""}
+    # No PLIVO_AUTH_ID: end_call must not try a REST hangup of a fake call. Webhook auth
+    # stays on with a test token (answer webhooks are signed, /ws needs the issued token).
+    env = {
+        "PLIVO_AUTH_ID": "",
+        "PLIVO_AUTH_TOKEN": TEST_AUTH_TOKEN,
+        "PLIVO_PHONE_NUMBER": "",
+        "PLIVO_WEBHOOK_AUTH": "on",
+        "PUBLIC_URL": TEST_HTTP_URL,
+    }
     env["DEEPGRAM_INBOUND_AGENT_ID"] = ""
     if request.param == "saved":
         env["DEEPGRAM_INBOUND_AGENT_ID"] = create_agent_config("inbound")

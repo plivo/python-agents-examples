@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+from xml.etree import ElementTree
 
 import httpx
 import plivo
 import pytest
+from plivo.utils.signature_v3 import construct_get_url, construct_post_url, get_signature_v3
 
 NGROK_BIN = os.getenv("NGROK_BIN", "ngrok")
 NGROK_API = "http://localhost:4040/api/tunnels"
@@ -117,6 +122,58 @@ def read_log_events(log_path: Path, event: str | None = None) -> list[dict]:
 def log_messages(log_path: Path) -> list[str]:
     """Return every log message text from a server log file."""
     return [r.get("message", "") for r in read_log_records(log_path)]
+
+
+# =============================================================================
+# Plivo webhook signing (V3) and /ws stream URLs — what Plivo itself sends
+# =============================================================================
+
+
+def plivo_signature_headers(
+    method: str,
+    url: str,
+    auth_token: str,
+    params: dict | None = None,
+    nonce: str | None = None,
+) -> dict[str, str]:
+    """``X-Plivo-Signature-V3`` headers for a webhook request, signed the way Plivo signs.
+
+    ``url`` is the full URL Plivo was configured to call, query string included. For POST,
+    ``params`` are the form fields; for GET, Plivo's params are part of ``url``. The base
+    string comes from the Plivo SDK (the same code the server validates with).
+    """
+    nonce = nonce or str(secrets.randbelow(10**20))
+    if method.upper() == "GET":
+        base_url = construct_get_url(url, dict(params or {}))
+    else:
+        base_url = construct_post_url(url, dict(params or {}))
+    signature = get_signature_v3(auth_token.encode(), base_url.decode(), nonce.encode())
+    return {"X-Plivo-Signature-V3": signature.decode(), "X-Plivo-Signature-V3-Nonce": nonce}
+
+
+def signed_webhook(
+    method: str, url: str, auth_token: str, data: dict | None = None, timeout: float = 10.0
+) -> httpx.Response:
+    """Send a Plivo-signed webhook request (form ``data`` for POST) to ``url``."""
+    headers = plivo_signature_headers(method, url, auth_token, data)
+    return httpx.request(method, url, data=data, headers=headers, timeout=timeout)
+
+
+def stream_url_from_xml(xml: str) -> str:
+    """The wss:// URL of the <Stream> element in an answer webhook response."""
+    stream = ElementTree.fromstring(xml).find("Stream")
+    assert stream is not None and stream.text, f"No <Stream> URL in: {xml}"
+    return stream.text.strip()
+
+
+def stream_query(xml: str) -> dict[str, str]:
+    """Decoded query params (``body``, ``token``) of the <Stream> URL."""
+    return {k: v[0] for k, v in parse_qs(urlsplit(stream_url_from_xml(xml)).query).items()}
+
+
+def stream_body(xml: str) -> dict:
+    """The call metadata JSON carried in the <Stream> URL's ``body``."""
+    return json.loads(base64.b64decode(stream_query(xml)["body"]))
 
 
 # =============================================================================

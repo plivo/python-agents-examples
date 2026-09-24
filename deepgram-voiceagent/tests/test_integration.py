@@ -40,7 +40,15 @@ import websockets
 from dotenv import load_dotenv
 from loguru import logger
 
-from tests.helpers import server_log_path, start_server, stop_server
+from tests.helpers import (
+    plivo_signature_headers,
+    server_log_path,
+    start_server,
+    stop_server,
+    stream_body,
+    stream_query,
+    stream_url_from_xml,
+)
 from utils import (
     deepgram_to_plivo,
     normalize_phone_number,
@@ -63,6 +71,8 @@ LOCAL_WS_URL = f"ws://localhost:{TEST_PORT}/ws"
 LOCAL_HTTP_URL = f"http://localhost:{TEST_PORT}"
 
 STREAM_ID = "stream-0001"
+# Plivo auth token the unit tests sign webhooks with (never a real credential)
+TEST_AUTH_TOKEN = "test-plivo-auth-token"
 CALL_ID = "call-1234-5678-90ab-cdef00000001"
 
 
@@ -144,6 +154,29 @@ class FakeDeepgramWS:
 
     def sent_types(self) -> list[str]:
         return [m.get("type", "") for m in self.sent_json()]
+
+
+@pytest.fixture(autouse=True)
+def webhook_auth_on(monkeypatch):
+    """Both servers check webhook signatures and /ws tokens with TEST_AUTH_TOKEN."""
+    from inbound import server as inbound_server
+    from outbound import server as outbound_server
+
+    for server in (inbound_server, outbound_server):
+        monkeypatch.setattr(server, "PLIVO_AUTH_TOKEN", TEST_AUTH_TOKEN)
+        monkeypatch.setattr(server, "PLIVO_WEBHOOK_AUTH", "on")
+
+
+def signed(method: str, public_url: str, path: str, data: dict | None = None) -> dict[str, str]:
+    """Headers Plivo sends for ``path`` (query included) under ``public_url``."""
+    url = public_url.rstrip("/") + path
+    return plivo_signature_headers(method, url, TEST_AUTH_TOKEN, data)
+
+
+def ws_path(xml: str) -> str:
+    """Path + query of the <Stream> URL (what Plivo opens on this server)."""
+    url = stream_url_from_xml(xml)
+    return url[url.index("/ws") :]
 
 
 @pytest.fixture
@@ -1292,9 +1325,11 @@ class TestUnitServerRoutes:
 
         monkeypatch.setattr(server, "PUBLIC_URL", "https://example.ngrok.app")
         client = TestClient(server.app)
+        form = {"CallUUID": "uuid-1", "From": "+15551234567", "To": "+16572338892"}
         resp = client.post(
             "/answer",
-            data={"CallUUID": "uuid-1", "From": "+15551234567", "To": "+16572338892"},
+            data=form,
+            headers=signed("POST", "https://example.ngrok.app", "/answer", form),
         )
         assert resp.status_code == 200
         assert "application/xml" in resp.headers["content-type"]
@@ -1304,8 +1339,8 @@ class TestUnitServerRoutes:
         assert 'keepCallAlive="true"' in xml
         assert "audio/x-mulaw;rate=8000" in xml
         assert "wss://example.ngrok.app/ws?body=" in xml
-        body = xml.split("body=")[1].split("<")[0]
-        meta = json.loads(base64.b64decode(body))
+        assert stream_query(xml)["token"]
+        meta = stream_body(xml)
         assert meta["call_uuid"] == "uuid-1"
         assert meta["from"] == "+15551234567"
 
@@ -1348,21 +1383,24 @@ class TestUnitServerRoutes:
 
         monkeypatch.setattr(server, "PUBLIC_URL", "https://example.ngrok.app/")
         client = TestClient(server.app)
+        path = (
+            "/outbound/answer?opening_reason=you%20requested%20a%20demo&objective=book%20a%20call"
+        )
+        form = {
+            "CallUUID": "a-leg-uuid",
+            "From": "+14155550100",
+            "To": "+15551234567",
+            "SIP-H-Account": "acme",
+        }
         resp = client.post(
-            "/outbound/answer?opening_reason=you%20requested%20a%20demo&objective=book%20a%20call",
-            data={
-                "CallUUID": "a-leg-uuid",
-                "From": "+14155550100",
-                "To": "+15551234567",
-                "SIP-H-Account": "acme",
-            },
+            path, data=form, headers=signed("POST", "https://example.ngrok.app/", path, form)
         )
         assert "<Stream" in resp.text
         assert 'bidirectional="true"' in resp.text
         assert 'keepCallAlive="true"' in resp.text
         assert "audio/x-mulaw;rate=8000" in resp.text
         assert "wss://example.ngrok.app/ws?body=" in resp.text
-        meta = json.loads(base64.b64decode(resp.text.split("body=")[1].split("<")[0]))
+        meta = stream_body(resp.text)
         assert meta == {
             "call_uuid": "a-leg-uuid",
             "from": "+14155550100",
@@ -1380,19 +1418,25 @@ class TestUnitServerRoutes:
         from outbound import server
 
         monkeypatch.setattr(server, "PUBLIC_URL", "https://example.ngrok.app")
-        resp = TestClient(server.app).get("/outbound/answer?CallUUID=u1&To=%2B15551234567")
-        meta = json.loads(base64.b64decode(resp.text.split("body=")[1].split("<")[0]))
+        path = "/outbound/answer?CallUUID=u1&To=%2B15551234567"
+        resp = TestClient(server.app).get(
+            path, headers=signed("GET", "https://example.ngrok.app", path)
+        )
+        meta = stream_body(resp.text)
         assert (meta["call_uuid"], meta["to"]) == ("u1", "+15551234567")
         assert (meta["opening_reason"], meta["objective"], meta["context"]) == ("", "", "")
 
-    def test_outbound_hangup_webhook_logs(self, captured_messages):
+    def test_outbound_hangup_webhook_logs(self, monkeypatch, captured_messages):
         from fastapi.testclient import TestClient
 
         from outbound import server
 
+        monkeypatch.setattr(server, "PUBLIC_URL", "https://example.ngrok.app")
+        form = {"CallUUID": "u1", "Duration": "12", "HangupCause": "NORMAL_CLEARING"}
         resp = TestClient(server.app).post(
             "/outbound/hangup",
-            data={"CallUUID": "u1", "Duration": "12", "HangupCause": "NORMAL_CLEARING"},
+            data=form,
+            headers=signed("POST", "https://example.ngrok.app", "/outbound/hangup", form),
         )
         assert resp.text == "OK"
         assert any(
@@ -1448,6 +1492,343 @@ class TestUnitServerRoutes:
         message = server.ready_message()
         assert '"from": "<your Plivo number>"' in message
         assert '"answer_url": "<PUBLIC_URL>/outbound/answer?' in message
+
+
+# =============================================================================
+# UNIT TESTS - Webhook authentication (Plivo V3 signatures, /ws tokens)
+# =============================================================================
+
+SERVER_MODULES = ["inbound.server", "outbound.server"]
+PUBLIC = "https://agent.example.com"
+FORM = {"CallUUID": "c-1", "From": "+15551230000", "To": "+15557654321"}
+# Every Plivo webhook route: (module, method, path)
+WEBHOOK_ROUTES = [
+    ("inbound.server", "POST", "/answer"),
+    ("inbound.server", "GET", "/answer?CallUUID=c-1&From=%2B15551230000"),
+    ("inbound.server", "POST", "/hangup"),
+    ("inbound.server", "POST", "/fallback"),
+    ("inbound.server", "GET", "/hold"),
+    ("inbound.server", "POST", "/hold"),
+    ("outbound.server", "POST", "/outbound/answer?opening_reason=a%20demo"),
+    ("outbound.server", "GET", "/outbound/answer?CallUUID=c-1&objective=book"),
+    ("outbound.server", "POST", "/outbound/hangup"),
+]
+
+
+def _server(module: str, monkeypatch, public_url: str = PUBLIC):
+    import importlib
+
+    server = importlib.import_module(module)
+    monkeypatch.setattr(server, "PUBLIC_URL", public_url)
+    return server
+
+
+def _answer_path(module: str) -> str:
+    return "/answer" if module == "inbound.server" else "/outbound/answer?opening_reason=a%20demo"
+
+
+class _RunAgentRecorder:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def __call__(self, **kwargs: Any) -> None:
+        self.calls.append(kwargs)
+
+
+class TestUnitWebhookAuth:
+    """Plivo V3 signature checks on webhooks and the signed /ws token."""
+
+    @pytest.mark.parametrize(("module", "method", "path"), WEBHOOK_ROUTES)
+    def test_every_webhook_accepts_signed_and_rejects_unsigned(
+        self, monkeypatch, module, method, path
+    ):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(_server(module, monkeypatch).app)
+        data = FORM if method == "POST" else None
+        ok = client.request(method, path, data=data, headers=signed(method, PUBLIC, path, data))
+        assert ok.status_code == 200, ok.text
+        assert client.request(method, path, data=data).status_code == 403
+
+    @pytest.mark.parametrize("module", SERVER_MODULES)
+    def test_valid_post_logs_verification(self, monkeypatch, captured_messages, module):
+        from fastapi.testclient import TestClient
+
+        path = _answer_path(module)
+        client = TestClient(_server(module, monkeypatch).app)
+        resp = client.post(path, data=FORM, headers=signed("POST", PUBLIC, path, FORM))
+        assert resp.status_code == 200
+        suffix = " + query string" if "?" in path else ""
+        assert f"Plivo signature verified: POST {path.split('?')[0]}{suffix}" in captured_messages
+
+    @pytest.mark.parametrize("drop", ["X-Plivo-Signature-V3", "X-Plivo-Signature-V3-Nonce", "both"])
+    def test_missing_headers_rejected(self, monkeypatch, captured_messages, drop):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(_server("inbound.server", monkeypatch).app)
+        headers = signed("POST", PUBLIC, "/answer", FORM)
+        for name in list(headers):
+            if drop in (name, "both"):
+                del headers[name]
+        assert client.post("/answer", data=FORM, headers=headers).status_code == 403
+        assert any("Rejected Plivo webhook POST /answer: missing" in m for m in captured_messages)
+
+    def test_wrong_signature_rejected_and_not_logged(self, monkeypatch, captured_messages):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(_server("inbound.server", monkeypatch).app)
+        headers = plivo_signature_headers("POST", f"{PUBLIC}/answer", "some-other-token", FORM)
+        resp = client.post("/answer", data=FORM, headers=headers)
+        assert resp.status_code == 403
+        rejected = [m for m in captured_messages if "Rejected Plivo webhook" in m]
+        assert rejected and "signature mismatch" in rejected[0]
+        joined = "\n".join(captured_messages)
+        assert headers["X-Plivo-Signature-V3"] not in joined
+        assert TEST_AUTH_TOKEN not in joined
+
+    @pytest.mark.parametrize("module", SERVER_MODULES)
+    def test_tampered_form_field_rejected(self, monkeypatch, module):
+        from fastapi.testclient import TestClient
+
+        path = _answer_path(module)
+        client = TestClient(_server(module, monkeypatch).app)
+        headers = signed("POST", PUBLIC, path, FORM)
+        tampered = {**FORM, "To": "+19995550000"}
+        assert client.post(path, data=tampered, headers=headers).status_code == 403
+        extra = {**FORM, "Extra": "x"}
+        assert client.post(path, data=extra, headers=headers).status_code == 403
+
+    @pytest.mark.parametrize("method", ["POST", "GET"])
+    def test_tampered_outbound_query_string_rejected(self, monkeypatch, method):
+        """The answer_url call details are covered by the signature."""
+        from fastapi.testclient import TestClient
+
+        client = TestClient(_server("outbound.server", monkeypatch).app)
+        data = FORM if method == "POST" else None
+        signed_path = "/outbound/answer?opening_reason=a%20demo&objective=book"
+        headers = signed(method, PUBLIC, signed_path, data)
+        for sent in (
+            "/outbound/answer?opening_reason=free%20money&objective=book",
+            "/outbound/answer?opening_reason=a%20demo&objective=book&context=injected",
+            "/outbound/answer?opening_reason=a%20demo",
+        ):
+            assert client.request(method, sent, data=data, headers=headers).status_code == 403
+        ok = client.request(method, signed_path, data=data, headers=headers)
+        assert ok.status_code == 200
+
+    def test_post_with_query_base_string_rule(self):
+        """SDK rule: URL + '?' + sorted decoded query + '.' + sorted form name/value pairs."""
+        from plivo.utils.signature_v3 import construct_post_url
+
+        base = construct_post_url(
+            f"{PUBLIC}/outbound/answer?opening_reason=a%20demo&context=c", {"To": "1", "From": "2"}
+        )
+        assert base.decode() == f"{PUBLIC}/outbound/answer?context=c&opening_reason=a demo.From2To1"
+
+    @pytest.mark.parametrize("module", SERVER_MODULES)
+    def test_signature_checked_against_public_url_not_request_url(self, monkeypatch, module):
+        """Behind a tunnel the server sees http://localhost (here http://testserver)."""
+        from fastapi.testclient import TestClient
+
+        path = _answer_path(module)
+        client = TestClient(_server(module, monkeypatch).app)
+        seen_by_server = plivo_signature_headers(
+            "POST", f"http://testserver{path}", TEST_AUTH_TOKEN, FORM
+        )
+        assert client.post(path, data=FORM, headers=seen_by_server).status_code == 403
+        as_plivo = signed("POST", PUBLIC, path, FORM)
+        assert client.post(path, data=FORM, headers=as_plivo).status_code == 200
+
+    @pytest.mark.parametrize("module", SERVER_MODULES)
+    def test_public_request_url_reconstruction(self, monkeypatch, module):
+        from starlette.requests import Request
+
+        server = _server(module, monkeypatch, "https://agent.example.com/")
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "server": ("127.0.0.1", 8000),
+            "path": "/outbound/answer",
+            "query_string": b"opening_reason=a%20demo&x=1",
+            "headers": [(b"host", b"localhost:8000")],
+        }
+        assert server.public_request_url(Request(scope)) == (
+            "https://agent.example.com/outbound/answer?opening_reason=a%20demo&x=1"
+        )
+        scope["query_string"] = b""
+        assert server.public_request_url(Request(scope)) == (
+            "https://agent.example.com/outbound/answer"
+        )
+
+    @pytest.mark.parametrize("module", SERVER_MODULES)
+    def test_tunnel_public_url_set_at_runtime_is_used(self, monkeypatch, module):
+        from fastapi.testclient import TestClient
+
+        server = _server(module, monkeypatch, "https://old.example.com")
+        monkeypatch.setattr(
+            server, "start_quick_tunnel", lambda port: ("https://t-7.trycloudflare.com", None)
+        )
+        monkeypatch.setattr(server.atexit, "register", lambda *a: None)
+        server._start_tunnel()
+        path = _answer_path(module)
+        client = TestClient(server.app)
+        tunnel = signed("POST", "https://t-7.trycloudflare.com", path, FORM)
+        resp = client.post(path, data=FORM, headers=tunnel)
+        assert resp.status_code == 200
+        assert stream_url_from_xml(resp.text).startswith("wss://t-7.trycloudflare.com/ws?")
+        old = signed("POST", "https://old.example.com", path, FORM)
+        assert client.post(path, data=FORM, headers=old).status_code == 403
+
+    def test_no_public_url_rejects(self, monkeypatch, captured_messages):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(_server("inbound.server", monkeypatch, "").app)
+        headers = signed("POST", PUBLIC, "/answer", FORM)
+        assert client.post("/answer", data=FORM, headers=headers).status_code == 403
+        assert any("PUBLIC_URL not set" in m for m in captured_messages)
+
+    # --- /ws token ---------------------------------------------------------------
+
+    @pytest.mark.parametrize("module", SERVER_MODULES)
+    def test_ws_with_issued_token_runs_agent(self, monkeypatch, module):
+        from fastapi.testclient import TestClient
+
+        server = _server(module, monkeypatch)
+        recorder = _RunAgentRecorder()
+        monkeypatch.setattr(server, "run_agent", recorder)
+        client = TestClient(server.app)
+        path = _answer_path(module)
+        answer = client.post(path, data=FORM, headers=signed("POST", PUBLIC, path, FORM))
+        with client.websocket_connect(ws_path(answer.text)) as ws:
+            ws.send_text(json.dumps({"event": "start", "start": {"callId": "c-1"}}))
+        assert len(recorder.calls) == 1
+        assert recorder.calls[0]["from_number"] == FORM["From"]
+
+    def _assert_ws_rejected(self, server, monkeypatch, path, captured_messages, reason):
+        from fastapi.testclient import TestClient
+        from starlette.websockets import WebSocketDisconnect
+
+        recorder = _RunAgentRecorder()
+        monkeypatch.setattr(server, "run_agent", recorder)
+        with (
+            pytest.raises(WebSocketDisconnect) as exc,
+            TestClient(server.app).websocket_connect(path),
+        ):
+            pass
+        assert exc.value.code == 1008
+        assert recorder.calls == [], "no agent (and no Deepgram connection) may start"
+        assert any(f"Rejected /ws connection: {reason}" in m for m in captured_messages)
+
+    @pytest.mark.parametrize("module", SERVER_MODULES)
+    def test_ws_missing_token_rejected(self, monkeypatch, captured_messages, module):
+        server = _server(module, monkeypatch)
+        body = base64.b64encode(b'{"call_uuid": "c-1"}').decode()
+        self._assert_ws_rejected(
+            server, monkeypatch, f"/ws?body={body}", captured_messages, "missing token"
+        )
+
+    @pytest.mark.parametrize("module", SERVER_MODULES)
+    def test_ws_expired_token_rejected(self, monkeypatch, captured_messages, module):
+        from urllib.parse import quote
+
+        server = _server(module, monkeypatch)
+        body = base64.b64encode(b'{"call_uuid": "c-1"}').decode()
+        token = server.issue_ws_token(body, now=time.time() - server.WS_TOKEN_TTL_S - 1)
+        path = f"/ws?body={quote(body, safe='')}&token={token}"
+        self._assert_ws_rejected(server, monkeypatch, path, captured_messages, "expired token")
+
+    @pytest.mark.parametrize("module", SERVER_MODULES)
+    def test_ws_tampered_body_rejected(self, monkeypatch, captured_messages, module):
+        from fastapi.testclient import TestClient
+
+        server = _server(module, monkeypatch)
+        path = _answer_path(module)
+        answer = TestClient(server.app).post(
+            path, data=FORM, headers=signed("POST", PUBLIC, path, FORM)
+        )
+        query = stream_query(answer.text)
+        forged = base64.b64encode(json.dumps({"call_uuid": "evil"}).encode()).decode()
+        self._assert_ws_rejected(
+            server,
+            monkeypatch,
+            f"/ws?body={forged}&token={query['token']}",
+            captured_messages,
+            "bad token",
+        )
+
+    @pytest.mark.parametrize("module", SERVER_MODULES)
+    def test_ws_token_expiry_cannot_be_extended(self, monkeypatch, captured_messages, module):
+        from urllib.parse import quote
+
+        server = _server(module, monkeypatch)
+        body = base64.b64encode(b'{"call_uuid": "c-1"}').decode()
+        _expires, mac = server.issue_ws_token(body, now=time.time() - 3600).split(".")
+        path = f"/ws?body={quote(body, safe='')}&token={int(time.time()) + 3600}.{mac}"
+        self._assert_ws_rejected(server, monkeypatch, path, captured_messages, "bad token")
+
+    def test_ws_token_unit(self, monkeypatch):
+        from inbound import server
+
+        body = "eyJhIjogMX0="
+        token = server.issue_ws_token(body, now=1000)
+        assert token.startswith(f"{1000 + server.WS_TOKEN_TTL_S}.")
+        assert server.ws_token_error(body, token, now=1000 + server.WS_TOKEN_TTL_S) is None
+        assert server.ws_token_error(body, token, now=1001 + server.WS_TOKEN_TTL_S) == (
+            "expired token"
+        )
+        assert server.ws_token_error(body, "", now=1000) == "missing token"
+        assert server.ws_token_error(body, "abc", now=1000) == "malformed token"
+        monkeypatch.setattr(server, "PLIVO_AUTH_TOKEN", "another-account-token")
+        assert server.ws_token_error(body, token, now=1000).startswith("bad token")
+
+    # --- PLIVO_WEBHOOK_AUTH switch and startup -------------------------------------
+
+    @pytest.mark.parametrize("module", SERVER_MODULES)
+    def test_switch_off_skips_both_checks(self, monkeypatch, module):
+        from fastapi.testclient import TestClient
+
+        server = _server(module, monkeypatch)
+        monkeypatch.setattr(server, "PLIVO_WEBHOOK_AUTH", "off")
+        recorder = _RunAgentRecorder()
+        monkeypatch.setattr(server, "run_agent", recorder)
+        client = TestClient(server.app)
+        answer = client.post(_answer_path(module), data=FORM)  # unsigned
+        assert answer.status_code == 200
+        assert "token" not in stream_query(answer.text)
+        with client.websocket_connect(ws_path(answer.text)) as ws:
+            ws.send_text(json.dumps({"event": "start", "start": {"callId": "c-1"}}))
+        assert len(recorder.calls) == 1
+
+    @pytest.mark.parametrize("module", SERVER_MODULES)
+    def test_switch_off_warns_at_startup(self, monkeypatch, captured_messages, module):
+        server = _server(module, monkeypatch)
+        monkeypatch.setattr(server, "PLIVO_WEBHOOK_AUTH", "off")
+        monkeypatch.setattr(server, "PLIVO_AUTH_TOKEN", "")
+        server.check_webhook_auth_config()  # no SystemExit even without a token
+        assert any("PLIVO_WEBHOOK_AUTH=off" in m and "NOT checked" in m for m in captured_messages)
+
+    @pytest.mark.parametrize("module", SERVER_MODULES)
+    def test_refuses_to_start_without_auth_token(self, monkeypatch, captured_messages, module):
+        import sys
+
+        server = _server(module, monkeypatch)
+        monkeypatch.setattr(server, "PLIVO_AUTH_TOKEN", "")
+        monkeypatch.setattr(sys, "argv", [module])
+        started = []
+        monkeypatch.setattr(server.uvicorn, "run", lambda *a, **k: started.append(True))
+        with pytest.raises(SystemExit) as exc:
+            server.main()
+        assert exc.value.code == 1
+        assert started == []
+        assert any("PLIVO_AUTH_TOKEN is empty" in m for m in captured_messages)
+
+    @pytest.mark.parametrize("value", ["on", "", "yes", "OFFF"])
+    def test_anything_but_off_keeps_auth_on(self, monkeypatch, value):
+        from inbound import server
+
+        monkeypatch.setattr(server, "PLIVO_WEBHOOK_AUTH", value)
+        assert server.webhook_auth_enabled() is True
 
 
 # =============================================================================
@@ -1753,8 +2134,11 @@ class TestUnitQuickTunnel:
         monkeypatch.setattr(server, "PUBLIC_URL", "https://t-2.trycloudflare.com")
         transport = httpx.ASGITransport(app=server.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            form = {"CallUUID": "c-1", "From": "+15551230000", "To": "+15557654321"}
             resp = await client.post(
-                "/answer", data={"CallUUID": "c-1", "From": "+15551230000", "To": "+15557654321"}
+                "/answer",
+                data=form,
+                headers=signed("POST", "https://t-2.trycloudflare.com", "/answer", form),
             )
         assert resp.status_code == 200
         assert "wss://t-2.trycloudflare.com/ws?body=" in resp.text
@@ -2389,12 +2773,12 @@ class TestUnitSavedAgentConfig:
         monkeypatch.setattr(server, "PUBLIC_URL", "https://example.ngrok.app")
         monkeypatch.setattr(server, "run_agent", fake_run_agent)
         client = TestClient(server.app)
+        path = "/outbound/answer?opening_reason=a%20demo&objective=book&context=ctx"
+        form = {"CallUUID": "u", "From": "+14155550100", "To": "+15551234567"}
         answer = client.post(
-            "/outbound/answer?opening_reason=a%20demo&objective=book&context=ctx",
-            data={"CallUUID": "u", "From": "+14155550100", "To": "+15551234567"},
+            path, data=form, headers=signed("POST", "https://example.ngrok.app", path, form)
         )
-        body = answer.text.split("body=")[1].split("<")[0]
-        with client.websocket_connect(f"/ws?body={body}") as ws:
+        with client.websocket_connect(ws_path(answer.text)) as ws:
             ws.send_text(json.dumps({"event": "start", "start": {"callId": "u", "streamId": "s"}}))
         assert (seen["opening_reason"], seen["objective"], seen["context"]) == (
             "a demo",
@@ -2418,12 +2802,19 @@ class TestLocalIntegration:
     def server_process(self):
         """Start the inbound server as a subprocess (SIGTERM -> wait(5) -> SIGKILL)."""
         log_path = server_log_path("integration_local_server")
-        # No Plivo credentials: the local server must never touch the Plivo REST API
+        # No PLIVO_AUTH_ID: the local server must never touch the Plivo REST API. Webhook
+        # auth stays on, keyed with a test token; requests are signed like Plivo's.
         proc = start_server(
             "inbound.server",
             TEST_PORT,
             log_path,
-            {"PLIVO_AUTH_ID": "", "PLIVO_AUTH_TOKEN": "", "PUBLIC_URL": ""},
+            {
+                "PLIVO_AUTH_ID": "",
+                "PLIVO_AUTH_TOKEN": TEST_AUTH_TOKEN,
+                "PLIVO_PHONE_NUMBER": "",
+                "PLIVO_WEBHOOK_AUTH": "on",
+                "PUBLIC_URL": LOCAL_HTTP_URL,
+            },
         )
         yield proc
         stop_server(proc)
@@ -2434,12 +2825,27 @@ class TestLocalIntegration:
         assert response.status_code == 200
         assert response.json()["status"] == "ok"
 
-    async def test_local_answer_webhook(self, server_process):
+    @staticmethod
+    async def _answer(call_uuid: str, signed_request: bool = True) -> httpx.Response:
+        form = {"CallUUID": call_uuid, "From": "+15551234567", "To": "+16572338892"}
+        headers = signed("POST", LOCAL_HTTP_URL, "/answer", form) if signed_request else {}
         async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{LOCAL_HTTP_URL}/answer",
-                params={"CallUUID": "test123", "From": "+15551234567", "To": "+16572338892"},
-            )
+            return await client.post(f"{LOCAL_HTTP_URL}/answer", data=form, headers=headers)
+
+    async def _stream_url(self, call_uuid: str) -> str:
+        """The /ws URL (with its token) from a Plivo-signed answer webhook."""
+        return stream_url_from_xml((await self._answer(call_uuid)).text)
+
+    async def test_local_unsigned_answer_rejected(self, server_process):
+        assert (await self._answer("test-unsigned", signed_request=False)).status_code == 403
+
+    async def test_local_ws_without_token_rejected(self, server_process):
+        with pytest.raises(websockets.exceptions.InvalidStatus):
+            async with websockets.connect(LOCAL_WS_URL, close_timeout=2):
+                pass
+
+    async def test_local_answer_webhook(self, server_process):
+        response = await self._answer("test123")
         assert response.status_code == 200
         assert "application/xml" in response.headers["content-type"]
         assert "<Stream" in response.text
@@ -2448,8 +2854,7 @@ class TestLocalIntegration:
 
     async def test_local_websocket_connection(self, server_process):
         """A Plivo start event produces playAudio (the greeting) within 15s."""
-        body = base64.b64encode(json.dumps({"call_uuid": "test123"}).encode()).decode()
-        async with websockets.connect(f"{LOCAL_WS_URL}?body={body}", close_timeout=2) as ws:
+        async with websockets.connect(await self._stream_url("test123"), close_timeout=2) as ws:
             await ws.send(
                 json.dumps(
                     {
@@ -2472,11 +2877,11 @@ class TestLocalIntegration:
 
     async def test_local_audio_quality(self, server_process):
         """Greeting audio has speech energy (RMS > 500) while we stream silence."""
-        body = base64.b64encode(json.dumps({"call_uuid": "test456"}).encode()).decode()
+        stream_url = await self._stream_url("test456")
         audio_chunks: list[bytes] = []
         silence = base64.b64encode(b"\xff" * 160).decode()
 
-        async with websockets.connect(f"{LOCAL_WS_URL}?body={body}", close_timeout=2) as ws:
+        async with websockets.connect(stream_url, close_timeout=2) as ws:
             await ws.send(
                 json.dumps(
                     {

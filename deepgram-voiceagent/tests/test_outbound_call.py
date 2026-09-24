@@ -30,8 +30,6 @@ Usage:
 
 from __future__ import annotations
 
-import base64
-import json
 import os
 import time
 from urllib.parse import quote, urlencode
@@ -50,10 +48,12 @@ from tests.helpers import (
     log_messages,
     read_log_events,
     server_log_path,
+    signed_webhook,
     start_ngrok,
     start_server,
     stop_ngrok,
     stop_server,
+    stream_body,
     upsert_application,
 )
 from utils import normalize_phone_number
@@ -186,23 +186,21 @@ class TestOutboundCall:
 
     def test_outbound_answer_webhook(self, server_process, ngrok_tunnel):
         """/outbound/answer returns valid Plivo Stream XML carrying the call details."""
-        resp = httpx.get(
-            f"{ngrok_tunnel}/outbound/answer",
-            params={
-                "CallUUID": "test-uuid-456",
-                "From": PLIVO_PHONE_NUMBER,
-                "To": PLIVO_TEST_NUMBER,
-                **CALL_DETAILS,
-            },
-            timeout=10.0,
+        query = urlencode(
+            {"CallUUID": "test-uuid-456", "From": PLIVO_PHONE_NUMBER, "To": PLIVO_TEST_NUMBER}
+            | CALL_DETAILS,
+            quote_via=quote,
         )
+        url = f"{ngrok_tunnel}/outbound/answer?{query}"
+        assert httpx.get(url, timeout=10.0).status_code == 403  # unsigned
+        resp = signed_webhook("GET", url, PLIVO_AUTH_TOKEN)
         assert resp.status_code == 200
         body = resp.text
         assert "<Stream" in body
         assert "bidirectional" in body
         assert "audio/x-mulaw" in body
         assert ngrok_tunnel.replace("https://", "wss://") + "/ws?body=" in body
-        meta = json.loads(base64.b64decode(body.split("body=")[1].split("<")[0]))
+        meta = stream_body(body)
         assert {k: meta[k] for k in CALL_DETAILS} == CALL_DETAILS
 
         ready = [m for m in log_messages(LOG_PATH) if m.startswith("Ready! Place a call")]

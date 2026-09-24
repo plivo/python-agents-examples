@@ -40,6 +40,7 @@ from tests.helpers import (
     place_call_and_wait,
     read_log_events,
     server_log_path,
+    signed_webhook,
     start_ngrok,
     start_server,
     stop_ngrok,
@@ -162,12 +163,11 @@ class TestLiveCall:
         assert resp.json()["status"] == "ok"
 
     def test_answer_webhook_via_ngrok(self, plivo_configured):
+        """Signed like Plivo signs it: accepted through the tunnel; unsigned: 403."""
         public_url = plivo_configured["public_url"]
-        resp = httpx.post(
-            f"{public_url}/answer",
-            data={"CallUUID": "test-ngrok", "From": "+15551234567", "To": "+16572338892"},
-            timeout=10.0,
-        )
+        form = {"CallUUID": "test-ngrok", "From": "+15551234567", "To": "+16572338892"}
+        assert httpx.post(f"{public_url}/answer", data=form, timeout=10.0).status_code == 403
+        resp = signed_webhook("POST", f"{public_url}/answer", PLIVO_AUTH_TOKEN, form)
         assert resp.status_code == 200
         assert "<Stream" in resp.text
         assert "bidirectional" in resp.text
