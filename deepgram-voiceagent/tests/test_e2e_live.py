@@ -114,7 +114,6 @@ class SimulatedPlivo:
         self.audio = bytearray()  # agent audio for the current phase
         self.checkpoints: list[str] = []
         self.played: list[str] = []  # checkpoints acked with playedStream
-        self.clear_audio = 0
         self.closed = asyncio.Event()
         self._play_start: float | None = None
         self._play_chunks = 0
@@ -164,7 +163,6 @@ class SimulatedPlivo:
                     self._play_start = None
                     asyncio.get_running_loop().create_task(self._played(msg["name"], end))
                 elif event == "clearAudio":
-                    self.clear_audio += 1
                     self._play_start = None
         except websockets.exceptions.ConnectionClosed:
             pass

@@ -43,7 +43,7 @@ from utils import (
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Loguru sink configuration (env-var driven, backward compatible)
+# Loguru sink configuration (env-var driven)
 # ---------------------------------------------------------------------------
 _LOG_FORMAT = os.getenv("LOG_FORMAT", "text").lower()
 _LOG_FILE = os.getenv("LOG_FILE", "")
@@ -363,7 +363,7 @@ async def hangup_webhook(request: Request) -> Response:
 
 
 @app.post("/fallback")
-async def fallback_webhook(request: Request) -> Response:
+async def fallback_webhook() -> Response:
     """Fallback webhook if primary answer webhook fails."""
     logger.warning("Fallback webhook triggered")
 

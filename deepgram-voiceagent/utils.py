@@ -325,7 +325,7 @@ def ulaw_to_pcm(ulaw_data: bytes) -> bytes:
     """Convert μ-law encoded audio to 16-bit PCM.
 
     μ-law is a companding algorithm used in telephony (G.711 standard).
-    This replaces the deprecated audioop.ulaw2lin function.
+    Pure numpy, so it needs no audioop (deprecated, and removed in Python 3.13).
 
     Args:
         ulaw_data: μ-law encoded audio bytes
@@ -339,9 +339,7 @@ def ulaw_to_pcm(ulaw_data: bytes) -> bytes:
 
 
 def pcm_to_ulaw(pcm_data: bytes) -> bytes:
-    """Convert 16-bit PCM audio to μ-law encoding.
-
-    This replaces the deprecated audioop.lin2ulaw function.
+    """Convert 16-bit PCM audio to μ-law encoding (pure numpy, no audioop).
 
     Args:
         pcm_data: 16-bit PCM audio bytes

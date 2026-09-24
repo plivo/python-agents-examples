@@ -153,7 +153,7 @@ def build_outbound_prompt(
 ) -> str:
     """Build a concrete outbound system prompt by substituting template variables.
 
-    Live calls pass the campaign fields. The README's reusable-config publish command
+    Live calls pass the campaign fields. The README's reusable-config create command
     passes pointers to the "This Call" section instead, so the saved prompt has no
     unfilled placeholders (see DeepgramVoiceAgent._build_prompt_update()).
     """
@@ -468,7 +468,7 @@ FUNCTION_DEFINITIONS: list[dict[str, Any]] = [
 
 
 # =============================================================================
-# Send-queue sentinel
+# Helpers
 # =============================================================================
 
 
@@ -511,6 +511,11 @@ def _build_speak_provider() -> dict[str, Any]:
     if _is_flux(DEEPGRAM_SPEAK_MODEL):
         provider["version"] = "v2"
     return provider
+
+
+# =============================================================================
+# Send-queue sentinel
+# =============================================================================
 
 
 @dataclass(frozen=True)
@@ -581,7 +586,6 @@ class DeepgramVoiceAgent:
 
         # Playback tracking
         self._is_playing = False  # True from first agent audio until playedStream/barge-in
-        self._agent_audio_done = False
         self._pending_checkpoint: _Checkpoint | None = None
         self._checkpoint_counter = 0
         self._checkpoint_sent_time: float | None = None
@@ -684,7 +688,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
         Reusable config: ``agent`` is the saved configuration's UUID (all-or-nothing: no
         inline agent fields may be mixed in). Inline: ``agent`` is the full definition —
         listen/think/speak providers, the per-call prompt, FUNCTION_DEFINITIONS and the
-        greeting. The README's publish command stores this inline block, minus the
+        greeting. The README's create command stores this inline block, minus the
         greeting, as a reusable config.
 
         Never add ``agent.language`` or ``speak.provider.language`` — Deepgram
@@ -1086,7 +1090,6 @@ You can use the caller's phone number for SMS or callbacks without asking."""
         if not self._is_playing:
             self._logv("deepgram", "first agent audio of response")
         self._is_playing = True
-        self._agent_audio_done = False
         self._dg_rx_audio_bytes += len(data)
         self._send_queue.put_nowait(deepgram_to_plivo(data))
 
@@ -1238,7 +1241,6 @@ You can use the caller's phone number for SMS or callbacks without asking."""
 
     async def _on_agent_audio_done(self) -> None:
         """Deepgram finished sending a response's audio: queue a playback checkpoint."""
-        self._agent_audio_done = True
         if self._drop_agent_audio and not self._is_playing:
             # Tail of a response cancelled by barge-in — nothing left to play
             self._logv("deepgram", "AgentAudioDone for interrupted response")

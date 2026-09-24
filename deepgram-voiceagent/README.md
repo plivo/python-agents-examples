@@ -163,13 +163,13 @@ Three concurrent asyncio tasks, following the canonical `FIRST_COMPLETED` patter
 | When | File | What it does |
 |---|---|---|
 | Module import | `inbound/agent.py`, `outbound/agent.py` | `load_dotenv()`, read the `DEEPGRAM_*` config, load `system_prompt.md`, define `FUNCTION_DEFINITIONS`. No network calls. |
-| Server start: `uv run python -m inbound.server` | `inbound/server.py` → `main()` | Logging sinks (text/JSON/file/Redis) and optional OTel are set up when the module loads. Then `describe_deepgram_agent()` logs the active path. On the reusable path, `verify_deepgram_agent_id()` looks the UUID up in the API key's Deepgram project (`GET /v1/projects`, then `/projects/{id}/agents/{uuid}`) and **exits with code 1 if it isn't found**. It warns and starts anyway if it can't check (network error, key without `agent:read`), e.g. `Deepgram agent: inline (listen=flux-general-en, think=open_ai/gpt-4.1-mini, speak=aura-2-thalia-en)` or `Deepgram agent: reusable config <uuid> …` (no Deepgram API call), then `configure_plivo_webhooks()` creates or updates the Plivo application and assigns `PLIVO_PHONE_NUMBER` when `PUBLIC_URL` is set, then uvicorn starts. |
+| Server start: `uv run python -m inbound.server` | `inbound/server.py` → `main()` | Logging sinks (text/JSON/file/Redis) and optional OTel are set up when the module loads. Then `describe_deepgram_agent()` logs the active path, e.g. `Deepgram agent: inline (listen=flux-general-en, think=open_ai/gpt-4.1-mini, speak=aura-2-thalia-en)` or `Deepgram agent: reusable config <uuid> …`. On the reusable path, `verify_deepgram_agent_id()` looks the UUID up in the API key's Deepgram project (`GET /v1/projects`, then `/projects/{id}/agents/{uuid}`) and **exits with code 1 if it isn't found**. It warns and starts anyway if it can't check (network error, key without `agent:read`). Then `configure_plivo_webhooks()` creates or updates the Plivo application and assigns `PLIVO_PHONE_NUMBER` when `PUBLIC_URL` is set, then uvicorn starts. |
 | Server start: `uv run python -m outbound.server` | `outbound/server.py` → `main()` | Same agent-path log line and reusable-config ID check, then uvicorn. There is no number auto-config, because answer and hangup URLs are passed per call. |
 | `POST /outbound/call` | `outbound/server.py` | `CallManager.create_call()` builds the per-call prompt and greeting, then Plivo `calls.create` dials the number. |
 | Plivo answers (`/answer` or `/outbound/answer`) | `server.py` | Returns `<Stream bidirectional keepCallAlive>` XML that points Plivo at `/ws`. Call metadata travels in `?body=`. |
 | Each call (`/ws`) | `server.py` → `run_agent()` in `agent.py` | Accepts the WebSocket, reads Plivo's `start` event, then runs `DeepgramVoiceAgent.run()`. That opens a **new** Deepgram WebSocket for the call, sends Settings (inline block or reusable config UUID), sends `UpdatePrompt` + `InjectAgentMessage` on the reusable path, and runs the `plivo_rx` / `deepgram_rx` / `plivo_tx` tasks until the call ends. There is no Deepgram connection before a call arrives. |
 | `end_call` tool | `agent.py` → `hangup_callback` | After the goodbye has played, the agent calls `_hangup_call()` from `server.py`, which hangs up via the Plivo REST API. Plivo credentials never leave `server.py`. |
-| One-off setup (optional): create a reusable config | your shell → Deepgram REST API | The `curl` commands in [Creating a reusable config](#creating-a-reusable-config) post this example's agent definition once. The example contains no code for it; servers only read the UUID from the env var. |
+| One-off setup (optional): create a reusable config | your shell → Deepgram REST API | The `curl` commands in [Creating a reusable config](#creating-a-reusable-config) post this example's agent definition once. The example contains no code for it; servers only read the UUID from the env var and check at startup that it exists. |
 | Shared helpers | `utils.py` | μ-law codec, resampling, `plivo_to_deepgram` / `deepgram_to_plivo` (pass-through), phone normalization. |
 
 ## Audio Formats
@@ -181,7 +181,7 @@ Three concurrent asyncio tasks, following the canonical `FIRST_COMPLETED` patter
 | Deepgram → Agent | μ-law (binary WS frame, `container: none`) | 8 kHz | variable | raw, no WAV header |
 | Agent → Plivo | μ-law (base64 JSON `playAudio`) | 8 kHz | 160 bytes (20ms) | `deepgram_to_plivo()` is a pass-through; the tail is padded with `0xFF` (μ-law silence) |
 
-`utils.py` still ships `ulaw_to_pcm`, `pcm_to_ulaw` and `resample_audio` (numpy + scipy). The agent does not call them; they are there for tests and for switching to a `linear16` encoding. The `0xFF` padding is applied only to a partial final chunk when a checkpoint is dequeued.
+`utils.py` also provides `ulaw_to_pcm`, `pcm_to_ulaw` and `resample_audio` (numpy + scipy). The agent does not call them; the tests use them, and they are what switching to a `linear16` encoding would need. The `0xFF` padding is applied only to a partial final chunk when a checkpoint is dequeued.
 
 ## Deepgram Settings
 
@@ -250,13 +250,13 @@ With a UUID set, Deepgram receives **only the UUID**. The `DEEPGRAM_LISTEN_*`, `
 
 ### Creating a reusable config
 
-This is a one-off setup step, done with Deepgram's REST API. The example has no admin code for it; the server only reads the UUID. The key needs the `agent:write` scope to create or delete and `agent:read` to list. Run from this directory:
+This is a one-off setup step, done with Deepgram's REST API. The example has no code for it; the server only reads the UUID and checks at startup that it exists. The key needs the `agent:write` scope to create or delete and `agent:read` to list. Run from this directory:
 
 ```bash
 set -a && source .env && set +a   # DEEPGRAM_API_KEY (and any DEEPGRAM_* model vars) in the shell
 
 # Project id (the first project; pick another from the list if your key sees several)
-export DEEPGRAM_PROJECT_ID=$(curl -s https://api.deepgram.com/v1/projects \
+export DG_PROJECT_ID=$(curl -s https://api.deepgram.com/v1/projects \
   -H "Authorization: Token $DEEPGRAM_API_KEY" \
   | uv run python -c 'import json, sys; print(json.load(sys.stdin)["projects"][0]["project_id"])')
 ```
@@ -266,12 +266,12 @@ Each command below prints this example's own inline agent definition (from `_bui
 **Inbound** (`DEEPGRAM_INBOUND_AGENT_ID`):
 
 ```bash
-uv run python - <<'EOF' | curl -sS -X POST "https://api.deepgram.com/v1/projects/$DEEPGRAM_PROJECT_ID/agents" \
+uv run python - <<'EOF' | curl -sS -X POST "https://api.deepgram.com/v1/projects/$DG_PROJECT_ID/agents" \
   -H "Authorization: Token $DEEPGRAM_API_KEY" -H "Content-Type: application/json" -d @-
 import json
 from inbound.agent import DeepgramVoiceAgent
 
-agent = DeepgramVoiceAgent(websocket=None, call_id="publish", agent_config_id="")
+agent = DeepgramVoiceAgent(websocket=None, call_id="create-config", agent_config_id="")
 config = agent._build_settings()["agent"]
 del config["greeting"]  # sent per call with InjectAgentMessage
 meta = {"example": "deepgram-voiceagent", "direction": "inbound"}
@@ -282,7 +282,7 @@ EOF
 **Outbound** (`DEEPGRAM_OUTBOUND_AGENT_ID`). The saved prompt cannot hold one call's campaign details, so the template's `{{opening_reason}}`, `{{objective}}` and `{{context}}` are filled with pointers to the `## This Call` section. Each call appends that section with `UpdatePrompt`: the greeting already spoken, the opening reason, the objective and the extra context, followed by the call context.
 
 ```bash
-uv run python - <<'EOF' | curl -sS -X POST "https://api.deepgram.com/v1/projects/$DEEPGRAM_PROJECT_ID/agents" \
+uv run python - <<'EOF' | curl -sS -X POST "https://api.deepgram.com/v1/projects/$DG_PROJECT_ID/agents" \
   -H "Authorization: Token $DEEPGRAM_API_KEY" -H "Content-Type: application/json" -d @-
 import json
 from outbound.agent import DeepgramVoiceAgent, build_outbound_prompt
@@ -293,7 +293,7 @@ prompt = build_outbound_prompt(
     context='See "This Call" below.',
 )
 agent = DeepgramVoiceAgent(
-    websocket=None, call_id="publish", system_prompt=prompt, agent_config_id=""
+    websocket=None, call_id="create-config", system_prompt=prompt, agent_config_id=""
 )
 config = agent._build_settings()["agent"]
 del config["greeting"]  # sent per call with InjectAgentMessage
@@ -305,10 +305,10 @@ EOF
 List and delete:
 
 ```bash
-curl -s "https://api.deepgram.com/v1/projects/$DEEPGRAM_PROJECT_ID/agents" \
+curl -s "https://api.deepgram.com/v1/projects/$DG_PROJECT_ID/agents" \
   -H "Authorization: Token $DEEPGRAM_API_KEY"
 
-curl -sS -X DELETE "https://api.deepgram.com/v1/projects/$DEEPGRAM_PROJECT_ID/agents/<uuid>" \
+curl -sS -X DELETE "https://api.deepgram.com/v1/projects/$DG_PROJECT_ID/agents/<uuid>" \
   -H "Authorization: Token $DEEPGRAM_API_KEY"
 ```
 
@@ -448,7 +448,7 @@ Only the default row went through the full Plivo call suites. For any other comb
 - Runtime: `fastapi`, `uvicorn[standard]`, `websockets>=15.0`, `plivo`, `httpx` (the reusable-config ID check at startup), `python-dotenv`, `python-multipart`, `loguru`, `numpy`, `scipy`, `phonenumbers`. No torch, Silero, ONNX, OpenAI or Deepgram SDK.
 - `observability` extra: `opentelemetry-api`, `opentelemetry-sdk`, `opentelemetry-exporter-otlp`, `opentelemetry-instrumentation-httpx`, `traceloop-sdk`.
 - `streaming` extra: `redis[hiredis]`.
-- `dev` group: `ruff`, `pre-commit`, `pytest`, `pytest-asyncio`, `httpx`, `faster-whisper`, `gtts`, `pydub`, `audioop-lts` (Python 3.13+).
+- `dev` group: `ruff`, `pre-commit`, `pytest`, `pytest-asyncio`, `faster-whisper` (the tests also use the runtime `httpx`).
 
 ## Pricing
 
@@ -492,7 +492,7 @@ uv run pytest tests/test_outbound_call.py -v -s
 uv run pytest tests/test_multiturn_voice.py -v -s
 ```
 
-The live call tests use `PLIVO_TEST_NUMBER`, a second Plivo number on the same account. It is the caller for inbound tests and the destination for outbound tests.
+The live call tests use `PLIVO_TEST_NUMBER`, a second Plivo number on the same account. It is the caller for inbound tests and the destination for outbound tests. Optional test-only env vars: `NGROK_BIN` (ngrok binary, default `ngrok`), `FFMPEG_DIR` (directory holding an `ffmpeg` binary for faster-whisper) and `TEST_LOG_DIR` (where test server logs go, default the system temp dir).
 
 From the repo root:
 
@@ -567,7 +567,7 @@ The hangup waits for `playedStream` on the goodbye's checkpoint; if Plivo never 
 Behaviour observed in live testing against Deepgram, and how the code handles it:
 
 1. **Settings once, nothing before `SettingsApplied`.** Media and text that arrive during the handshake are buffered (audio capped at 2s / 16000B, oldest dropped) and flushed before `_settings_applied` is set, so live input cannot overtake them.
-2. **No `AgentStartedSpeaking` / `AgentThinking` in practice.** Latency arrives only as single-key `LatencyReport` messages: `stt_latency` (roughly every audio frame), then `ttt_text_latency` / `ttt_token_latency` / `ttt_tool_latency`, `tts_latency` and `total_latency`, all in seconds. `_on_latency_report()` merges them into `turn_complete`'s `latency_report` and `*_latency_ms` fields. The `AgentStartedSpeaking` handler is kept in case Deepgram sends it.
+2. **No `AgentStartedSpeaking` / `AgentThinking` in practice.** Latency arrives only as single-key `LatencyReport` messages: `stt_latency` (roughly every audio frame), then `ttt_text_latency` / `ttt_token_latency` / `ttt_tool_latency`, `tts_latency` and `total_latency`, all in seconds. `_on_latency_report()` merges them into `turn_complete`'s `latency_report` and `*_latency_ms` fields. The `AgentStartedSpeaking` handler reads its latency fields if Deepgram sends it.
 3. **Greeting audio before its text.** Binary greeting audio can arrive before `ConversationText{assistant}`. The code does not wait for the text; `_on_agent_audio()` starts playback on the first frame, and turn 1 is assigned whichever arrives.
 4. **`InjectUserMessage` echo.** Deepgram echoes an injected message back as `ConversationText{user}` and sends `EndOfTurn{trigger: "manual"}`. The echo is matched against `_last_injected_text` and skipped, so the turn is counted once. Injecting while audio is playing triggers a local barge-in first.
 5. **Drop gate after barge-in.** A few binary frames of the cancelled response can still arrive after `UserStartedSpeaking`. `_drop_agent_audio` discards them and clears on `ConversationText{user}`, `EndOfTurn`, `AgentThinking`, `FunctionCallRequest` or `AgentStartedSpeaking`. It is deliberately **not** cleared by `ConversationText{assistant}`, because the new response's first frame can precede it and a late sentence of the cancelled response can follow it.

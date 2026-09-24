@@ -46,7 +46,7 @@ from utils import (
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Loguru sink configuration (env-var driven, backward compatible)
+# Loguru sink configuration (env-var driven)
 # ---------------------------------------------------------------------------
 _LOG_FORMAT = os.getenv("LOG_FORMAT", "text").lower()
 _LOG_FILE = os.getenv("LOG_FILE", "")
@@ -227,7 +227,6 @@ async def _create_call(client: plivo.RestClient, **params) -> object:
 
 @app.post("/outbound/call")
 async def outbound_initiate(
-    request: Request,
     phone_number: str = Query(default=""),
     campaign_id: str = Query(default=""),
     opening_reason: str = Query(default=""),

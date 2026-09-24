@@ -22,7 +22,7 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 
 
 def ensure_ffmpeg_on_path() -> None:
-    """Put a checked-in ffmpeg binary on PATH (faster-whisper/pydub need it).
+    """Put a checked-in ffmpeg binary on PATH (faster-whisper needs it).
 
     Looks in FFMPEG_DIR, then in the example dir and each parent directory.
     """
@@ -126,7 +126,7 @@ def log_messages(log_path: Path) -> list[str]:
 DEEPGRAM_API_URL = "https://api.deepgram.com/v1"
 
 
-def readme_publish_script(direction: str) -> str:
+def readme_create_script(direction: str) -> str:
     """The Python half of the README's create command for ``direction`` (one source of truth).
 
     It is the body of the ``uv run python - <<'EOF' | curl ...`` heredoc in "Creating a
@@ -138,11 +138,11 @@ def readme_publish_script(direction: str) -> str:
     return readme[start : readme.index("\nEOF\n", start) + 1]
 
 
-def readme_publish_body(direction: str, env: dict[str, str] | None = None) -> dict:
+def readme_create_body(direction: str, env: dict[str, str] | None = None) -> dict:
     """Run the README's create script and return the body it would POST."""
     result = subprocess.run(
         [sys.executable, "-"],
-        input=readme_publish_script(direction),
+        input=readme_create_script(direction),
         capture_output=True,
         text=True,
         cwd=PROJECT_DIR,
@@ -175,7 +175,7 @@ def deepgram_project_id() -> str:
 def create_agent_config(direction: str) -> str:
     """POST the README's create body for ``direction``; return the new config's UUID."""
     created = _deepgram_rest(
-        "POST", f"/projects/{deepgram_project_id()}/agents", readme_publish_body(direction)
+        "POST", f"/projects/{deepgram_project_id()}/agents", readme_create_body(direction)
     )
     return created["agent_uuid"]
 

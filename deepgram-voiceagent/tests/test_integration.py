@@ -101,12 +101,11 @@ class FakePlivoWS:
 
 
 class FakeDeepgramWS:
-    """Stands in for the Deepgram Voice Agent WebSocket (recv, async-iter, send, close)."""
+    """Stands in for the Deepgram Voice Agent WebSocket (recv, async-iter, send, async with)."""
 
     def __init__(self, script: list[Any] | None = None) -> None:
         self.sent: list[Any] = []
         self._queue: asyncio.Queue[Any] = asyncio.Queue()
-        self.closed = False
         for item in script or []:
             self.feed(item)
 
@@ -134,14 +133,11 @@ class FakeDeepgramWS:
             raise StopAsyncIteration
         return item
 
-    async def close(self) -> None:
-        self.closed = True
-
     async def __aenter__(self) -> FakeDeepgramWS:
         return self
 
     async def __aexit__(self, *exc: object) -> None:
-        self.closed = True
+        return None
 
     def sent_json(self) -> list[dict[str, Any]]:
         return [json.loads(s) for s in self.sent if isinstance(s, str)]
@@ -1082,7 +1078,7 @@ class TestUnitDeepgramEventHandling:
 
     async def test_plivo_tx_disconnect_is_not_an_error(self):
         """Caller hangs up mid-playback: send_text raises WebSocketDisconnect (empty str)."""
-        from starlette.websockets import WebSocketDisconnect
+        from fastapi import WebSocketDisconnect
 
         agent, plivo_ws, _ = make_agent()
 
@@ -1106,7 +1102,7 @@ class TestUnitDeepgramEventHandling:
             await asyncio.wait_for(agent._send_to_plivo(), timeout=1)
 
     async def test_plivo_rx_disconnect_is_not_an_error(self):
-        from starlette.websockets import WebSocketDisconnect
+        from fastapi import WebSocketDisconnect
 
         agent, plivo_ws, _ = make_agent()
         plivo_ws.incoming.put_nowait(WebSocketDisconnect(code=1000))
@@ -1356,13 +1352,14 @@ class TestUnitServerRoutes:
 
 
 # =============================================================================
-# UNIT TESTS - Saved agent configurations (opt-in DEEPGRAM_{INBOUND,OUTBOUND}_AGENT_ID)
+# UNIT TESTS - Agent paths: inline Settings snapshot, startup checks, --tunnel,
+# Plivo auto-config, reusable agent configs (DEEPGRAM_{INBOUND,OUTBOUND}_AGENT_ID)
 # =============================================================================
 
 SAVED_UUID = "11111111-2222-3333-4444-555555555555"
 
-# sha256 of the exact Settings wire JSON (json.dumps(_build_settings())) captured at 7a7a78c,
-# before the refactor, with default models, a frozen clock and CALL_ID (see INLINE_CASES)
+# sha256 of the exact inline Settings wire JSON (json.dumps(_build_settings())) with
+# default models, a frozen clock and CALL_ID; any change to the Settings bytes fails these
 INLINE_SETTINGS_SHA256 = {
     "inbound|caller=": "f8c554713f9ed7fd13d6745344557f93b9ce0261809e4c5637a3dea69185b87f",
     "inbound|caller=+15551234567": (
@@ -1383,8 +1380,8 @@ INLINE_SETTINGS_SHA256 = {
     "outbound|default": "6c411dda5ff5ccb2335231f5d42308d80ab7b987af5a34017aba8003133a68cc",
 }
 
-# sha256 of the config string the removed `--publish` CLI sent at 7a7a78c (default env)
-PUBLISHED_CONFIG_SHA256 = {
+# sha256 of the config string in the README create body (default env)
+CREATE_BODY_CONFIG_SHA256 = {
     "inbound": "61191cfbf2c69e83f3f270e55eefb187972a2956f76c56112ff623ba7e005c47",
     "outbound": "871d4cc494065a22b1878e8947695c900a839f8b40c0c166ecd7d4a02b5c7545",
 }
@@ -1433,7 +1430,7 @@ def default_agent_modules(monkeypatch):
 
 
 class TestUnitInlineSettingsSnapshot:
-    """Path 1 (inline): Settings wire JSON is byte-identical to the pre-refactor snapshots."""
+    """Path 1 (inline): Settings wire JSON is byte-identical to the pinned snapshots."""
 
     @staticmethod
     def _wire_sha256(agent) -> str:
@@ -1936,10 +1933,10 @@ class TestUnitPlivoAutoConfig:
 @pytest.fixture(scope="module")
 def readme_bodies() -> dict[str, dict[str, Any]]:
     """Create bodies printed by the README's reusable-config commands (run as subprocesses)."""
-    from tests.helpers import readme_publish_body
+    from tests.helpers import readme_create_body
 
     env = {k: v for k, v in os.environ.items() if k not in _AGENT_ENV_VARS}
-    return {d: readme_publish_body(d, env=env) for d in ("inbound", "outbound")}
+    return {d: readme_create_body(d, env=env) for d in ("inbound", "outbound")}
 
 
 # Env vars that shape the agent definition; cleared for the snapshot comparisons
@@ -2008,9 +2005,9 @@ class TestUnitSavedAgentConfig:
         prompt = json.loads(readme_bodies["outbound"]["config"])["think"]["prompt"]
         assert prompt.count('"This Call"') >= 3  # opening reason, objective, context
 
-    def test_readme_create_body_matches_pre_refactor_publish(self, readme_bodies):
-        """Byte-identical to what the removed ``--publish`` CLI sent at 7a7a78c (default env)."""
-        for direction, digest in PUBLISHED_CONFIG_SHA256.items():
+    def test_readme_create_body_matches_snapshot(self, readme_bodies):
+        """The README create body's config string is byte-identical to the pinned snapshot."""
+        for direction, digest in CREATE_BODY_CONFIG_SHA256.items():
             config = readme_bodies[direction]["config"]
             assert hashlib.sha256(config.encode()).hexdigest() == digest, direction
 
@@ -2023,9 +2020,9 @@ class TestUnitSavedAgentConfig:
         inline = agent._build_settings()["agent"]
         assert inline.pop("greeting") == "Hello from a test."
         assert inline["think"].pop("prompt") == SYSTEM_PROMPT + context
-        published = json.loads(readme_bodies["inbound"]["config"])
-        del published["think"]["prompt"]
-        assert inline == published
+        created = json.loads(readme_bodies["inbound"]["config"])
+        del created["think"]["prompt"]
+        assert inline == created
 
     def test_outbound_inline_settings_use_record_prompt_and_greeting(self):
         from outbound.agent import CallManager
@@ -2322,7 +2319,7 @@ class TestDeepgramAgentIntegration:
 
 
 # =============================================================================
-# DEEPGRAM SAVED AGENT CONFIGURATION INTEGRATION (publish -> use -> delete)
+# DEEPGRAM SAVED AGENT CONFIGURATION INTEGRATION (create -> use -> delete)
 # =============================================================================
 
 _SPOKEN_DIGITS = {
