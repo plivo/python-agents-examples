@@ -43,6 +43,18 @@ Drop the size class (mini/nano/pro/flash) unless two different sizes are used to
 | `livekit` | Uses the LiveKit Agents framework |
 | `vapi` | Uses the Vapi framework |
 
+### Managed voice-agent platforms: `{provider}-{product}[-{variant}]`
+
+When a hosted product runs the whole STT → LLM → TTS loop (including turn detection and barge-in), name the example after that product instead of its component models — e.g. `deepgram-voiceagent` for Deepgram's "Voice Agent API".
+
+- Use the platform's **own** product name as branded in its docs (lowercased, no spaces/punctuation, "API" dropped). Don't borrow another platform's term or apply a common label to all platforms.
+- No model, orchestration, or VAD tokens. Models are `.env` config that accepts the platform's documented values verbatim.
+- One example per platform; new model combinations go in its README.
+- Variants are not predefined: propose one only when the integration itself changes (not a model swap), and get it approved in PR review.
+- Add `[tool.voice-agent-example]` / `category = "managed-platform"` to `pyproject.toml`.
+
+See the "Managed Voice-Agent Platforms" section of [CLAUDE.md](./CLAUDE.md) for the full rules.
+
 ### Examples
 
 | Project Name | LLM | STT | TTS | Framework |
@@ -50,6 +62,7 @@ Drop the size class (mini/nano/pro/flash) unless two different sizes are used to
 | `gpt5.4-assemblyaiu3-cartesiasonic3-native` | GPT 5.4 | AssemblyAI U3 | Cartesia Sonic 3 | None |
 | `gemini2.5-live-native` | Gemini 2.5 (S2S) | Gemini 2.5 (S2S) | Gemini 2.5 (S2S) | None |
 | `gpt4.1-deepgramnova3-elevenflashv2.5-vapi` | GPT 4.1 | Deepgram Nova 3 | ElevenLabs Flash v2.5 | Vapi |
+| `deepgram-voiceagent` | Configurable (default GPT-4.1 mini, hosted by Deepgram) | Configurable (default Deepgram Flux) | Configurable (default Deepgram Aura-2) | Managed platform (Deepgram Voice Agent API) |
 
 ## Project Structure
 
@@ -62,8 +75,8 @@ Each example project should be a self-contained directory at the repository root
 │   ├── server.py       # FastAPI: /answer, /ws, /hangup
 │   └── system_prompt.md
 ├── outbound/
-│   ├── agent.py        # Same agent + OutboundCallRecord, CallManager
-│   ├── server.py       # FastAPI: /outbound/call, /outbound/ws
+│   ├── agent.py        # Same agent + prompt/greeting from per-call context
+│   ├── server.py       # FastAPI: /outbound/answer, /outbound/hangup, /ws (calls placed via Plivo Make Call API)
 │   └── system_prompt.md
 ├── utils.py            # Audio conversion, VAD, phone utils
 ├── tests/              # Unit, integration, e2e, live call tests

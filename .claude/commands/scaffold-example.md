@@ -35,6 +35,11 @@ Examples: `gpt5.4-assemblyaiu3-cartesiasonic3-native`, `gemini2.5-live-pipecat`,
 - If a variant suffix follows the orchestration type, it must be a known variant: `no-vad`, `webrtcvad`
 - Unknown suffixes should be flagged — ask the user before proceeding
 
+**Managed voice-agent platform** (hosted product runs STT/LLM/TTS, turn detection and barge-in — see CLAUDE.md "Managed Voice-Agent Platforms"): the name is `{provider}-{product}[-{variant}]` instead, e.g. `deepgram-voiceagent`.
+- `{product}` must mirror the platform's own branding for the product; do not reuse another platform's term. Confirm the product name with the user before creating files.
+- No model/orchestration/VAD tokens. Add `[tool.voice-agent-example]` `category = "managed-platform"` to `pyproject.toml`.
+- Variants are not predefined — if one seems needed, propose it and get the user's explicit approval.
+
 If the name does not match, stop and ask the user to provide a corrected name.
 
 ### 1. Create the full directory structure
@@ -83,11 +88,11 @@ Copy `grok3-voice-native/inbound/server.py` → `{example-name}/inbound/server.p
 - Replace Plivo app name (`Grok_Voice_Agent` → `{NewAgent}_Voice_Agent`)
 - Keep ALL routes, webhook logic, and WebSocket handling identical
 
-Do the same for `grok3-voice-native/outbound/server.py` → `{example-name}/outbound/server.py`.
+For `outbound/server.py`, follow `deepgram-voiceagent/outbound/server.py` (the simple path in CLAUDE.md "Outbound Calls"): `/`, `/outbound/answer` (reads `opening_reason`/`objective`/`context` from the query string into the `<Stream>` body), `/outbound/hangup` (logs only), `/ws`. Do not copy `POST /outbound/call`, status/campaign routes or `CallManager` from `grok3-voice-native`.
 
 ### 4. Create system prompts
 
-Copy `grok3-voice-native/inbound/system_prompt.md` and `outbound/system_prompt.md` as starting templates. The user can customize these later.
+Copy `grok3-voice-native/inbound/system_prompt.md` and `outbound/system_prompt.md` as starting templates. The user can customize these later. These files are the only prompt source: no `SYSTEM_PROMPT` env override (see CLAUDE.md "System Prompt").
 
 ### 5. Create agent.py skeletons
 
@@ -98,13 +103,13 @@ Copy `grok3-voice-native/inbound/system_prompt.md` and `outbound/system_prompt.m
   - All method bodies have `# TODO: Implement {api}-specific logic` comments
   - Include the tool functions (check_order_status, send_sms, etc.) from reference
   - Include public `run_agent()` function
-- `outbound/agent.py`: Same skeleton + `OutboundCallRecord`, `CallManager`, `determine_outcome` from `grok3-voice-native/outbound/agent.py`
+- `outbound/agent.py`: Same skeleton + `build_outbound_prompt()` / greeting rendered from the per-call context (`opening_reason`, `objective`, `context`) that `run_agent()` receives. No `CallManager`, `OutboundCallRecord` or `determine_outcome` (legacy); follow `deepgram-voiceagent/outbound/`
 
 **For framework orchestration**:
 - `inbound/agent.py`: Skeleton with `run_agent()` function that assembles a Pipeline
   - `# TODO: Configure {framework} services and pipeline` comments
   - No custom agent class (framework handles task management)
-- `outbound/agent.py`: Similar skeleton + `OutboundCallRecord`, `CallManager`
+- `outbound/agent.py`: Similar skeleton + prompt/greeting rendered from the per-call context (no `CallManager`)
 
 ### 6. Create utils.py
 

@@ -56,6 +56,14 @@ ORCHESTRATION="native"
 if grep -q "pipecat\|livekit" "$EXAMPLE_DIR/inbound/agent.py" 2>/dev/null; then
     ORCHESTRATION="framework"
 fi
+# Managed voice-agent platforms declare themselves in pyproject.toml:
+#   [tool.voice-agent-example]
+#   category = "managed-platform"
+# (names follow the platform's own product branding, so they can't be
+# detected from the directory name alone)
+if grep -Eq '^category *= *"managed-platform"' "$EXAMPLE_DIR/pyproject.toml" 2>/dev/null; then
+    ORCHESTRATION="managed-platform"
+fi
 
 echo "=========================================="
 echo "Validating: $EXAMPLE"
@@ -75,8 +83,15 @@ KNOWN_ORCH="native|pipecat|livekit|vapi"
 KNOWN_VARIANTS="no-vad|webrtcvad"
 
 name_valid=false
+if [[ "$ORCHESTRATION" == "managed-platform" ]]; then
+    # {provider}-{product}[-{variant}]: lowercase, hyphen-separated tokens.
+    # The product token must mirror the platform's own branding and any variant
+    # must be agreed in review (see CLAUDE.md) -- only the format is checked here.
+    if [[ "$EXAMPLE" =~ ^[a-z0-9.]+(-[a-z0-9.]+)+$ ]]; then
+        name_valid=true
+    fi
 # Check if name ends with a known orchestration type (with optional known variant)
-if [[ "$EXAMPLE" =~ -($KNOWN_ORCH)$ ]]; then
+elif [[ "$EXAMPLE" =~ -($KNOWN_ORCH)$ ]]; then
     name_valid=true
 elif [[ "$EXAMPLE" =~ -($KNOWN_ORCH)-($KNOWN_VARIANTS)$ ]]; then
     name_valid=true
@@ -84,6 +99,11 @@ fi
 
 if $name_valid; then
     pass "Directory name follows naming convention"
+    if [[ "$ORCHESTRATION" == "managed-platform" ]]; then
+        echo "  [NOTE] Managed-platform name: confirm product branding and any variant in human review"
+    fi
+elif [[ "$ORCHESTRATION" == "managed-platform" ]]; then
+    fail "Directory name '$EXAMPLE' must be lowercase hyphen-separated {provider}-{product}[-{variant}]"
 else
     fail "Directory name '$EXAMPLE' does not follow naming convention ({provider}-...-{orchestration}[-{variant}])"
 fi
@@ -240,7 +260,18 @@ echo ""
 
 echo "--- VAD ---"
 
-if [[ "$EXAMPLE" == *"-no-vad"* ]]; then
+if [[ "$ORCHESTRATION" == "managed-platform" ]]; then
+    skip "SileroVADProcessor (managed platform — turn detection is platform-side)"
+    skip "plivo_to_vad (managed platform)"
+    skip "VAD-driven turn management (managed platform)"
+    skip "silero-vad dependency (managed platform)"
+    # The platform detects barge-in, but the client must still flush Plivo playback
+    if grep -q "clearAudio" "$EXAMPLE_DIR/inbound/agent.py" 2>/dev/null; then
+        pass "Barge-in handling (clearAudio on platform interruption event)"
+    else
+        fail "clearAudio not sent in inbound/agent.py (platform barge-in must flush Plivo playback)"
+    fi
+elif [[ "$EXAMPLE" == *"-no-vad"* ]]; then
     skip "SileroVADProcessor (no-vad variant — uses server-side VAD)"
     skip "plivo_to_vad (no-vad variant)"
     skip "VAD-driven turn management (no-vad variant)"

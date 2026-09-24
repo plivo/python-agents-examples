@@ -13,6 +13,7 @@ Read `CLAUDE.md` for all rules. Then systematically check every item below.
 ### Detection
 
 First, determine orchestration type by reading `{example-name}/inbound/agent.py`:
+- If `pyproject.toml` declares `category = "managed-platform"` under `[tool.voice-agent-example]` → **managed platform**
 - If it imports from `pipecat` or `livekit` → **framework**
 - Otherwise → **native**
 
@@ -22,7 +23,7 @@ Run through EVERY item. Report PASS or FAIL with details for each.
 
 #### Naming (1 check)
 
-0. **Directory name follows convention**: Must match `{provider}-...-{orchestration}[-{variant}]` where orchestration is `native|pipecat|livekit|vapi` and variant (if present) is `no-vad|webrtcvad`
+0. **Directory name follows convention**: Must match `{provider}-...-{orchestration}[-{variant}]` where orchestration is `native|pipecat|livekit|vapi` and variant (if present) is `no-vad|webrtcvad`. For a **managed platform**, the name is `{provider}-{product}[-{variant}]`: verify `{product}` matches the platform's own branding and flag any variant for human approval (VAD checks do not apply; `clearAudio` on the platform's interruption event does)
 
 #### Structure (8 checks)
 
@@ -38,7 +39,7 @@ Run through EVERY item. Report PASS or FAIL with details for each.
 #### Config Placement (4 checks)
 
 9. **Server constants in server.py**: `SERVER_PORT`, `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN`, `PLIVO_PHONE_NUMBER`, `PUBLIC_URL` are imported from utils or defined in server.py — NOT in agent.py
-10. **Agent constants in agent.py**: API keys, model names, voice names, `PLIVO_CHUNK_SIZE`, `SYSTEM_PROMPT` — NOT in utils.py
+10. **Agent constants in agent.py**: API keys, model names, voice names, `PLIVO_CHUNK_SIZE`, `SYSTEM_PROMPT` — NOT in utils.py. `SYSTEM_PROMPT` is read only from `system_prompt.md`: flag any `os.getenv("SYSTEM_PROMPT")` (or similar) override. New examples use the simple outbound path (no `CallManager`, `OutboundCallRecord` or `POST /outbound/call`; see CLAUDE.md "Outbound Calls")
 11. **Utils only has utility constants**: No `SERVER_PORT`, `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN`, `PLIVO_PHONE_NUMBER`, `PUBLIC_URL`, API keys, or model names in utils.py
 12. **No config leakage**: grep for common config constants to verify placement
 

@@ -21,7 +21,7 @@ If an API docs URL is provided, fetch it to understand:
 
 Also read the reference implementations:
 - `grok3-voice-native/inbound/agent.py` — native pattern with Silero VAD, barge-in, turn management
-- `grok3-voice-native/outbound/agent.py` — outbound pattern with CallManager
+- `deepgram-voiceagent/outbound/` — outbound pattern: Plivo Make Call API → `answer_url` query params → `<Stream>` → agent (`grok3-voice-native/outbound/` uses the legacy `CallManager`; don't copy it)
 - `gemini2.5-live-native/inbound/agent.py` — alternative native pattern (SDK-based)
 
 ### 2. Update utils.py
@@ -73,12 +73,13 @@ Include all tool functions from the scaffold (check_order_status, send_sms, sche
 
 ### 4. Implement outbound/agent.py
 
-Copy the inbound agent logic, then add:
-- `OutboundCallRecord` dataclass (from `grok3-voice-native/outbound/agent.py`)
-- `CallManager` class (thread-safe call tracking)
-- `determine_outcome()` function (maps Plivo hangup causes)
-- `build_outbound_prompt()` for template variable substitution
-- Modified `run_agent()` that accepts system_prompt and initial_message overrides
+Copy the inbound agent logic, then add (reference: `deepgram-voiceagent/outbound/agent.py`):
+- `build_outbound_prompt()` for template variable substitution, with neutral fallbacks so no `{{...}}` placeholder is ever sent
+- A greeting builder from `opening_reason` (default greeting when it is empty)
+- An outbound call context that labels `To` as the customer's number and `From` as our caller ID
+- `run_agent()` that accepts `opening_reason`, `objective`, `context` (from the `answer_url` query string) and renders the prompt and greeting
+
+Do not add `CallManager`, `OutboundCallRecord` or `determine_outcome()` (legacy), and do not read the prompt from a `SYSTEM_PROMPT` env var; `system_prompt.md` is the only source.
 
 ### 5. Update pyproject.toml
 
@@ -98,6 +99,6 @@ After implementation:
 1. `uv run ruff check .` from the example directory — must be clean
 2. `uv run python -c "from utils import *; print('utils OK')"` — imports work
 3. `uv run python -c "from inbound.agent import run_agent; print('inbound OK')"` — imports work
-4. `uv run python -c "from outbound.agent import run_agent, CallManager; print('outbound OK')"` — imports work
+4. `uv run python -c "from outbound.agent import run_agent, build_outbound_prompt; print('outbound OK')"` — imports work
 
 Fix any lint or import errors before declaring Phase 2 complete.

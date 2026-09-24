@@ -47,16 +47,39 @@ Drop the size class (mini/nano/pro/flash) — it's `.env` config. Only include s
 
 ### Examples
 
-`gpt5.4-assemblyaiu3-cartesiasonic3-native`, `gemini2.5-live-pipecat`, `gpt4.1-deepgramnova3-elevenflashv2.5-native`
+`gpt5.4-assemblyaiu3-cartesiasonic3-native`, `gemini2.5-live-pipecat`, `gpt4.1-deepgramnova3-elevenflashv2.5-native`, `deepgram-voiceagent` (managed platform — see below)
 
 Orchestration types:
 - **native** — raw websockets/SDK, custom asyncio task management, client-side Silero VAD (default)
 - **pipecat** / **livekit** / **vapi** — framework-based Pipeline, framework-managed VAD
+- **managed platform** — hosted voice-agent product; no orchestration token in the name (see "Managed Voice-Agent Platforms")
 
 Variants:
 - **`-no-vad`** — explicitly opts out of client-side VAD (e.g., `gemini2.5-live-native-no-vad` relies on server-side VAD)
 - **`-webrtcvad`** — uses WebRTC VAD instead of Silero (e.g., `gemini2.5-live-native-webrtcvad`)
 - All new native examples include Silero VAD by default. These suffixes are the exception, not the rule.
+
+### Managed Voice-Agent Platforms
+
+A managed platform runs the whole conversation loop (STT, LLM, TTS, turn detection, barge-in) as one hosted product; the example only bridges Plivo audio to it and answers its client-side events. These are named after the **product**, not its component models, and do not use the orchestration/VAD tokens above:
+
+`{provider}-{product}[-{variant}]` — e.g. `deepgram-voiceagent` (Deepgram "Voice Agent API")
+
+- **`{provider}`** — the company name, lowercased.
+- **`{product}`** — the platform's *own* name for the product, as branded in its docs/API reference: lowercased, spaces and punctuation removed, generic suffixes like "API" dropped. Honor each brand's naming; do **not** reuse another platform's product term or invent a shared category word. If the product name is the company name, write it once. If a provider has several voice-agent products, use the one whose API the example actually calls.
+- **No model components** — model choices are `.env` config. Env vars mirror the platform's own config schema and accept its documented values verbatim (model ids, provider types); never define aliases or wrapper values on top. The README lists tested combinations.
+- **No `native`/`-no-vad`/orchestration token** — turn detection and barge-in are owned by the platform. The client still must flush Plivo playback (`clearAudio`) on the platform's interruption event.
+- **One example per platform.** A different model combination is a README/`.env` change, not a new example.
+- Declare the category in `pyproject.toml` so `scripts/validate-example.sh` applies the right checks:
+  ```toml
+  [tool.voice-agent-example]
+  category = "managed-platform"
+  ```
+- Canonical file structure, config placement, audio rules and the 3-task asyncio pattern still apply (`_receive_from_{api}()` handles the platform's events). No Silero/VAD code.
+
+**Variants (`-{variant}`) are not predefined and require human review.** Add one only when the *integration contract* changes in a way `.env` config cannot express — e.g. how Plivo audio reaches the platform changes, or a pipeline stage moves out of the platform into this example's own code. When proposing one: name what differs in the integration (not a model, and not a vendor unless the vendor *is* the difference), keep it to one or two lowercase words, check it doesn't collide with an existing token, and call it out in the PR description for a reviewer to approve before the directory is created. The validator only checks the name's format.
+
+Legacy: `gpt4.1-deepgramnova3-elevenflashv2.5-vapi` predates this rule and is still named by components; it will be revisited separately.
 
 ## Canonical File Structure (ALL examples)
 
@@ -69,8 +92,8 @@ Variants:
 │   └── system_prompt.md      # System prompt for inbound calls
 ├── outbound/
 │   ├── __init__.py
-│   ├── agent.py              # Same agent class + OutboundCallRecord, CallManager
-│   ├── server.py             # FastAPI: /outbound/call, /outbound/ws, etc.
+│   ├── agent.py              # Same agent class + outbound prompt/greeting rendered from per-call context
+│   ├── server.py             # FastAPI: /outbound/answer (answer_url context → <Stream>), /outbound/hangup, /ws
 │   └── system_prompt.md      # System prompt for outbound calls
 ├── utils.py                  # Audio conversion, VAD (if native), phone utils
 ├── tests/
@@ -102,12 +125,20 @@ Constants live where they are consumed:
 **`agent.py`** owns:
 - API keys, model names, voice names, API URLs
 - `PLIVO_CHUNK_SIZE = 160` (used in `_send_to_plivo`)
-- `SYSTEM_PROMPT` (loaded from `system_prompt.md`)
+- `SYSTEM_PROMPT` (loaded only from `system_prompt.md`; no env override, see "System Prompt")
 
 **`utils.py`** owns only what its functions consume:
 - Audio sample rates: `PLIVO_SAMPLE_RATE`, `{API}_SAMPLE_RATE`, `VAD_SAMPLE_RATE`
 - VAD params (native only): `VAD_START_THRESHOLD`, `VAD_END_THRESHOLD`, `VAD_MIN_SILENCE_MS`, `VAD_CHUNK_SAMPLES`
 - `DEFAULT_COUNTRY_CODE`
+
+## System Prompt
+
+The system prompt is loaded only from `inbound/system_prompt.md` / `outbound/system_prompt.md`. No `SYSTEM_PROMPT` (or similar) env override: it is a second source of truth, the env is shared by both directions, and multi-line prompts don't fit env files / `docker --env-file`. Customise by editing the file, or by mounting another file over it (e.g. `docker run -v ./my_prompt.md:/app/inbound/system_prompt.md …`).
+
+## Outbound Calls
+
+New examples use the simple outbound path: Plivo Make Call API → `answer_url` (`/outbound/answer?opening_reason=…&objective=…&context=…`, per-call context as query params) → `<Stream>` (context in the base64 `body`) → `/ws` → agent renders prompt + greeting. The server has no dial endpoint and no `CallManager`/campaign/status tracking; `/outbound/hangup` only logs. Reference: `deepgram-voiceagent/`. Existing examples with `CallManager`, `OutboundCallRecord` and `POST /outbound/call` are legacy; don't add them to new ones.
 
 ## utils.py Requirements
 
@@ -168,6 +199,13 @@ For framework examples: no VAD in utils (framework handles it).
 3. Plivo sends `{"event": "stop"}` — call ended
 4. Agent sends `{"event": "playAudio", "media": {...}}` — response audio
 5. Agent sends `{"event": "clearAudio"}` — on barge-in to stop playback
+
+## Webhook Authentication
+
+New examples authenticate Plivo's HTTP webhooks (reference: `deepgram-voiceagent/`, README "Webhook authentication"):
+- **Plivo HTTP webhooks** (answer, hangup, fallback, …): verify the V3 signature (`X-Plivo-Signature-V3` + `-Nonce`) with `plivo.utils.validate_v3_signature`, keyed with `PLIVO_AUTH_TOKEN`, via a FastAPI dependency in `server.py`. Rebuild the signed URL as `PUBLIC_URL` + request path + raw query string (never `request.url`: behind a tunnel it is `http://localhost…`), read at request time so `--tunnel` works. Signed params are the form fields for POST and the query string for GET. Failure: 403, plus a warning with the path and reason, never the signature.
+- **Always on**: no env switch disables the check. With an empty `PLIVO_AUTH_TOKEN`, refuse to start. Tests use a dummy `PLIVO_AUTH_TOKEN` and sign requests the way Plivo does.
+- **`/ws`** carries no token of its own (same as every other example); keep percent-encoding the base64 `body` in the stream URL so a `+` doesn't arrive as a space.
 
 ## Asyncio Patterns (Native)
 
@@ -262,10 +300,12 @@ Run: `uv run pytest tests/test_integration.py -v -k "unit"` (offline)
 - **Primary reference**: `grok3-voice-native/` — complete native example with Silero VAD
 - `grok3-voice-native/utils.py` — SileroVADProcessor class, audio conversion
 - `grok3-voice-native/inbound/agent.py` — native agent pattern with VAD + barge-in
-- `grok3-voice-native/outbound/agent.py` — OutboundCallRecord, CallManager pattern
+- `grok3-voice-native/outbound/agent.py` — legacy `CallManager` outbound pattern; do not copy it into new examples (see "Outbound Calls")
 - `grok3-voice-native/tests/` — full test suite to replicate
 - `gemini2.5-live-native-no-vad/` — alternative native pattern (SDK-based, server-side VAD, no client-side VAD)
 - `gemini2.5-live-pipecat/inbound/agent.py` — framework Pipeline reference
+- `deepgram-voiceagent/` — managed voice-agent platform reference (raw WebSocket bridge, platform-side turn detection, checkpoint-based playback tracking)
+- `deepgram-voiceagent/outbound/` — outbound reference: Plivo Make Call API → `answer_url` query params → `<Stream>` → agent
 
 ## README Demo Description (Required)
 
