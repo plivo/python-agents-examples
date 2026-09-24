@@ -3,8 +3,8 @@ Integration tests for the Deepgram Voice Agent API + Plivo example.
 
 Test Levels:
 1. Unit Tests (offline) - audio conversion, phone normalization, Settings builder,
-   function dispatch, Deepgram event handling with fake WebSockets, CallManager,
-   server routes via FastAPI TestClient
+   function dispatch, Deepgram event handling with fake WebSockets, outbound call
+   details (prompt/greeting rendering), server routes via FastAPI TestClient
 2. Local Integration - start the inbound server, drive the Plivo WebSocket protocol
 3. Deepgram Agent Integration - connect directly to the Deepgram Voice Agent API
 4. Plivo Integration - validate Plivo credentials and phone number
@@ -1148,103 +1148,112 @@ class TestUnitDeepgramEventHandling:
 # =============================================================================
 
 
-class TestUnitCallManager:
-    """Unit tests for outbound call records, prompts and greetings."""
+class TestUnitOutboundCallDetails:
+    """Outbound prompt + greeting rendered from the answer_url call details."""
 
     def test_literal_greeting_with_opening_reason(self):
-        from outbound.agent import CallManager
+        from outbound.agent import build_outbound_greeting
 
-        record = CallManager().create_call(
-            phone_number="+15551234567", opening_reason="you requested a demo"
+        greeting = build_outbound_greeting("you requested a demo.")
+        assert greeting == (
+            "Hi, this is Alex from TechFlow. I'm reaching out because you requested a demo. "
+            "Is now a good time for a quick chat?"
         )
-        assert record.initial_message.startswith("Hi, this is Alex from TechFlow.")
-        assert "you requested a demo" in record.initial_message
-        assert record.status == "initiating"
 
-    def test_default_greeting_without_reason(self):
-        from outbound.agent import DEFAULT_OUTBOUND_GREETING, CallManager
+    @pytest.mark.parametrize("reason", ["", "   "])
+    def test_default_greeting_without_reason(self, reason):
+        from outbound.agent import DEFAULT_OUTBOUND_GREETING, build_outbound_greeting
 
-        record = CallManager().create_call(phone_number="+15551234567")
-        assert record.initial_message == DEFAULT_OUTBOUND_GREETING
+        assert build_outbound_greeting(reason) == DEFAULT_OUTBOUND_GREETING
 
     def test_prompt_substitution(self):
-        from outbound.agent import CallManager
+        from outbound.agent import build_outbound_greeting, build_outbound_prompt
 
-        record = CallManager().create_call(
-            phone_number="+15551234567",
+        prompt = build_outbound_prompt(
             opening_reason="your trial ends soon",
             objective="book a renewal call",
             context="customer since 2024",
         )
-        assert "{{" not in record.system_prompt
-        assert "your trial ends soon" in record.system_prompt
-        assert "book a renewal call" in record.system_prompt
+        assert "{{" not in prompt
+        for text in ("your trial ends soon", "book a renewal call", "customer since 2024"):
+            assert text in prompt, text
+        assert f'"{build_outbound_greeting("your trial ends soon")}"' in prompt
 
-    def test_outbound_settings_use_record(self):
-        from outbound.agent import CallManager, DeepgramVoiceAgent
+    def test_prompt_without_details_uses_neutral_wording(self):
+        """#3/#24: no unrendered placeholders, no "because .", and the quoted greeting
+        is the one actually spoken."""
+        from outbound import agent as agent_mod
 
-        record = CallManager().create_call(phone_number="+1555", opening_reason="a demo")
+        prompt = agent_mod.build_outbound_prompt()
+        assert "{{" not in prompt and "}}" not in prompt
+        assert "because ." not in prompt
+        assert "calling about: \n" not in prompt
+        assert f'"{agent_mod.DEFAULT_OUTBOUND_GREETING}"' in prompt
+        for fallback in (
+            agent_mod.FALLBACK_OPENING_REASON,
+            agent_mod.FALLBACK_OBJECTIVE,
+            agent_mod.FALLBACK_CONTEXT,
+        ):
+            assert fallback in prompt
+
+    def test_agent_renders_prompt_and_greeting_from_details(self):
+        from outbound.agent import (
+            DeepgramVoiceAgent,
+            build_outbound_greeting,
+            build_outbound_prompt,
+        )
+
         agent = DeepgramVoiceAgent(
-            websocket=FakePlivoWS(),
-            call_id="c",
-            system_prompt=record.system_prompt,
-            initial_message=record.initial_message,
+            websocket=FakePlivoWS(), call_id="c", opening_reason="a demo", objective="book"
         )
         settings = agent._build_settings()
-        assert settings["agent"]["greeting"] == record.initial_message
-        assert settings["agent"]["think"]["prompt"].startswith(record.system_prompt)
+        assert settings["agent"]["greeting"] == build_outbound_greeting("a demo")
+        assert settings["agent"]["think"]["prompt"].startswith(
+            build_outbound_prompt("a demo", "book")
+        )
         assert _find_keys(settings, "language") == []
 
-    def test_status_and_active_calls(self):
-        from outbound.agent import CallManager
+    async def test_run_agent_renders_details(self, monkeypatch):
+        from outbound import agent as agent_mod
 
-        manager = CallManager()
-        a = manager.create_call(phone_number="+1")
-        b = manager.create_call(phone_number="+2")
-        manager.update_status(a.call_id, "connected", plivo_call_uuid="uuid-a", bogus="x")
-        manager.update_status(b.call_id, "completed", outcome="success")
-        assert manager.get_call(a.call_id).plivo_call_uuid == "uuid-a"
-        assert not hasattr(manager.get_call(a.call_id), "bogus")
-        assert [r.call_id for r in manager.get_active_calls()] == [a.call_id]
-        assert manager.update_status("missing", "completed") is None
-        assert manager.get_call("missing") is None
+        seen: dict[str, Any] = {}
 
-    def test_calls_by_campaign(self):
-        from outbound.agent import CallManager
+        async def fake_run(self):
+            seen.update(prompt=self.system_prompt, greeting=self.initial_message)
 
-        manager = CallManager()
-        manager.create_call(phone_number="+1", campaign_id="c1")
-        manager.create_call(phone_number="+2", campaign_id="c1")
-        manager.create_call(phone_number="+3", campaign_id="c2")
-        assert len(manager.get_calls_by_campaign("c1")) == 2
-        assert len(manager.get_calls_by_campaign("c3")) == 0
+        monkeypatch.setattr(agent_mod.DeepgramVoiceAgent, "run", fake_run)
+        await agent_mod.run_agent(
+            websocket=FakePlivoWS(), call_id="c", opening_reason="a demo", context="VIP"
+        )
+        assert seen["greeting"] == agent_mod.build_outbound_greeting("a demo")
+        assert seen["prompt"] == agent_mod.build_outbound_prompt("a demo", "", "VIP")
 
-    @pytest.mark.parametrize(
-        ("cause", "duration", "expected"),
-        [
-            ("NO_ANSWER", 0, "no_answer"),
-            ("ORIGINATOR_CANCEL", 0, "no_answer"),
-            ("USER_BUSY", 0, "busy"),
-            ("CALL_REJECTED", 0, "busy"),
-            ("UNALLOCATED_NUMBER", 0, "failed"),
-            ("NORMAL_CLEARING", 42, "success"),
-            ("", 0, "success"),
-            ("SOMETHING_ELSE", 0, "failed"),
-            ("something_else", 5, "success"),
-        ],
-    )
-    def test_determine_outcome(self, cause, duration, expected):
-        from outbound.agent import determine_outcome
 
-        assert determine_outcome(cause, duration) == expected
+class TestUnitCallContextLabels:
+    """#1: the call context names each number by its role in the call's direction."""
 
-    def test_reset(self):
-        from outbound.agent import CallManager
+    def test_inbound_caller_is_from_number(self):
+        agent, _, _ = make_agent(from_number="+15550001111", to_number="+16572338892")
+        context = agent._build_call_context()
+        assert "- Caller's phone number: +15550001111" in context
+        assert "+16572338892" not in context
+        assert "use the caller's phone number for SMS or callbacks" in context
 
-        manager = CallManager()
-        record = manager.create_call(phone_number="+1")
-        manager.reset()
-        assert manager.get_call(record.call_id) is None
+    def test_outbound_customer_is_to_number_and_ours_is_from_number(self):
+        agent, _ = make_outbound_agent(from_number="+14155550100", to_number="+15550002222")
+        context = agent._build_call_context()
+        assert "- Customer's phone number (the person you called): +15550002222" in context
+        assert "- Our business phone number (caller ID the customer sees): +14155550100" in context
+        assert "Caller's phone number" not in context
+        assert "use the customer's phone number for SMS or callbacks" in context
+        assert "give our business phone number" in context
+        # The same context reaches the inline prompt and the reusable-config UpdatePrompt
+        assert agent._build_settings()["agent"]["think"]["prompt"].endswith(context)
+        assert agent._build_prompt_update().endswith(context)
+
+    def test_outbound_without_numbers_has_no_context(self):
+        agent, _ = make_outbound_agent(from_number="", to_number="")
+        assert agent._build_call_context() == ""
 
 
 # =============================================================================
@@ -1311,44 +1320,113 @@ class TestUnitServerRoutes:
         await server._hangup_call("uuid-42")
         assert deleted == ["uuid-42"]
 
-    def test_outbound_answer_marks_connected(self, monkeypatch):
+    def test_outbound_answer_carries_call_details(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        from outbound import server
+
+        monkeypatch.setattr(server, "PUBLIC_URL", "https://example.ngrok.app/")
+        client = TestClient(server.app)
+        resp = client.post(
+            "/outbound/answer?opening_reason=you%20requested%20a%20demo&objective=book%20a%20call",
+            data={
+                "CallUUID": "a-leg-uuid",
+                "From": "+14155550100",
+                "To": "+15551234567",
+                "SIP-H-Account": "acme",
+            },
+        )
+        assert "<Stream" in resp.text
+        assert 'bidirectional="true"' in resp.text
+        assert 'keepCallAlive="true"' in resp.text
+        assert "audio/x-mulaw;rate=8000" in resp.text
+        assert "wss://example.ngrok.app/ws?body=" in resp.text
+        meta = json.loads(base64.b64decode(resp.text.split("body=")[1].split("<")[0]))
+        assert meta == {
+            "call_uuid": "a-leg-uuid",
+            "from": "+14155550100",
+            "to": "+15551234567",
+            "parent_call_uuid": "",
+            "sip_headers": {"SIP-H-Account": "acme"},
+            "opening_reason": "you requested a demo",
+            "objective": "book a call",
+            "context": "",
+        }
+
+    def test_outbound_answer_without_details(self, monkeypatch):
         from fastapi.testclient import TestClient
 
         from outbound import server
 
         monkeypatch.setattr(server, "PUBLIC_URL", "https://example.ngrok.app")
-        record = server.call_manager.create_call(phone_number="+15551234567")
-        client = TestClient(server.app)
-        resp = client.post(
-            f"/outbound/answer?call_id={record.call_id}",
-            data={"CallUUID": "a-leg-uuid", "To": "+15551234567"},
-        )
-        assert "<Stream" in resp.text
-        assert "audio/x-mulaw;rate=8000" in resp.text
+        resp = TestClient(server.app).get("/outbound/answer?CallUUID=u1&To=%2B15551234567")
         meta = json.loads(base64.b64decode(resp.text.split("body=")[1].split("<")[0]))
-        assert meta["is_outbound"] is True
-        assert meta["call_id"] == record.call_id
+        assert (meta["call_uuid"], meta["to"]) == ("u1", "+15551234567")
+        assert (meta["opening_reason"], meta["objective"], meta["context"]) == ("", "", "")
 
-        status = client.get(f"/outbound/status/{record.call_id}").json()
-        assert status["status"] == "connected"
-        assert status["plivo_call_uuid"] == "a-leg-uuid"
-
-    def test_outbound_call_requires_phone_number(self):
+    def test_outbound_hangup_webhook_logs(self, captured_messages):
         from fastapi.testclient import TestClient
 
         from outbound import server
 
-        resp = TestClient(server.app).post("/outbound/call")
-        assert resp.json() == {"error": "phone_number is required"}
+        resp = TestClient(server.app).post(
+            "/outbound/hangup",
+            data={"CallUUID": "u1", "Duration": "12", "HangupCause": "NORMAL_CLEARING"},
+        )
+        assert resp.text == "OK"
+        assert any(
+            "Outbound call ended: CallUUID=u1, Duration=12s, HangupCause=NORMAL_CLEARING" in m
+            for m in captured_messages
+        )
 
-    def test_outbound_status_unknown(self):
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("post", "/outbound/call"),
+            ("get", "/outbound/status/x"),
+            ("post", "/outbound/hangup/x"),
+            ("get", "/outbound/campaign/x"),
+            ("get", "/hold"),
+        ],
+    )
+    def test_outbound_campaign_routes_are_gone(self, method, path):
         from fastapi.testclient import TestClient
 
         from outbound import server
 
-        assert TestClient(server.app).get("/outbound/status/nope").json() == {
-            "error": "Call not found"
-        }
+        assert getattr(TestClient(server.app), method)(path).status_code in (404, 405)
+
+    def test_outbound_ready_message(self, monkeypatch):
+        from outbound import server
+
+        monkeypatch.setattr(server, "PUBLIC_URL", "https://t-9.trycloudflare.com/")
+        monkeypatch.setattr(server, "PLIVO_PHONE_NUMBER", "+1 (415) 555-0100")
+        monkeypatch.setattr(server, "PLIVO_AUTH_ID", "MAREALID")
+        monkeypatch.setattr(server, "PLIVO_AUTH_TOKEN", "real-secret-token")
+        message = server.ready_message()
+        assert message.startswith("Ready! ")
+        assert message.endswith("(Ctrl+C to stop)")
+        assert '"https://api.plivo.com/v1/Account/$PLIVO_AUTH_ID/Call/"' in message
+        assert '-u "$PLIVO_AUTH_ID:$PLIVO_AUTH_TOKEN"' in message
+        assert "MAREALID" not in message and "real-secret-token" not in message
+        assert '"from": "+14155550100"' in message
+        assert '"to": "<E.164 number to call>"' in message
+        assert (
+            '"answer_url": "https://t-9.trycloudflare.com/outbound/answer'
+            '?opening_reason=you%20requested%20a%20demo"'
+        ) in message
+        assert '"hangup_url": "https://t-9.trycloudflare.com/outbound/hangup"' in message
+        assert "Must be a valid url" not in message
+        assert "Must be a valid url" in server.ready_message(tunnel=True)
+
+    def test_outbound_ready_message_placeholders(self, monkeypatch):
+        from outbound import server
+
+        monkeypatch.setattr(server, "PUBLIC_URL", "")
+        monkeypatch.setattr(server, "PLIVO_PHONE_NUMBER", "")
+        message = server.ready_message()
+        assert '"from": "<your Plivo number>"' in message
+        assert '"answer_url": "<PUBLIC_URL>/outbound/answer?' in message
 
 
 # =============================================================================
@@ -1365,32 +1443,31 @@ INLINE_SETTINGS_SHA256 = {
     "inbound|caller=+15551234567": (
         "f33419bbdb46b83b93f02570d6cb153723a0af1230479186fff4f82955fb9c8d"
     ),
-    "outbound|campaign=False|caller=": (
-        "1b84b56c05e54ea21f0b09578a398855d11b4f655580f939e87e1b99b862317e"
+    "outbound|details=False|numbers=False": (
+        "be1c1fe7126048b2706b74a1a9d58d36f293fa46a647ad8ea5ff8c4867acfe50"
     ),
-    "outbound|campaign=False|caller=+15551234567": (
-        "4528d4355a314c9ac0a6a78317ecdc501aac63fd703530b93d48c3c39f749446"
+    "outbound|details=False|numbers=True": (
+        "e60e6fe3a8d1364e6d5b2228b0e4884a833704147ced60fda8285a6a5e270f1a"
     ),
-    "outbound|campaign=True|caller=": (
-        "c6bc66a3cf7e7e9b4f43b3164f98aabd7d8296c531f204058bf2e3e226e78bb5"
+    "outbound|details=True|numbers=False": (
+        "aa4c4ee018172354404e7f744ea80717c5dfd6c2ea4c42694c53c37eac1dc960"
     ),
-    "outbound|campaign=True|caller=+15551234567": (
-        "f86a00ac586b817d30c0d3b0f5e86513abddb8b6fbc095e0bcf2a1da3af5fbc7"
+    "outbound|details=True|numbers=True": (
+        "34d156d2b61c2b43d1bfb5e0b7702a77ed5e1d1e26609d0b686df718baf872e5"
     ),
-    "outbound|default": "6c411dda5ff5ccb2335231f5d42308d80ab7b987af5a34017aba8003133a68cc",
 }
 
 # sha256 of the config string in the README create body (default env)
 CREATE_BODY_CONFIG_SHA256 = {
     "inbound": "61191cfbf2c69e83f3f270e55eefb187972a2956f76c56112ff623ba7e005c47",
-    "outbound": "871d4cc494065a22b1878e8947695c900a839f8b40c0c166ecd7d4a02b5c7545",
+    "outbound": "65b5e6ad3f8e3851baf71c4ad4cdc75b32722046176ffcc9af722af809b199f5",
 }
 
 _DEFAULT_INBOUND_GREETING = (
     "Hi, this is Alex from TechFlow. I'm built with the Deepgram Voice Agent API "
     "on Plivo. How can I help you today?"
 )
-_CAMPAIGN = {
+_CALL_DETAILS = {
     "opening_reason": "you asked about TechFlow Pro pricing",
     "objective": "book a demo",
     "context": "Lead from the pricing page",
@@ -1425,7 +1502,6 @@ def default_agent_modules(monkeypatch):
             monkeypatch.setattr(mod, name, value)
     inbound_prompt = (Path(inbound_mod.__file__).parent / "system_prompt.md").read_text().strip()
     monkeypatch.setattr(inbound_mod, "SYSTEM_PROMPT", inbound_prompt)
-    monkeypatch.setattr(outbound_mod, "SYSTEM_PROMPT", outbound_mod._OUTBOUND_PROMPT_TEMPLATE)
     return inbound_mod, outbound_mod
 
 
@@ -1448,28 +1524,17 @@ class TestUnitInlineSettingsSnapshot:
         )
         assert self._wire_sha256(agent) == INLINE_SETTINGS_SHA256[f"inbound|caller={caller}"]
 
-    @pytest.mark.parametrize("campaign", [False, True])
-    @pytest.mark.parametrize("caller", ["", "+15551234567"])
-    def test_outbound(self, default_agent_modules, campaign, caller):
+    @pytest.mark.parametrize("details", [False, True])
+    @pytest.mark.parametrize("numbers", [False, True])
+    def test_outbound(self, default_agent_modules, details, numbers):
         _, outbound_mod = default_agent_modules
-        fields = _CAMPAIGN if campaign else {}
-        record = outbound_mod.CallManager().create_call("+15551234567", **fields)
+        fields = _CALL_DETAILS if details else {}
+        phones = {"from_number": "+14155550100", "to_number": "+15551234567"} if numbers else {}
         agent = outbound_mod.DeepgramVoiceAgent(
-            None,
-            CALL_ID,
-            from_number=caller,
-            system_prompt=record.system_prompt,
-            initial_message=record.initial_message,
-            agent_config_id="",
-            **fields,
+            None, CALL_ID, agent_config_id="", **phones, **fields
         )
-        key = f"outbound|campaign={campaign}|caller={caller}"
+        key = f"outbound|details={details}|numbers={numbers}"
         assert self._wire_sha256(agent) == INLINE_SETTINGS_SHA256[key]
-
-    def test_outbound_without_record(self, default_agent_modules):
-        _, outbound_mod = default_agent_modules
-        agent = outbound_mod.DeepgramVoiceAgent(None, CALL_ID, agent_config_id="")
-        assert self._wire_sha256(agent) == INLINE_SETTINGS_SHA256["outbound|default"]
 
 
 class TestUnitStartupLog:
@@ -1545,7 +1610,8 @@ def make_outbound_agent(**kwargs: Any):
     agent = DeepgramVoiceAgent(
         websocket=FakePlivoWS(),
         call_id=CALL_ID,
-        from_number=kwargs.pop("from_number", "+15551234567"),
+        from_number=kwargs.pop("from_number", "+14155550100"),
+        to_number=kwargs.pop("to_number", "+15551234567"),
         stream_id=STREAM_ID,
         **kwargs,
     )
@@ -1676,16 +1742,15 @@ class TestUnitQuickTunnel:
 
 
 class FakePlivoClient:
-    """Minimal stand-in for plivo.RestClient covering applications/numbers/calls."""
+    """Minimal stand-in for plivo.RestClient covering applications/numbers."""
 
     def __init__(self, apps=None, reject_urls: int = 0):
         self.apps = list(apps or [])
-        self.reject_urls = reject_urls  # first N app/call writes fail with "valid url"
+        self.reject_urls = reject_urls  # first N app writes fail with "valid url"
         self.list_params: list = []
         self.updated: list = []
         self.created: list = []
         self.numbers_updated: list = []
-        self.calls_created: list = []
         outer = self
 
         class _Apps:
@@ -1707,13 +1772,7 @@ class FakePlivoClient:
             def update(self, number, app_id):
                 outer.numbers_updated.append((number, app_id))
 
-        class _Calls:
-            def create(self, **params):
-                outer._maybe_reject()
-                outer.calls_created.append(params)
-                return {"request_uuid": "req-1"}
-
-        self.applications, self.numbers, self.calls = _Apps(), _Numbers(), _Calls()
+        self.applications, self.numbers = _Apps(), _Numbers()
 
     def _maybe_reject(self):
         if self.reject_urls > 0:
@@ -1911,24 +1970,6 @@ class TestUnitPlivoAutoConfig:
             assert stopped == []
         assert stopped == ["fake-proc"]
 
-    async def test_outbound_call_retries_invalid_url_on_fresh_tunnel(self, monkeypatch):
-        from outbound import server
-
-        fake = FakePlivoClient(reject_urls=2)
-        monkeypatch.setattr(server, "TUNNEL_URL_RETRY_INTERVAL_S", 0.0)
-        monkeypatch.setattr(server, "_tunnel_started_at", time.monotonic())
-        result = await server._create_call(fake, from_="1", to_="2", answer_url="https://x")
-        assert result == {"request_uuid": "req-1"}
-        assert len(fake.calls_created) == 1
-
-    async def test_outbound_call_invalid_url_not_retried_without_tunnel(self, monkeypatch):
-        from outbound import server
-
-        fake = FakePlivoClient(reject_urls=1)
-        monkeypatch.setattr(server, "_tunnel_started_at", None)
-        with pytest.raises(plivo.exceptions.ValidationError):
-            await server._create_call(fake, from_="1", to_="2", answer_url="https://x")
-
 
 @pytest.fixture(scope="module")
 def readme_bodies() -> dict[str, dict[str, Any]]:
@@ -2024,18 +2065,14 @@ class TestUnitSavedAgentConfig:
         del created["think"]["prompt"]
         assert inline == created
 
-    def test_outbound_inline_settings_use_record_prompt_and_greeting(self):
-        from outbound.agent import CallManager
+    def test_outbound_inline_settings_use_rendered_prompt_and_greeting(self):
+        from outbound.agent import build_outbound_greeting, build_outbound_prompt
 
-        record = CallManager().create_call(phone_number="+1555", opening_reason="a demo")
-        agent, _ = make_outbound_agent(
-            system_prompt=record.system_prompt,
-            initial_message=record.initial_message,
-            opening_reason="a demo",
-        )
+        agent, _ = make_outbound_agent(opening_reason="a demo")
         inline = agent._build_settings()["agent"]
-        assert inline["greeting"] == record.initial_message
-        assert inline["think"]["prompt"] == record.system_prompt + agent._build_call_context()
+        assert inline["greeting"] == build_outbound_greeting("a demo")
+        expected = build_outbound_prompt("a demo") + agent._build_call_context()
+        assert inline["think"]["prompt"] == expected
 
     async def test_saved_handshake_sends_context_then_greeting_then_flushes(self):
         agent, plivo_ws, dg = make_agent(
@@ -2105,7 +2142,7 @@ class TestUnitSavedAgentConfig:
         (session_end,) = of_event(captured_events, "session_end")
         assert session_end["agent_config"] == expected
 
-    async def test_outbound_saved_mode_appends_campaign_details(self):
+    async def test_outbound_saved_mode_appends_call_details(self):
         agent, dg = make_outbound_agent(
             agent_config_id=SAVED_UUID,
             initial_message="Hi, this is Alex from TechFlow.",
@@ -2134,7 +2171,20 @@ class TestUnitSavedAgentConfig:
             "message": "Hi, this is Alex from TechFlow.",
         }
 
-    def test_outbound_ws_passes_campaign_to_agent(self, monkeypatch):
+    async def test_outbound_saved_mode_without_details_is_neutral(self):
+        from outbound import agent as agent_mod
+
+        agent, _ = make_outbound_agent(agent_config_id=SAVED_UUID)
+        update = agent._build_prompt_update()
+        assert f'"{agent_mod.DEFAULT_OUTBOUND_GREETING}"' in update
+        for fallback in (
+            agent_mod.FALLBACK_OPENING_REASON,
+            agent_mod.FALLBACK_OBJECTIVE,
+            agent_mod.FALLBACK_CONTEXT,
+        ):
+            assert fallback in update
+
+    def test_outbound_ws_passes_call_details_to_agent(self, monkeypatch):
         from fastapi.testclient import TestClient
 
         from outbound import server
@@ -2144,21 +2194,23 @@ class TestUnitSavedAgentConfig:
         async def fake_run_agent(**kwargs):
             seen.update(kwargs)
 
+        monkeypatch.setattr(server, "PUBLIC_URL", "https://example.ngrok.app")
         monkeypatch.setattr(server, "run_agent", fake_run_agent)
-        record = server.call_manager.create_call(
-            phone_number="+1555", opening_reason="a demo", objective="book", context="ctx"
+        client = TestClient(server.app)
+        answer = client.post(
+            "/outbound/answer?opening_reason=a%20demo&objective=book&context=ctx",
+            data={"CallUUID": "u", "From": "+14155550100", "To": "+15551234567"},
         )
-        body = base64.b64encode(
-            json.dumps({"call_uuid": "u", "is_outbound": True, "call_id": record.call_id}).encode()
-        ).decode()
-        with TestClient(server.app).websocket_connect(f"/ws?body={body}") as ws:
+        body = answer.text.split("body=")[1].split("<")[0]
+        with client.websocket_connect(f"/ws?body={body}") as ws:
             ws.send_text(json.dumps({"event": "start", "start": {"callId": "u", "streamId": "s"}}))
         assert (seen["opening_reason"], seen["objective"], seen["context"]) == (
             "a demo",
             "book",
             "ctx",
         )
-        assert seen["initial_message"] == record.initial_message
+        assert (seen["from_number"], seen["to_number"]) == ("+14155550100", "+15551234567")
+        assert "system_prompt" not in seen and "initial_message" not in seen
 
 
 # =============================================================================

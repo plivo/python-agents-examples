@@ -1,21 +1,21 @@
 """
-Outbound call E2E tests — verifies the outbound calling feature end-to-end.
+Outbound call E2E tests: place the call with Plivo's Make Call API, as a user would.
 
 Tests:
-1. POST /outbound/call returns call_id and status tracking works
-2. /outbound/answer returns valid Stream XML
-3. Full outbound call cycle: place real call, record, transcribe, verify the greeting
-   the speak model says verbatim (built from opening_reason)
-4. Status lifecycle transitions (initiating -> ringing -> connected -> completed)
-5. Programmatic hangup via POST /outbound/hangup/{call_id}
-6. GET /outbound/campaign/{campaign_id}
+1. /outbound/answer (reached through the tunnel) returns Stream XML whose body carries
+   the answer_url call details
+2. Full outbound call cycle: plivo.RestClient().calls.create(answer_url=<tunnel>/outbound/
+   answer?opening_reason=...&objective=...&context=..., hangup_url=<tunnel>/outbound/hangup),
+   record, transcribe, and verify from the server logs that the A-leg greeting was built
+   from opening_reason, that the callee leg (no query params) used the neutral default
+   greeting, and that the hangup webhook was received
 
 The agent calls from PLIVO_PHONE_NUMBER to PLIVO_TEST_NUMBER. A call between two Plivo
 numbers creates a second, inbound call on PLIVO_TEST_NUMBER, answered by that number's
-app. A <Wait>-only answer (/hold) never answers an inbound call (Plivo ends both legs
-with NO_USER_RESPONSE / Media Timeout), so PLIVO_TEST_NUMBER is temporarily assigned to
-an app that answers with /outbound/answer: the callee is a second agent instance (with
-the default outbound greeting). The original app is restored afterwards.
+app. A <Wait>-only answer never answers an inbound call (Plivo ends both legs with
+NO_USER_RESPONSE / Media Timeout), so PLIVO_TEST_NUMBER is temporarily assigned to an
+app that answers with /outbound/answer (no query params): the callee is a second agent
+instance with the default outbound greeting. The original app is restored afterwards.
 
 Requirements:
     - PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN, PLIVO_PHONE_NUMBER, PLIVO_TEST_NUMBER and
@@ -30,8 +30,11 @@ Usage:
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 import time
+from urllib.parse import quote, urlencode
 
 import httpx
 import plivo
@@ -44,6 +47,7 @@ from tests.helpers import (
     get_app_id_for_number,
     hangup_quietly,
     list_live_call_ids,
+    log_messages,
     read_log_events,
     server_log_path,
     start_ngrok,
@@ -66,7 +70,11 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 TEST_PORT = 18003
 LOG_PATH = server_log_path("outbound_server")
 BLEG_APP_NAME = "Deepgram_VoiceAgent_Outbound_Test_Agent"
-OPENING_REASON = "your recent demo request for TechFlow Teams"
+CALL_DETAILS = {
+    "opening_reason": "your recent demo request for TechFlow Teams",
+    "objective": "qualify interest and book a meeting with sales",
+    "context": "Lead from the pricing page",
+}
 
 pytestmark = pytest.mark.skipif(
     not all(
@@ -136,35 +144,36 @@ def hang_up_leftover_calls(plivo_client):
 # =============================================================================
 
 
-def _initiate(public_url: str, **params: str) -> dict:
-    resp = httpx.post(
-        f"{public_url}/outbound/call",
-        params={"phone_number": PLIVO_TEST_NUMBER, **params},
-        timeout=30.0,
-    )
-    assert resp.status_code == 200
-    data = resp.json()
-    print(f"[Outbound] initiate: {data}")
-    assert "call_id" in data, f"Expected call_id in response: {data}"
-    assert "error" not in data, data
-    return data
+def _direction(client: plivo.RestClient, call_uuid: str) -> str:
+    try:
+        live = client.live_calls.get(call_uuid)
+    except Exception:
+        return ""
+    value = live.get("direction", "") if isinstance(live, dict) else getattr(live, "direction", "")
+    return str(value or "")
 
 
-def _status(public_url: str, call_id: str) -> dict:
-    return httpx.get(f"{public_url}/outbound/status/{call_id}", timeout=10.0).json()
-
-
-def _wait_connected(public_url: str, call_id: str, timeout: float = 40.0) -> dict:
-    status: dict = {}
+def _wait_for_legs(
+    client: plivo.RestClient, baseline: set[str], timeout: float = 40.0
+) -> tuple[str, str]:
+    """(A-leg, B-leg): the outbound call we placed and the inbound call it created."""
+    a_leg, b_leg = "", ""
     deadline = time.time() + timeout
-    while time.time() < deadline:
-        status = _status(public_url, call_id)
-        if status.get("status") == "connected" and status.get("plivo_call_uuid"):
-            return status
-        if status.get("status") in ("completed", "failed", "no_answer"):
-            return status
+    while time.time() < deadline and not (a_leg and b_leg):
+        for call_uuid in set(list_live_call_ids(client)) - baseline:
+            direction = _direction(client, call_uuid)
+            if direction == "outbound":
+                a_leg = call_uuid
+            elif direction == "inbound":
+                b_leg = call_uuid
         time.sleep(0.5)
-    return status
+    print(f"[Outbound] live legs: A={a_leg} B={b_leg}")
+    return a_leg, b_leg
+
+
+def _agent_texts(call_id: str) -> list[str]:
+    events = read_log_events(LOG_PATH, "agent_text")
+    return [e["text"] for e in events if e.get("call_id") == call_id]
 
 
 # =============================================================================
@@ -173,38 +182,17 @@ def _wait_connected(public_url: str, call_id: str, timeout: float = 40.0) -> dic
 
 
 class TestOutboundCall:
-    """End-to-end tests for outbound calling."""
-
-    def test_initiate_outbound_call_api(self, server_process, ngrok_tunnel, bleg_app_id):
-        """POST /outbound/call returns call_id and status tracking works."""
-        data = _initiate(
-            ngrok_tunnel,
-            campaign_id="test-campaign-1",
-            opening_reason=OPENING_REASON,
-            objective="qualify interest and book a meeting with sales",
-        )
-        call_id = data["call_id"]
-        assert data["status"] == "ringing"
-        assert data["plivo_request_uuid"]
-
-        status = _status(ngrok_tunnel, call_id)
-        print(f"[Outbound] Status: {status}")
-        assert status["call_id"] == call_id
-        assert status["status"] in ("ringing", "connected", "completed", "failed", "no_answer")
-
-        status = _wait_connected(ngrok_tunnel, call_id, timeout=30)
-        hangup = httpx.post(f"{ngrok_tunnel}/outbound/hangup/{call_id}", timeout=10.0).json()
-        print(f"[Outbound] Hangup response: {hangup}")
+    """End-to-end tests for outbound calling via Plivo's Make Call API."""
 
     def test_outbound_answer_webhook(self, server_process, ngrok_tunnel):
-        """/outbound/answer returns valid Plivo Stream XML."""
+        """/outbound/answer returns valid Plivo Stream XML carrying the call details."""
         resp = httpx.get(
             f"{ngrok_tunnel}/outbound/answer",
             params={
-                "call_id": "test-call-123",
                 "CallUUID": "test-uuid-456",
                 "From": PLIVO_PHONE_NUMBER,
                 "To": PLIVO_TEST_NUMBER,
+                **CALL_DETAILS,
             },
             timeout=10.0,
         )
@@ -214,31 +202,37 @@ class TestOutboundCall:
         assert "bidirectional" in body
         assert "audio/x-mulaw" in body
         assert ngrok_tunnel.replace("https://", "wss://") + "/ws?body=" in body
+        meta = json.loads(base64.b64decode(body.split("body=")[1].split("<")[0]))
+        assert {k: meta[k] for k in CALL_DETAILS} == CALL_DETAILS
 
     def test_outbound_call_full_cycle(
         self, server_process, ngrok_tunnel, plivo_client, bleg_app_id
     ):
-        """Place a real outbound call, record, transcribe, verify the outbound greeting."""
+        """Make Call API -> /outbound/answer?details -> agent greeting built from them."""
+        from outbound.agent import DEFAULT_OUTBOUND_GREETING, build_outbound_greeting
+
         baseline = set(list_live_call_ids(plivo_client))
-        data = _initiate(
-            ngrok_tunnel,
-            campaign_id="test-full-cycle",
-            opening_reason=OPENING_REASON,
-            objective="qualify interest and book a meeting with sales",
+        answer_url = f"{ngrok_tunnel}/outbound/answer?" + urlencode(CALL_DETAILS, quote_via=quote)
+        response = plivo_client.calls.create(
+            from_=normalize_phone_number(PLIVO_PHONE_NUMBER),
+            to_=normalize_phone_number(PLIVO_TEST_NUMBER),
+            answer_url=answer_url,
+            answer_method="POST",
+            hangup_url=f"{ngrok_tunnel}/outbound/hangup",
+            hangup_method="POST",
         )
-        call_id = data["call_id"]
+        request_uuid = (
+            response.get("request_uuid", "")
+            if isinstance(response, dict)
+            else getattr(response, "request_uuid", "")
+        )
+        print(f"[Outbound] Make Call request_uuid={request_uuid}")
+        assert request_uuid
 
-        status = _wait_connected(ngrok_tunnel, call_id)
-        a_leg_uuid = status.get("plivo_call_uuid", "")
-        if status.get("status") != "connected" or not a_leg_uuid:
-            pytest.skip(f"Call did not connect: {status}")
-        print(f"[Outbound] Connected! A-leg UUID: {a_leg_uuid}")
-
-        call_uuids = [a_leg_uuid]
-        for uid in set(list_live_call_ids(plivo_client)) - baseline:
-            if uid not in call_uuids:
-                call_uuids.append(uid)
-        print(f"[Outbound] Call legs: {call_uuids}")
+        a_leg, b_leg = _wait_for_legs(plivo_client, baseline)
+        if not a_leg:
+            pytest.skip("The outbound call did not connect")
+        call_uuids = [uid for uid in (a_leg, b_leg) if uid]
 
         try:
             for uid in call_uuids:
@@ -257,82 +251,38 @@ class TestOutboundCall:
         identity = [w for w in ("alex", "techflow", "tech flow") if w in lower]
         reason = [w for w in ("demo", "teams", "reaching out", "request") if w in lower]
         # Both legs run an agent, so the recording can mix two greetings; the reason is
-        # checked deterministically on the A-leg agent's own agent_text below.
+        # checked deterministically on each agent's own agent_text below.
         print(f"[Result] identity={identity} reason={reason}")
         assert identity, f"Greeting lacks the agent identity: '{transcript}'"
 
         time.sleep(1)
-        a_leg = [e for e in read_log_events(LOG_PATH) if e.get("call_id") == a_leg_uuid]
-        a_leg_texts = [e["text"] for e in a_leg if e["event"] == "agent_text"]
+        a_leg_texts = _agent_texts(a_leg)
         print(f"[Log] A-leg agent_text: {a_leg_texts}")
         assert a_leg_texts, "The A-leg agent never spoke"
-        assert OPENING_REASON in a_leg_texts[0], "Greeting lacks the opening reason"
-        turns = [e for e in a_leg if e["event"] == "turn_complete"]
+        assert a_leg_texts[0] == build_outbound_greeting(CALL_DETAILS["opening_reason"])
+        a_events = [e for e in read_log_events(LOG_PATH) if e.get("call_id") == a_leg]
+        answered = [e for e in a_events if e["event"] == "call_answered"]
+        assert answered and answered[0]["to_number"].lstrip("+") == normalize_phone_number(
+            PLIVO_TEST_NUMBER
+        ), answered
+        turns = [e for e in a_events if e["event"] == "turn_complete"]
         print(
             f"[Log] turn_complete: {[(t['turn'], t['barge_in'], t['playback_ms']) for t in turns]}"
         )
         assert turns, "The A-leg agent never completed a turn"
-        sessions = [e for e in a_leg if e["event"] == "session_end"]
+        sessions = [e for e in a_events if e["event"] == "session_end"]
         assert sessions and sessions[-1]["tx_chunks"] > 0, sessions
 
-    def test_outbound_call_status_lifecycle(self, server_process, ngrok_tunnel, bleg_app_id):
-        """Status transitions: initiating -> ringing -> connected -> completed."""
-        data = _initiate(ngrok_tunnel, opening_reason="your recent free trial sign-up")
-        call_id = data["call_id"]
+        if b_leg:  # callee answered /outbound/answer without query params -> neutral path
+            b_leg_texts = _agent_texts(b_leg)
+            print(f"[Log] B-leg agent_text: {b_leg_texts}")
+            assert b_leg_texts and b_leg_texts[0] == DEFAULT_OUTBOUND_GREETING, b_leg_texts
 
-        status = _status(ngrok_tunnel, call_id)
-        print(f"\n[Lifecycle] Initial status: {status['status']}")
-        assert status["status"] in ("ringing", "connected")
-
-        status = _wait_connected(ngrok_tunnel, call_id)
-        print(f"[Lifecycle] After connect wait: {status['status']}")
-        assert status["status"] == "connected", status
-        assert status["connected_at"]
-
-        hangup = httpx.post(f"{ngrok_tunnel}/outbound/hangup/{call_id}", timeout=10.0).json()
-        print(f"[Lifecycle] Hangup response: {hangup}")
-        assert hangup.get("status") == "completed", hangup
-
-        status = _status(ngrok_tunnel, call_id)
-        print(f"[Lifecycle] Final status: {status['status']} outcome={status['outcome']}")
-        assert status["status"] == "completed"
-
-    def test_outbound_hangup_programmatic(
-        self, server_process, ngrok_tunnel, plivo_client, bleg_app_id
-    ):
-        """POST /outbound/hangup/{call_id} ends an active call."""
-        data = _initiate(ngrok_tunnel, opening_reason=OPENING_REASON)
-        call_id = data["call_id"]
-
-        status = _wait_connected(ngrok_tunnel, call_id)
-        if status.get("status") != "connected":
-            pytest.skip(f"Call did not connect in time: {status}")
-        a_leg_uuid = status["plivo_call_uuid"]
-        time.sleep(3)
-
-        hangup = httpx.post(f"{ngrok_tunnel}/outbound/hangup/{call_id}", timeout=10.0).json()
-        print(f"\n[Hangup] Response: {hangup}")
-        assert hangup.get("status") == "completed", hangup
-
-        time.sleep(3)
-        status = _status(ngrok_tunnel, call_id)
-        assert status["status"] in ("completed", "failed", "no_answer"), status
-        assert a_leg_uuid not in list_live_call_ids(plivo_client), "Call still live after hangup"
-
-    def test_outbound_campaign_endpoint(self, server_process, ngrok_tunnel, bleg_app_id):
-        """GET /outbound/campaign/{campaign_id} returns calls for a campaign."""
-        campaign_id = "test-campaign-endpoint"
-        data = _initiate(ngrok_tunnel, campaign_id=campaign_id, opening_reason=OPENING_REASON)
-        call_id = data["call_id"]
-
-        _wait_connected(ngrok_tunnel, call_id, timeout=30)
-        httpx.post(f"{ngrok_tunnel}/outbound/hangup/{call_id}", timeout=10.0)
-
-        camp = httpx.get(f"{ngrok_tunnel}/outbound/campaign/{campaign_id}", timeout=10.0).json()
-        print(f"\n[Campaign] Response: {camp}")
-        assert camp["campaign_id"] == campaign_id
-        assert camp["total"] >= 1
-        assert call_id in [c["call_id"] for c in camp["calls"]]
+        deadline = time.time() + 15
+        ended = f"Outbound call ended: CallUUID={a_leg}"
+        while time.time() < deadline and not any(ended in m for m in log_messages(LOG_PATH)):
+            time.sleep(1)
+        assert any(ended in m for m in log_messages(LOG_PATH)), "hangup_url webhook not received"
 
 
 if __name__ == "__main__":

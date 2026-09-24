@@ -1,6 +1,6 @@
-"""Outbound voice agent — Deepgram Voice Agent API (managed pipeline) + call state.
+"""Outbound voice agent — Deepgram Voice Agent API (managed pipeline).
 
-Native orchestration: one raw WebSocket to the Deepgram Voice Agent API, which
+Managed-platform bridge: one raw WebSocket to the Deepgram Voice Agent API, which
 hosts the whole Listen -> Think -> Speak loop server-side:
 
   Plivo μ-law 8kHz --> Deepgram Voice Agent (wss://agent.deepgram.com/v1/agent/converse)
@@ -19,25 +19,21 @@ Playback completion is tracked with Plivo checkpoints: a ``_Checkpoint``
 sentinel travels through the send queue behind the last audio chunk, so the
 checkpoint event is always sent after the audio it marks.
 
-Provides run_agent() for outbound call WebSocket sessions plus CallManager for
-tracking call lifecycle. The outbound greeting is literal text that the speak model
-speaks verbatim when the callee answers (Deepgram ``agent.greeting``).
+Calls are placed with Plivo's Make Call API directly. Its answer_url
+(``/outbound/answer?opening_reason=&objective=&context=``) carries the per-call
+context, which server.py passes to run_agent(). The prompt is outbound/system_prompt.md
+rendered by build_outbound_prompt(); the greeting (build_outbound_greeting()) is literal
+text the speak model says verbatim when the callee answers (Deepgram ``agent.greeting``).
 
 Pipeline logging is controlled by the LOG_LEVEL env var:
   verbose — every pipeline event: Deepgram events, packet counts, queue sizes
   normal  — key events: turn lifecycle, transcripts, latencies (default)
   quiet   — errors and session start/end only
 
-Status state machine:
-    initiating -> ringing -> connected -> completed
-                         |-> no_answer
-                |-> failed
-
 Two ways to define the agent, chosen by DEEPGRAM_OUTBOUND_AGENT_ID:
   inline (default, empty) — Settings.agent carries the full definition built here
-  reusable config (a UUID) — Settings.agent is that UUID; the per-call campaign
-      details + context (UpdatePrompt, "This Call") and greeting (InjectAgentMessage)
-      follow SettingsApplied.
+  reusable config (a UUID) — Settings.agent is that UUID; the per-call details + context
+      (UpdatePrompt, "This Call") and greeting (InjectAgentMessage) follow SettingsApplied.
 Creating a reusable config is a one-off REST call; see the README.
 """
 
@@ -51,11 +47,9 @@ import functools
 import json
 import os
 import random
-import threading
 import time
-import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -396,171 +390,58 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "normal").lower()
 
 _OUTBOUND_PROMPT_TEMPLATE = (Path(__file__).parent / "system_prompt.md").read_text().strip()
 
-
-def build_outbound_prompt(
-    opening_reason: str = "",
-    objective: str = "",
-    context: str = "",
-) -> str:
-    """Build a concrete outbound system prompt by substituting template variables.
-
-    Live calls pass the campaign fields. The README's reusable-config create command
-    passes pointers to the "This Call" section instead, so the saved prompt has no
-    unfilled placeholders (see DeepgramVoiceAgent._build_prompt_update()).
-    """
-    prompt = _OUTBOUND_PROMPT_TEMPLATE
-    prompt = prompt.replace("{{opening_reason}}", opening_reason)
-    prompt = prompt.replace("{{objective}}", objective)
-    prompt = prompt.replace("{{context}}", context)
-    return prompt
-
-
 # Deepgram speaks agent.greeting verbatim via TTS — literal text, not an LLM instruction.
 DEFAULT_OUTBOUND_GREETING = (
     "Hi, this is Alex from TechFlow, following up on your recent interest in our "
     "products. Is now a good time for a quick chat?"
 )
 
-# Default system prompt (no template substitution)
-SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", _OUTBOUND_PROMPT_TEMPLATE)
-
-# =============================================================================
-# Outbound Call Records
-# =============================================================================
-
-
-@dataclass
-class OutboundCallRecord:
-    """Tracks the state of a single outbound call."""
-
-    call_id: str
-    phone_number: str
-    status: str = "initiating"  # initiating|ringing|connected|completed|failed|no_answer
-    campaign_id: str = ""
-    context: str = ""
-    system_prompt: str = ""
-    initial_message: str = ""
-    opening_reason: str = ""
-    objective: str = ""
-    plivo_request_uuid: str = ""
-    plivo_call_uuid: str = ""
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    connected_at: datetime | None = None
-    ended_at: datetime | None = None
-    duration: int = 0
-    hangup_cause: str = ""
-    outcome: str = ""  # success|no_answer|busy|failed
+# Neutral wording for per-call fields the answer_url did not carry, so the LLM never sees
+# an unfilled {{placeholder}} or a dangling "because ." (matches DEFAULT_OUTBOUND_GREETING).
+FALLBACK_OPENING_REASON = "a follow-up on their recent interest in TechFlow's products"
+FALLBACK_OBJECTIVE = (
+    "learn what they are looking for, qualify their interest, and offer a meeting "
+    "with a sales specialist if it fits"
+)
+FALLBACK_CONTEXT = "No additional context was provided for this call."
 
 
-def determine_outcome(hangup_cause: str, duration: int) -> str:
-    """Map Plivo hangup cause and duration to a high-level outcome.
+def build_outbound_greeting(opening_reason: str = "") -> str:
+    """The literal greeting spoken when the callee answers."""
+    reason = opening_reason.strip().rstrip(".")
+    if not reason:
+        return DEFAULT_OUTBOUND_GREETING
+    return (
+        f"Hi, this is Alex from TechFlow. I'm reaching out because {reason}. "
+        "Is now a good time for a quick chat?"
+    )
 
-    See https://www.plivo.com/docs/voice/troubleshooting/hangup-causes/
+
+def build_outbound_prompt(
+    opening_reason: str = "",
+    objective: str = "",
+    context: str = "",
+    greeting: str | None = None,
+) -> str:
+    """Render outbound/system_prompt.md for one call.
+
+    Empty fields get neutral fallbacks. ``greeting`` defaults to the quoted text of
+    build_outbound_greeting(opening_reason), i.e. exactly what the call speaks. The
+    README's reusable-config create command passes pointers to the "This Call" section
+    instead, which each call appends via UpdatePrompt (see _build_prompt_update()).
     """
-    cause = hangup_cause.upper() if hangup_cause else ""
-
-    if cause in ("NO_ANSWER", "ORIGINATOR_CANCEL"):
-        return "no_answer"
-    if cause in ("USER_BUSY", "CALL_REJECTED"):
-        return "busy"
-    if cause in (
-        "UNALLOCATED_NUMBER",
-        "INVALID_NUMBER_FORMAT",
-        "NO_ROUTE_DESTINATION",
-        "NETWORK_OUT_OF_ORDER",
-        "SERVICE_UNAVAILABLE",
-        "RECOVERY_ON_TIMER_EXPIRE",
-        "BEARERCAPABILITY_NOTAVAIL",
-    ):
-        return "failed"
-
-    # If the call was answered and had meaningful duration, consider it success
-    if duration > 0 or cause in ("NORMAL_CLEARING", ""):
-        return "success"
-
-    return "failed"
-
-
-class CallManager:
-    """Thread-safe manager for outbound call records."""
-
-    def __init__(self) -> None:
-        self._calls: dict[str, OutboundCallRecord] = {}
-        self._lock = threading.Lock()
-
-    def create_call(
-        self,
-        phone_number: str,
-        campaign_id: str = "",
-        opening_reason: str = "",
-        objective: str = "",
-        context: str = "",
-    ) -> OutboundCallRecord:
-        """Create and register a new outbound call record."""
-        call_id = str(uuid.uuid4())
-        system_prompt = build_outbound_prompt(opening_reason, objective, context)
-
-        # Deepgram speaks agent.greeting verbatim — this must be literal greeting text.
-        if opening_reason:
-            initial_message = (
-                "Hi, this is Alex from TechFlow. "
-                f"I'm reaching out because {opening_reason}. "
-                "Is now a good time for a quick chat?"
-            )
-        else:
-            initial_message = DEFAULT_OUTBOUND_GREETING
-
-        record = OutboundCallRecord(
-            call_id=call_id,
-            phone_number=phone_number,
-            campaign_id=campaign_id,
-            opening_reason=opening_reason,
-            objective=objective,
-            context=context,
-            system_prompt=system_prompt,
-            initial_message=initial_message,
-        )
-
-        with self._lock:
-            self._calls[call_id] = record
-
-        return record
-
-    def get_call(self, call_id: str) -> OutboundCallRecord | None:
-        """Look up a call by its ID."""
-        with self._lock:
-            return self._calls.get(call_id)
-
-    def update_status(self, call_id: str, status: str, **kwargs: Any) -> OutboundCallRecord | None:
-        """Thread-safe status update with optional extra fields."""
-        with self._lock:
-            record = self._calls.get(call_id)
-            if record is None:
-                return None
-            record.status = status
-            for key, value in kwargs.items():
-                if hasattr(record, key):
-                    setattr(record, key, value)
-            return record
-
-    def get_active_calls(self) -> list[OutboundCallRecord]:
-        """Return calls with status in (initiating, ringing, connected)."""
-        with self._lock:
-            return [
-                r
-                for r in self._calls.values()
-                if r.status in ("initiating", "ringing", "connected")
-            ]
-
-    def get_calls_by_campaign(self, campaign_id: str) -> list[OutboundCallRecord]:
-        """Return all calls for a given campaign."""
-        with self._lock:
-            return [r for r in self._calls.values() if r.campaign_id == campaign_id]
-
-    def reset(self) -> None:
-        """Clear all records (useful for testing)."""
-        with self._lock:
-            self._calls.clear()
+    if greeting is None:
+        greeting = f'"{build_outbound_greeting(opening_reason)}"'
+    values = {
+        "greeting": greeting,
+        "opening_reason": opening_reason.strip() or FALLBACK_OPENING_REASON,
+        "objective": objective.strip() or FALLBACK_OBJECTIVE,
+        "context": context.strip() or FALLBACK_CONTEXT,
+    }
+    prompt = _OUTBOUND_PROMPT_TEMPLATE
+    for name, value in values.items():
+        prompt = prompt.replace("{{" + name + "}}", value)
+    return prompt
 
 
 # =============================================================================
@@ -795,7 +676,7 @@ class DeepgramVoiceAgent:
         from_number: str = "",
         to_number: str = "",
         system_prompt: str | None = None,
-        initial_message: str = DEFAULT_OUTBOUND_GREETING,
+        initial_message: str | None = None,
         stream_id: str = "",
         parent_call_id: str = "",
         sip_headers: dict[str, str] | None = None,
@@ -811,16 +692,21 @@ class DeepgramVoiceAgent:
         self.parent_call_id = parent_call_id or call_id
         self.from_number = from_number
         self.to_number = to_number
-        self.system_prompt = system_prompt or SYSTEM_PROMPT
+        # Prompt + greeting rendered from the per-call details (answer_url query params)
+        if system_prompt is None:
+            system_prompt = build_outbound_prompt(opening_reason, objective, context)
+        self.system_prompt = system_prompt
+        if initial_message is None:
+            initial_message = build_outbound_greeting(opening_reason)
         self.initial_message = initial_message
         self.sip_headers = sip_headers or {}
         self.hangup_callback = hangup_callback
         self._stream_id = stream_id  # Plivo stream ID for checkpoint/clearAudio events
-        # Per-call campaign details: inline mode has them rendered into system_prompt;
+        # Per-call details: inline mode has them rendered into system_prompt;
         # saved mode sends them via UpdatePrompt ("This Call")
         self.opening_reason = opening_reason
         self.objective = objective
-        self.campaign_context = context
+        self.call_details_context = context
         # Reusable agent configuration UUID ("" = inline Settings)
         self.agent_config_id = (
             DEEPGRAM_OUTBOUND_AGENT_ID if agent_config_id is None else agent_config_id
@@ -909,32 +795,48 @@ class DeepgramVoiceAgent:
     # -- Settings --
 
     def _build_call_context(self) -> str:
-        """Per-call context appended to the prompt ("" when the caller is unknown)."""
-        if not self.from_number:
+        """Per-call context appended to the prompt ("" when neither number is known).
+
+        On an outbound call Plivo's ``To`` is the customer and ``From`` is our own number
+        (the caller ID), so the labels differ from inbound.
+        """
+        if not (self.to_number or self.from_number):
             return ""
         call_time = datetime.now().strftime("%I:%M %p on %A, %B %d")
-        return f"""
-
-## Current Call Context
-- Caller's phone number: {self.from_number}
-- Call ID: {self.call_id}
-- Time: {call_time}
-
-You can use the caller's phone number for SMS or callbacks without asking."""
+        lines = ["", "", "## Current Call Context"]
+        if self.to_number:
+            lines.append(f"- Customer's phone number (the person you called): {self.to_number}")
+        if self.from_number:
+            lines.append(
+                f"- Our business phone number (caller ID the customer sees): {self.from_number}"
+            )
+        lines += [f"- Call ID: {self.call_id}", f"- Time: {call_time}", ""]
+        if self.to_number:
+            lines.append(
+                "You can use the customer's phone number for SMS or callbacks without asking."
+            )
+        if self.from_number:
+            lines.append("If the customer asks how to reach us, give our business phone number.")
+        return "\n".join(lines)
 
     def _build_system_prompt(self) -> str:
         """Build system prompt with call context (inline mode)."""
         return self.system_prompt + self._build_call_context()
 
     def _build_prompt_update(self) -> str:
-        """Saved mode: "This Call" campaign details + call context, appended via UpdatePrompt."""
-        lines = ["## This Call", f'- Greeting you already spoke: "{self.initial_message}"']
-        if self.opening_reason:
-            lines.append(f"- Opening reason (why you are calling): {self.opening_reason}")
-        if self.objective:
-            lines.append(f"- Objective: {self.objective}")
-        if self.campaign_context:
-            lines.append(f"- Additional context: {self.campaign_context}")
+        """Saved mode: "This Call" details + call context, appended via UpdatePrompt.
+
+        Every line is always present (neutral fallbacks for missing fields), because the
+        saved prompt points at each of them.
+        """
+        opening_reason = self.opening_reason.strip() or FALLBACK_OPENING_REASON
+        lines = [
+            "## This Call",
+            f'- Greeting you already spoke: "{self.initial_message}"',
+            f"- Opening reason (why you are calling): {opening_reason}",
+            f"- Objective: {self.objective.strip() or FALLBACK_OBJECTIVE}",
+            f"- Additional context: {self.call_details_context.strip() or FALLBACK_CONTEXT}",
+        ]
         return "\n\n" + "\n".join(lines) + self._build_call_context()
 
     def _build_settings(self) -> dict[str, Any]:
@@ -1786,8 +1688,6 @@ async def run_agent(
     call_id: str,
     from_number: str = "",
     to_number: str = "",
-    system_prompt: str | None = None,
-    initial_message: str = DEFAULT_OUTBOUND_GREETING,
     stream_id: str = "",
     parent_call_id: str = "",
     sip_headers: dict[str, str] | None = None,
@@ -1797,14 +1697,20 @@ async def run_agent(
     context: str = "",
     saved_agent_models: dict[str, str] | None = None,
 ) -> None:
-    """Run a voice agent session for an outbound call."""
+    """Run a voice agent session for an outbound call.
+
+    ``opening_reason`` / ``objective`` / ``context`` come from the answer_url query string
+    (all optional). They render the prompt (build_outbound_prompt()) and the greeting
+    (build_outbound_greeting()); on the reusable-config path they form the "This Call"
+    section sent with UpdatePrompt.
+    """
     agent = DeepgramVoiceAgent(
         websocket=websocket,
         call_id=call_id,
         from_number=from_number,
         to_number=to_number,
-        system_prompt=system_prompt,
-        initial_message=initial_message,
+        system_prompt=build_outbound_prompt(opening_reason, objective, context),
+        initial_message=build_outbound_greeting(opening_reason),
         stream_id=stream_id,
         parent_call_id=parent_call_id,
         sip_headers=sip_headers,
