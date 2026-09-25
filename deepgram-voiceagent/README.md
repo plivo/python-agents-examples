@@ -431,6 +431,8 @@ Latency fields come from Deepgram `LatencyReport` messages (seconds, converted t
 
 `LOG_LEVEL` is read by `agent.py` and gates only the agent's pipeline logs. Structured events, the session-start line, warnings and errors are logged at every level.
 
+Pipeline log lines read `[<call UUID>] [<elapsed>s] [<stage>] <message>`, with the complete call UUID. Every per-call record also carries `call_id` (same value as in the structured events) and `leg_call_id` as structured fields, plus `stage` and `elapsed_s` on pipeline lines, so one `call_id` filter on the JSON log or Redis stream returns a call's pipeline logs and its events together.
+
 | `LOG_LEVEL` | What is logged |
 |-------------|----------------|
 | `verbose` | Everything in `normal`, plus `Settings sent`, `AgentThinking`, `EndOfTurn` trigger, `History`, non-STT `LatencyReport`s, unhandled event types (e.g. the `FunctionCallResponse` echo), `KeepAlive` sent, checkpoint sent/stale, dropped late audio, packet counts every 500 and queue size |

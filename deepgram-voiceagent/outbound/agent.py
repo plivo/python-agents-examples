@@ -691,6 +691,8 @@ class DeepgramVoiceAgent:
         self.websocket = websocket
         self.call_id = call_id
         self.parent_call_id = parent_call_id or call_id
+        # Per-call logger: full IDs as structured fields, same keys as the call_answered event
+        self._logger = logger.bind(call_id=self.parent_call_id, leg_call_id=self.call_id)
         self.from_number = from_number
         self.to_number = to_number
         # Prompt + greeting rendered from the per-call details (answer_url query params)
@@ -772,8 +774,8 @@ class DeepgramVoiceAgent:
         if LOG_LEVEL == "quiet":
             return
         elapsed = round(time.monotonic() - self._session_start, 2)
-        logger.bind(call_id=self.call_id[:8], elapsed_s=elapsed, stage=stage).info(
-            f"[{self.call_id[:8]}] [{elapsed:7.2f}s] [{stage}] {msg}"
+        self._logger.bind(elapsed_s=elapsed, stage=stage).info(
+            f"[{self.call_id}] [{elapsed:7.2f}s] [{stage}] {msg}"
         )
 
     def _logv(self, stage: str, msg: str) -> None:
@@ -781,16 +783,16 @@ class DeepgramVoiceAgent:
         if LOG_LEVEL != "verbose":
             return
         elapsed = round(time.monotonic() - self._session_start, 2)
-        logger.bind(call_id=self.call_id[:8], elapsed_s=elapsed, stage=stage).debug(
-            f"[{self.call_id[:8]}] [{elapsed:7.2f}s] [{stage}] {msg}"
+        self._logger.bind(elapsed_s=elapsed, stage=stage).debug(
+            f"[{self.call_id}] [{elapsed:7.2f}s] [{stage}] {msg}"
         )
 
     def _loge(self, stage: str, msg: str) -> None:
         """Log errors — always visible regardless of LOG_LEVEL."""
         self._error_count += 1
         elapsed = round(time.monotonic() - self._session_start, 2)
-        logger.bind(call_id=self.call_id[:8], elapsed_s=elapsed, stage=stage).error(
-            f"[{self.call_id[:8]}] [{elapsed:7.2f}s] [{stage}] {msg}"
+        self._logger.bind(elapsed_s=elapsed, stage=stage).error(
+            f"[{self.call_id}] [{elapsed:7.2f}s] [{stage}] {msg}"
         )
 
     # -- Settings --
@@ -907,12 +909,12 @@ class DeepgramVoiceAgent:
         self._session_start = time.monotonic()
         self._running = True
         # Session start always logs (even in quiet mode)
-        logger.info(
-            f"[{self.call_id[:8]}] [  0.00s] [session] "
+        self._logger.info(
+            f"[{self.call_id}] [  0.00s] [session] "
             f"started (from={self.from_number}, to={self.to_number}, log={LOG_LEVEL}, "
             f"settings: {self._settings_mode()})"
         )
-        logger.bind(
+        self._logger.bind(
             event="call_answered",
             call_id=self.parent_call_id,
             leg_call_id=self.call_id,
@@ -921,8 +923,7 @@ class DeepgramVoiceAgent:
             sip_headers=self.sip_headers,
             stream_id=self._stream_id,
         ).info(
-            f"[{self.call_id[:8]}] [  0.00s] [session] "
-            f"call answered (sip_headers={self.sip_headers})"
+            f"[{self.call_id}] [  0.00s] [session] call answered (sip_headers={self.sip_headers})"
         )
         self._trace.bind_session(*self._trace_attributes())
 
@@ -1234,12 +1235,12 @@ class DeepgramVoiceAgent:
         elif etype == "History":
             self._logv("deepgram", f"History: {str(evt)[:120]}")
         elif etype == "InjectionRefused":
-            logger.warning(
-                f"[{self.call_id[:8]}] [deepgram] InjectionRefused: {evt.get('message', '')}"
+            self._logger.warning(
+                f"[{self.call_id}] [deepgram] InjectionRefused: {evt.get('message', '')}"
             )
         elif etype == "Warning":
-            logger.warning(
-                f"[{self.call_id[:8]}] [deepgram] Warning: "
+            self._logger.warning(
+                f"[{self.call_id}] [deepgram] Warning: "
                 f"{evt.get('code', '')} {evt.get('description') or evt.get('message', '')}"
             )
             self._trace.event(
@@ -1345,12 +1346,12 @@ class DeepgramVoiceAgent:
         self._turn_latency_report = {}
         self._speech_end_time = time.monotonic()
         self._log("turn", f"turn {self._turn_count}: user '{text[:80]}'")
-        logger.bind(
+        self._logger.bind(
             event="user_text",
             call_id=self.parent_call_id,
             turn=self._turn_count,
             text=text,
-        ).info(f"[{self.call_id[:8]}] user_text turn {self._turn_count}: '{text[:60]}'")
+        ).info(f"[{self.call_id}] user_text turn {self._turn_count}: '{text[:60]}'")
 
     def _on_conversation_text(self, role: str, content: str) -> None:
         """Handle ConversationText (final user transcript at EOT, or agent response text)."""
@@ -1370,12 +1371,12 @@ class DeepgramVoiceAgent:
                 f"{self._turn_agent_text} {content}".strip() if self._turn_agent_text else content
             )
             self._log("turn", f"turn {self._turn_count}: agent '{content[:80]}'")
-            logger.bind(
+            self._logger.bind(
                 event="agent_text",
                 call_id=self.parent_call_id,
                 turn=self._turn_count,
                 text=content,
-            ).info(f"[{self.call_id[:8]}] agent_text turn {self._turn_count}: '{content[:60]}'")
+            ).info(f"[{self.call_id}] agent_text turn {self._turn_count}: '{content[:60]}'")
 
     async def _on_function_call_request(self, evt: dict[str, Any]) -> None:
         """Run client-side functions and reply with FunctionCallResponse."""
@@ -1620,7 +1621,7 @@ class DeepgramVoiceAgent:
         """Emit a structured turn_complete event with per-turn metrics."""
         if playback_ms is None and self._checkpoint_sent_time is not None:
             playback_ms = round((time.monotonic() - self._checkpoint_sent_time) * 1000)
-        logger.bind(
+        self._logger.bind(
             event="turn_complete",
             call_id=self.parent_call_id,
             turn=self._turn_count,
@@ -1635,8 +1636,7 @@ class DeepgramVoiceAgent:
             ttt_latency_ms=self._turn_latency.get("ttt_latency_ms"),
             latency_report=dict(self._turn_latency_report),
         ).info(
-            f"[{self.call_id[:8]}] turn {self._turn_count} complete"
-            f"{' (barge-in)' if barge_in else ''}"
+            f"[{self.call_id}] turn {self._turn_count} complete{' (barge-in)' if barge_in else ''}"
         )
         self._trace.end_turn(
             {
@@ -1657,7 +1657,7 @@ class DeepgramVoiceAgent:
         avg_ttfs = (
             round(sum(self._ttfs_samples) / len(self._ttfs_samples)) if self._ttfs_samples else None
         )
-        logger.bind(
+        self._logger.bind(
             event="session_end",
             call_id=self.parent_call_id,
             duration_s=duration,
@@ -1671,7 +1671,7 @@ class DeepgramVoiceAgent:
             deepgram_request_id=self._request_id,
             agent_config=self.agent_config_id or "inline",
         ).info(
-            f"[{self.call_id[:8]}] [{duration:7.1f}s] [session] "
+            f"[{self.call_id}] [{duration:7.1f}s] [session] "
             f"ended -- {self._turn_count} turns, "
             f"{self._barge_in_count} barge-ins, "
             f"TTFS avg={avg_ttfs}ms, "

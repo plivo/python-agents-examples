@@ -1173,6 +1173,56 @@ class TestUnitDeepgramEventHandling:
         assert of_event(captured_events, "agent_text")[0]["call_id"] == "parent-uuid"
 
 
+class TestUnitFullCallIdInLogs:
+    """Every per-call log line carries the complete call ID, never an 8-char prefix."""
+
+    @pytest.fixture(params=["inbound.agent", "outbound.agent"])
+    def agent_mod(self, request, monkeypatch):
+        import importlib
+
+        module = importlib.import_module(request.param)
+        monkeypatch.setattr(module, "LOG_LEVEL", "verbose")  # _logv logs too
+        return module
+
+    @pytest.fixture
+    def records(self):
+        captured: list[tuple[str, dict[str, Any]]] = []
+        sink_id = logger.add(
+            lambda m: captured.append((m.record["message"], dict(m.record["extra"]))),
+            level="DEBUG",
+        )
+        yield captured
+        logger.remove(sink_id)
+
+    async def test_pipeline_logs_use_full_ids(self, agent_mod, records, monkeypatch):
+        def refuse_connect(*_args, **_kwargs):
+            raise OSError("no network in unit tests")
+
+        monkeypatch.setattr(agent_mod.websockets, "connect", refuse_connect)
+        agent = agent_mod.DeepgramVoiceAgent(
+            websocket=FakePlivoWS(), call_id=CALL_ID, parent_call_id="parent-uuid"
+        )
+        agent._dg_ws = FakeDeepgramWS()
+        await agent.run()  # session start line, connect error (_loge), session_end
+        agent._log("test", "normal line")
+        agent._logv("test", "verbose line")
+        for evt in (
+            {"type": "Warning", "code": "W1", "description": "slow"},
+            {"type": "InjectionRefused", "message": "busy"},
+        ):
+            await agent._handle_deepgram_event(evt)
+
+        per_call = [(msg, extra) for msg, extra in records if CALL_ID in msg]
+        assert len(per_call) >= 7  # start, answered, error, session_end, log, logv, 2 warnings
+        for msg, extra in per_call:
+            assert msg.startswith(f"[{CALL_ID}]"), msg
+            assert extra.get("call_id") == "parent-uuid", (msg, extra)
+            assert extra.get("leg_call_id") == CALL_ID, (msg, extra)
+        events = {extra["event"] for _, extra in per_call if "event" in extra}
+        assert {"call_answered", "session_end"} <= events
+        assert not any(f"[{CALL_ID[:8]}]" in msg for msg, _ in records)
+
+
 # =============================================================================
 # UNIT TESTS - Outbound CallManager
 # =============================================================================
