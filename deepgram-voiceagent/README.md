@@ -117,7 +117,7 @@ deepgram-voiceagent/
 │   ├── agent.py            # Same agent + DEFAULT_OUTBOUND_GREETING, outbound call-context labels
 │   ├── server.py           # FastAPI: /, /outbound/answer (answer_url call details -> Stream body), /outbound/hangup (logs), /ws + _hangup_call()
 │   └── system_prompt.md    # Outbound prompt, sent as is
-├── utils.py                # μ-law codec, resample_audio, plivo_to_deepgram/deepgram_to_plivo (pass-through), normalize_phone_number, --tunnel helpers
+├── utils.py                # plivo_to_deepgram/deepgram_to_plivo (pass-through), normalize_phone_number, --tunnel helpers
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py
@@ -183,7 +183,7 @@ Three concurrent asyncio tasks, following the canonical `FIRST_COMPLETED` patter
 | Each call (`/ws`) | `server.py` → `run_agent()` in `agent.py` | Accepts the WebSocket, reads Plivo's `start` event, then runs `DeepgramVoiceAgent.run()`. That opens a **new** Deepgram WebSocket for the call, sends Settings (inline block or reusable config UUID), sends `UpdatePrompt` + `InjectAgentMessage` on the reusable path, and runs the `plivo_rx` / `deepgram_rx` / `plivo_tx` tasks until the call ends. There is no Deepgram connection before a call arrives. |
 | `end_call` tool | `agent.py` → `hangup_callback` | After the goodbye has played, the agent calls `_hangup_call()` from `server.py`, which hangs up via the Plivo REST API. Plivo credentials never leave `server.py`. |
 | One-off setup (optional): create a reusable config | your shell → Deepgram REST API | The `curl` commands in [Creating a reusable config](#creating-a-reusable-config) post this example's agent definition once. The example contains no code for it; servers only read the UUID from the env var and check at startup that it exists. |
-| Shared helpers | `utils.py` | μ-law codec, resampling, `plivo_to_deepgram` / `deepgram_to_plivo` (pass-through), phone normalization. |
+| Shared helpers | `utils.py` | `plivo_to_deepgram` / `deepgram_to_plivo` (pass-through), phone normalization, `--tunnel` helpers. |
 
 ## Webhook authentication
 
@@ -207,7 +207,7 @@ Both servers are exposed on a public URL, so they accept only requests that come
 | Deepgram → Agent | μ-law (binary WS frame, `container: none`) | 8 kHz | variable | raw, no WAV header |
 | Agent → Plivo | μ-law (base64 JSON `playAudio`) | 8 kHz | 160 bytes (20ms) | `deepgram_to_plivo()` is a pass-through; the tail is padded with `0xFF` (μ-law silence) |
 
-`utils.py` also provides `ulaw_to_pcm`, `pcm_to_ulaw` and `resample_audio` (numpy + scipy). The agent does not call them; the tests use them, and they are what switching to a `linear16` encoding would need. The `0xFF` padding is applied only to a partial final chunk when a checkpoint is dequeued.
+There is no codec or resampler in `utils.py`: both directions are μ-law 8kHz, so nothing is decoded (switching to a `linear16` encoding would need one). The tests decode recordings with their own `tests/helpers.py` `ulaw_to_pcm()`. The `0xFF` padding is applied only to a partial final chunk when a checkpoint is dequeued.
 
 ## Deepgram Settings
 
@@ -568,7 +568,7 @@ Only the default row went through the full Plivo call suites. For any other comb
 
 ## Dependencies
 
-- Runtime: `fastapi`, `uvicorn[standard]`, `websockets>=15.0`, `plivo`, `httpx` (the reusable-config ID check at startup), `python-dotenv`, `python-multipart`, `loguru`, `numpy`, `scipy`, `phonenumbers`. No torch, Silero, ONNX, OpenAI or Deepgram SDK.
+- Runtime: `fastapi`, `uvicorn[standard]`, `websockets>=15.0`, `plivo`, `httpx` (the reusable-config ID check at startup), `python-dotenv`, `python-multipart`, `loguru`, `phonenumbers`. No numpy, scipy, torch, Silero, ONNX, OpenAI or Deepgram SDK.
 - `observability` extra: `opentelemetry-api`, `opentelemetry-sdk`, `opentelemetry-exporter-otlp`, `traceloop-sdk`.
 - `streaming` extra: `redis[hiredis]`.
 - `dev` group: `ruff`, `pre-commit`, `pytest`, `pytest-asyncio`, `faster-whisper`, `opentelemetry-sdk` (the span-tree unit tests use its in-memory exporter; the tests also use the runtime `httpx`).

@@ -49,10 +49,10 @@ from tests.helpers import (
     read_log_events,
     server_log_path,
     signed_webhook,
-    start_ngrok,
     start_server,
-    stop_ngrok,
+    start_tunnel,
     stop_server,
+    stop_tunnel,
     stream_body,
     upsert_application,
 )
@@ -89,18 +89,18 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(scope="module")
-def ngrok_tunnel():
-    """Start ngrok before the server so PUBLIC_URL can be passed to it."""
-    proc, public_url = start_ngrok(TEST_PORT)
-    print(f"\n[ngrok] Tunnel URL: {public_url}")
+def tunnel_url():
+    """Start the tunnel before the server so PUBLIC_URL can be passed to it."""
+    proc, public_url = start_tunnel(TEST_PORT)
+    print(f"\n[tunnel] URL: {public_url}")
     yield public_url
-    stop_ngrok(proc)
+    stop_tunnel(proc)
 
 
 @pytest.fixture(scope="module")
-def server_process(ngrok_tunnel):
+def server_process(tunnel_url):
     """Start the outbound server (SIGTERM -> wait(5) -> SIGKILL on teardown)."""
-    proc = start_server("outbound.server", TEST_PORT, LOG_PATH, {"PUBLIC_URL": ngrok_tunnel})
+    proc = start_server("outbound.server", TEST_PORT, LOG_PATH, {"PUBLIC_URL": tunnel_url})
     print(f"[server] logs: {LOG_PATH}")
     yield proc
     stop_server(proc)
@@ -112,11 +112,11 @@ def plivo_client():
 
 
 @pytest.fixture(scope="module")
-def bleg_app_id(plivo_client, ngrok_tunnel):
+def bleg_app_id(plivo_client, tunnel_url):
     """Point PLIVO_TEST_NUMBER at /outbound/answer (it answers the call); restore afterwards."""
     test_digits = normalize_phone_number(PLIVO_TEST_NUMBER)
     original_app_id = get_app_id_for_number(plivo_client, test_digits)
-    app_id = upsert_application(plivo_client, BLEG_APP_NAME, f"{ngrok_tunnel}/outbound/answer")
+    app_id = upsert_application(plivo_client, BLEG_APP_NAME, f"{tunnel_url}/outbound/answer")
     plivo_client.numbers.update(number=test_digits, app_id=app_id)
     print(f"\n[Plivo] Configured {test_digits} with B-leg app {app_id}")
 
@@ -183,7 +183,7 @@ def _agent_texts(call_id: str) -> list[str]:
 class TestOutboundCall:
     """End-to-end tests for outbound calling via Plivo's Make Call API."""
 
-    def test_outbound_answer_webhook(self, server_process, ngrok_tunnel):
+    def test_outbound_answer_webhook(self, server_process, tunnel_url):
         """/outbound/answer returns valid Plivo Stream XML carrying the greeting."""
         query = urlencode(
             {
@@ -194,7 +194,7 @@ class TestOutboundCall:
             },
             quote_via=quote,
         )
-        url = f"{ngrok_tunnel}/outbound/answer?{query}"
+        url = f"{tunnel_url}/outbound/answer?{query}"
         assert httpx.get(url, timeout=10.0).status_code == 403  # unsigned
         resp = signed_webhook("GET", url, PLIVO_AUTH_TOKEN)
         assert resp.status_code == 200
@@ -202,22 +202,20 @@ class TestOutboundCall:
         assert "<Stream" in body
         assert "bidirectional" in body
         assert "audio/x-mulaw" in body
-        assert ngrok_tunnel.replace("https://", "wss://") + "/ws?body=" in body
+        assert tunnel_url.replace("https://", "wss://") + "/ws?body=" in body
         meta = stream_body(body)
         assert meta["greeting"] == GREETING
 
         ready = [m for m in log_messages(LOG_PATH) if m.startswith("Ready! Place a call")]
         assert len(ready) == 1, ready
-        assert f"{ngrok_tunnel}/outbound/answer?greeting=" in ready[0]
+        assert f"{tunnel_url}/outbound/answer?greeting=" in ready[0]
 
-    def test_outbound_call_full_cycle(
-        self, server_process, ngrok_tunnel, plivo_client, bleg_app_id
-    ):
+    def test_outbound_call_full_cycle(self, server_process, tunnel_url, plivo_client, bleg_app_id):
         """Make Call API -> /outbound/answer?greeting=... -> the agent speaks it verbatim."""
         from outbound.agent import DEFAULT_OUTBOUND_GREETING
 
         baseline = set(list_live_call_ids(plivo_client))
-        answer_url = f"{ngrok_tunnel}/outbound/answer?" + urlencode(
+        answer_url = f"{tunnel_url}/outbound/answer?" + urlencode(
             {"greeting": GREETING}, quote_via=quote
         )
         response = plivo_client.calls.create(
@@ -225,7 +223,7 @@ class TestOutboundCall:
             to_=normalize_phone_number(PLIVO_TEST_NUMBER),
             answer_url=answer_url,
             answer_method="POST",
-            hangup_url=f"{ngrok_tunnel}/outbound/hangup",
+            hangup_url=f"{tunnel_url}/outbound/hangup",
             hangup_method="POST",
         )
         request_uuid = (

@@ -24,7 +24,6 @@ import base64
 import contextlib
 import hashlib
 import json
-import math
 import os
 import struct
 import time
@@ -47,15 +46,9 @@ from tests.helpers import (
     stop_server,
     stream_body,
     stream_url_from_xml,
-)
-from utils import (
-    deepgram_to_plivo,
-    normalize_phone_number,
-    pcm_to_ulaw,
-    plivo_to_deepgram,
-    resample_audio,
     ulaw_to_pcm,
 )
+from utils import deepgram_to_plivo, normalize_phone_number, plivo_to_deepgram
 
 load_dotenv()
 
@@ -266,25 +259,13 @@ def rms_of_ulaw(ulaw_audio: bytes) -> float:
 
 
 class TestUnitAudioConversion:
-    """Unit tests for audio format conversion."""
+    """The agent forwards μ-law 8kHz both ways; the only decoder is the tests' own."""
 
-    def test_ulaw_to_pcm_conversion(self):
-        pcm_audio = ulaw_to_pcm(b"\xff" * 160)
-        samples = struct.unpack(f"{len(pcm_audio) // 2}h", pcm_audio)
-        assert len(pcm_audio) == 320  # 160 samples * 2 bytes
-        assert sum(abs(s) for s in samples) / len(samples) < 100  # near silence
-
-    def test_pcm_to_ulaw_conversion(self):
-        assert len(pcm_to_ulaw(b"\x00" * 320)) == 160
-
-    def test_audio_roundtrip(self):
-        samples = [int(16000 * math.sin(2 * math.pi * 440 * i / 8000)) for i in range(160)]
-        pcm_original = struct.pack(f"{len(samples)}h", *samples)
-        restored = struct.unpack("160h", ulaw_to_pcm(pcm_to_ulaw(pcm_original)))
-
-        corr = sum(o * r for o, r in zip(samples, restored, strict=True))
-        energy = (sum(o * o for o in samples) * sum(r * r for r in restored)) ** 0.5
-        assert corr / energy > 0.9, "Audio quality degraded too much"
+    def test_helper_ulaw_decoder_matches_g711(self):
+        """0xFF is μ-law silence (0); 0x00 / 0x80 are the G.711 full-scale codes (±32124)."""
+        assert ulaw_to_pcm(b"\xff" * 160) == b"\x00\x00" * 160
+        assert struct.unpack("<h", ulaw_to_pcm(b"\x00")) == (-32124,)
+        assert struct.unpack("<h", ulaw_to_pcm(b"\x80")) == (32124,)
 
     def test_plivo_to_deepgram_passthrough(self):
         """Deepgram is configured for μ-law 8kHz input, so Plivo bytes pass through."""
@@ -295,14 +276,6 @@ class TestUnitAudioConversion:
         """Deepgram emits raw μ-law 8kHz (container none), which Plivo plays as-is."""
         data = bytes(range(256)) * 2
         assert deepgram_to_plivo(data) == data
-
-    def test_resample_identity(self):
-        pcm = struct.pack("4h", 1, 2, 3, 4)
-        assert resample_audio(pcm, 8000, 8000) == pcm
-
-    def test_resample_doubles_length(self):
-        pcm = b"\x00\x01" * 160
-        assert len(resample_audio(pcm, 8000, 16000)) == len(pcm) * 2
 
 
 # =============================================================================
