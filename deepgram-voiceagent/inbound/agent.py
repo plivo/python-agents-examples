@@ -140,7 +140,6 @@ class _CallTrace:
         self.session: Any = None
         self.llm_attributes: dict[str, Any] = {}
         self.turn: Any = None
-        self.turn_start_ns = 0
         self.turn_awaiting_eot = False  # user turn started without an EndOfTurn yet
         self.playback: Any = None
         self.playback_started = False
@@ -217,7 +216,6 @@ class _CallTrace:
             attributes["eot.trigger"] = pending[0]
             start = pending[1]
         self.turn = self._span("turn", self.session, attributes, start_time=start)
-        self.turn_start_ns = start
         self.turn_awaiting_eot = source != "greeting" and "eot.trigger" not in attributes
         self.playback = None
         self.playback_started = False
@@ -686,7 +684,6 @@ class DeepgramVoiceAgent:
         self._session_start = time.monotonic()
         self._plivo_rx_bytes = 0
         self._plivo_tx_chunks = 0
-        self._dg_rx_audio_bytes = 0
         self._speech_end_time: float | None = None
         self._ttfs_samples: list[float] = []
 
@@ -749,10 +746,6 @@ You can use the caller's phone number for SMS or callbacks without asking."""
         """Build system prompt with call context (inline mode)."""
         return self.system_prompt + self._build_call_context()
 
-    def _build_prompt_update(self) -> str:
-        """Saved mode: text appended to the saved prompt via UpdatePrompt."""
-        return self._build_call_context()
-
     def _build_settings(self) -> dict[str, Any]:
         """Build the Deepgram Voice Agent Settings message.
 
@@ -798,7 +791,7 @@ You can use the caller's phone number for SMS or callbacks without asking."""
         UpdatePrompt appends to the saved prompt; InjectAgentMessage is spoken verbatim
         and flows back as ConversationText(assistant) like an inline greeting (turn 1).
         """
-        prompt_update = self._build_prompt_update()
+        prompt_update = self._build_call_context()
         if prompt_update:
             await dg_ws.send(json.dumps({"type": "UpdatePrompt", "prompt": prompt_update}))
         if self.initial_message:
@@ -1212,7 +1205,6 @@ You can use the caller's phone number for SMS or callbacks without asking."""
         if not self._is_playing:
             self._logv("deepgram", "first agent audio of response")
         self._is_playing = True
-        self._dg_rx_audio_bytes += len(data)
         self._send_queue.put_nowait(deepgram_to_plivo(data))
 
     async def _on_user_started_speaking(self) -> None:

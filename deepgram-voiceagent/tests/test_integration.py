@@ -732,7 +732,6 @@ class TestUnitDeepgramEventHandling:
         agent._on_agent_audio(b"\x10" * 400)
         assert agent._is_playing is True
         assert agent._send_queue.qsize() == 1
-        assert agent._dg_rx_audio_bytes == 400
 
     async def test_send_to_plivo_chunks_and_checkpoint_after_audio(self):
         from inbound.agent import PLIVO_CHUNK_SIZE, _Checkpoint
@@ -1313,7 +1312,6 @@ class TestUnitCallContextLabels:
         assert "give our business phone number" in context
         # The same context reaches the inline prompt and the reusable-config UpdatePrompt
         assert agent._build_settings()["agent"]["think"]["prompt"].endswith(context)
-        assert agent._build_prompt_update() == context
 
     def test_outbound_without_numbers_has_no_context(self):
         agent, _ = make_outbound_agent(from_number="", to_number="")
