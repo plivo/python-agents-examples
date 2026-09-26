@@ -24,7 +24,6 @@ import base64
 import contextlib
 import hashlib
 import json
-import math
 import os
 import struct
 import time
@@ -47,15 +46,9 @@ from tests.helpers import (
     stop_server,
     stream_body,
     stream_url_from_xml,
-)
-from utils import (
-    deepgram_to_plivo,
-    normalize_phone_number,
-    pcm_to_ulaw,
-    plivo_to_deepgram,
-    resample_audio,
     ulaw_to_pcm,
 )
+from utils import deepgram_to_plivo, normalize_phone_number, plivo_to_deepgram
 
 load_dotenv()
 
@@ -266,25 +259,13 @@ def rms_of_ulaw(ulaw_audio: bytes) -> float:
 
 
 class TestUnitAudioConversion:
-    """Unit tests for audio format conversion."""
+    """The agent forwards μ-law 8kHz both ways; the only decoder is the tests' own."""
 
-    def test_ulaw_to_pcm_conversion(self):
-        pcm_audio = ulaw_to_pcm(b"\xff" * 160)
-        samples = struct.unpack(f"{len(pcm_audio) // 2}h", pcm_audio)
-        assert len(pcm_audio) == 320  # 160 samples * 2 bytes
-        assert sum(abs(s) for s in samples) / len(samples) < 100  # near silence
-
-    def test_pcm_to_ulaw_conversion(self):
-        assert len(pcm_to_ulaw(b"\x00" * 320)) == 160
-
-    def test_audio_roundtrip(self):
-        samples = [int(16000 * math.sin(2 * math.pi * 440 * i / 8000)) for i in range(160)]
-        pcm_original = struct.pack(f"{len(samples)}h", *samples)
-        restored = struct.unpack("160h", ulaw_to_pcm(pcm_to_ulaw(pcm_original)))
-
-        corr = sum(o * r for o, r in zip(samples, restored, strict=True))
-        energy = (sum(o * o for o in samples) * sum(r * r for r in restored)) ** 0.5
-        assert corr / energy > 0.9, "Audio quality degraded too much"
+    def test_helper_ulaw_decoder_matches_g711(self):
+        """0xFF is μ-law silence (0); 0x00 / 0x80 are the G.711 full-scale codes (±32124)."""
+        assert ulaw_to_pcm(b"\xff" * 160) == b"\x00\x00" * 160
+        assert struct.unpack("<h", ulaw_to_pcm(b"\x00")) == (-32124,)
+        assert struct.unpack("<h", ulaw_to_pcm(b"\x80")) == (32124,)
 
     def test_plivo_to_deepgram_passthrough(self):
         """Deepgram is configured for μ-law 8kHz input, so Plivo bytes pass through."""
@@ -295,14 +276,6 @@ class TestUnitAudioConversion:
         """Deepgram emits raw μ-law 8kHz (container none), which Plivo plays as-is."""
         data = bytes(range(256)) * 2
         assert deepgram_to_plivo(data) == data
-
-    def test_resample_identity(self):
-        pcm = struct.pack("4h", 1, 2, 3, 4)
-        assert resample_audio(pcm, 8000, 8000) == pcm
-
-    def test_resample_doubles_length(self):
-        pcm = b"\x00\x01" * 160
-        assert len(resample_audio(pcm, 8000, 16000)) == len(pcm) * 2
 
 
 # =============================================================================
@@ -732,7 +705,6 @@ class TestUnitDeepgramEventHandling:
         agent._on_agent_audio(b"\x10" * 400)
         assert agent._is_playing is True
         assert agent._send_queue.qsize() == 1
-        assert agent._dg_rx_audio_bytes == 400
 
     async def test_send_to_plivo_chunks_and_checkpoint_after_audio(self):
         from inbound.agent import PLIVO_CHUNK_SIZE, _Checkpoint
@@ -1228,72 +1200,37 @@ class TestUnitFullCallIdInLogs:
 # =============================================================================
 
 
-class TestUnitOutboundCallDetails:
-    """Outbound prompt + greeting rendered from the answer_url call details."""
+class TestUnitOutboundGreeting:
+    """The answer_url ``greeting`` is Deepgram's agent.greeting as is; the prompt is the file."""
 
-    def test_literal_greeting_with_opening_reason(self):
-        from outbound.agent import build_outbound_greeting
+    GREETING = "Hi, this is Alex from TechFlow. I'm reaching out because you requested a demo."
 
-        greeting = build_outbound_greeting("you requested a demo.")
-        assert greeting == (
-            "Hi, this is Alex from TechFlow. I'm reaching out because you requested a demo. "
-            "Is now a good time for a quick chat?"
-        )
-
-    @pytest.mark.parametrize("reason", ["", "   "])
-    def test_default_greeting_without_reason(self, reason):
-        from outbound.agent import DEFAULT_OUTBOUND_GREETING, build_outbound_greeting
-
-        assert build_outbound_greeting(reason) == DEFAULT_OUTBOUND_GREETING
-
-    def test_prompt_substitution(self):
-        from outbound.agent import build_outbound_greeting, build_outbound_prompt
-
-        prompt = build_outbound_prompt(
-            opening_reason="your trial ends soon",
-            objective="book a renewal call",
-            context="customer since 2024",
-        )
-        assert "{{" not in prompt
-        for text in ("your trial ends soon", "book a renewal call", "customer since 2024"):
-            assert text in prompt, text
-        assert f'"{build_outbound_greeting("your trial ends soon")}"' in prompt
-
-    def test_prompt_without_details_uses_neutral_wording(self):
-        """#3/#24: no unrendered placeholders, no "because .", and the quoted greeting
-        is the one actually spoken."""
-        from outbound import agent as agent_mod
-
-        prompt = agent_mod.build_outbound_prompt()
-        assert "{{" not in prompt and "}}" not in prompt
-        assert "because ." not in prompt
-        assert "calling about: \n" not in prompt
-        assert f'"{agent_mod.DEFAULT_OUTBOUND_GREETING}"' in prompt
-        for fallback in (
-            agent_mod.FALLBACK_OPENING_REASON,
-            agent_mod.FALLBACK_OBJECTIVE,
-            agent_mod.FALLBACK_CONTEXT,
-        ):
-            assert fallback in prompt
-
-    def test_agent_renders_prompt_and_greeting_from_details(self):
-        from outbound.agent import (
-            DeepgramVoiceAgent,
-            build_outbound_greeting,
-            build_outbound_prompt,
-        )
+    def test_greeting_passed_through_verbatim(self):
+        from outbound.agent import SYSTEM_PROMPT, DeepgramVoiceAgent
 
         agent = DeepgramVoiceAgent(
-            websocket=FakePlivoWS(), call_id="c", opening_reason="a demo", objective="book"
+            websocket=FakePlivoWS(), call_id="c", initial_message=self.GREETING
         )
         settings = agent._build_settings()
-        assert settings["agent"]["greeting"] == build_outbound_greeting("a demo")
-        assert settings["agent"]["think"]["prompt"].startswith(
-            build_outbound_prompt("a demo", "book")
-        )
+        assert settings["agent"]["greeting"] == self.GREETING
+        assert settings["agent"]["think"]["prompt"] == SYSTEM_PROMPT
         assert _find_keys(settings, "language") == []
 
-    async def test_run_agent_renders_details(self, monkeypatch):
+    def test_default_greeting_when_absent(self):
+        from outbound.agent import DEFAULT_OUTBOUND_GREETING, DeepgramVoiceAgent
+
+        agent = DeepgramVoiceAgent(websocket=FakePlivoWS(), call_id="c")
+        assert agent._build_settings()["agent"]["greeting"] == DEFAULT_OUTBOUND_GREETING
+
+    def test_prompt_file_has_no_placeholders(self):
+        from outbound.agent import SYSTEM_PROMPT
+
+        file_text = (Path(__file__).parent.parent / "outbound" / "system_prompt.md").read_text()
+        assert file_text.strip() == SYSTEM_PROMPT
+        assert "{{" not in SYSTEM_PROMPT and "}}" not in SYSTEM_PROMPT
+
+    @pytest.mark.parametrize("greeting", ["", GREETING])
+    async def test_run_agent_passes_greeting(self, monkeypatch, greeting):
         from outbound import agent as agent_mod
 
         seen: dict[str, Any] = {}
@@ -1302,11 +1239,9 @@ class TestUnitOutboundCallDetails:
             seen.update(prompt=self.system_prompt, greeting=self.initial_message)
 
         monkeypatch.setattr(agent_mod.DeepgramVoiceAgent, "run", fake_run)
-        await agent_mod.run_agent(
-            websocket=FakePlivoWS(), call_id="c", opening_reason="a demo", context="VIP"
-        )
-        assert seen["greeting"] == agent_mod.build_outbound_greeting("a demo")
-        assert seen["prompt"] == agent_mod.build_outbound_prompt("a demo", "", "VIP")
+        await agent_mod.run_agent(websocket=FakePlivoWS(), call_id="c", greeting=greeting)
+        assert seen["greeting"] == (greeting or agent_mod.DEFAULT_OUTBOUND_GREETING)
+        assert seen["prompt"] == agent_mod.SYSTEM_PROMPT
 
 
 class TestUnitSystemPromptSource:
@@ -1314,7 +1249,7 @@ class TestUnitSystemPromptSource:
 
     @pytest.mark.parametrize(
         ("direction", "attribute"),
-        [("inbound", "SYSTEM_PROMPT"), ("outbound", "_OUTBOUND_PROMPT_TEMPLATE")],
+        [("inbound", "SYSTEM_PROMPT"), ("outbound", "SYSTEM_PROMPT")],
     )
     def test_env_var_does_not_override_file(self, monkeypatch, direction, attribute):
         import importlib.util
@@ -1350,7 +1285,6 @@ class TestUnitCallContextLabels:
         assert "give our business phone number" in context
         # The same context reaches the inline prompt and the reusable-config UpdatePrompt
         assert agent._build_settings()["agent"]["think"]["prompt"].endswith(context)
-        assert agent._build_prompt_update().endswith(context)
 
     def test_outbound_without_numbers_has_no_context(self):
         agent, _ = make_outbound_agent(from_number="", to_number="")
@@ -1429,9 +1363,7 @@ class TestUnitServerRoutes:
 
         monkeypatch.setattr(server, "PUBLIC_URL", "https://example.ngrok.app/")
         client = TestClient(server.app)
-        path = (
-            "/outbound/answer?opening_reason=you%20requested%20a%20demo&objective=book%20a%20call"
-        )
+        path = "/outbound/answer?greeting=Hi%2C%20this%20is%20Alex.%20You%20requested%20a%20demo."
         form = {
             "CallUUID": "a-leg-uuid",
             "From": "+14155550100",
@@ -1453,9 +1385,7 @@ class TestUnitServerRoutes:
             "to": "+15551234567",
             "parent_call_uuid": "",
             "sip_headers": {"SIP-H-Account": "acme"},
-            "opening_reason": "you requested a demo",
-            "objective": "book a call",
-            "context": "",
+            "greeting": "Hi, this is Alex. You requested a demo.",
         }
 
     def test_outbound_answer_without_details(self, monkeypatch):
@@ -1470,7 +1400,7 @@ class TestUnitServerRoutes:
         )
         meta = stream_body(resp.text)
         assert (meta["call_uuid"], meta["to"]) == ("u1", "+15551234567")
-        assert (meta["opening_reason"], meta["objective"], meta["context"]) == ("", "", "")
+        assert meta["greeting"] == ""
 
     def test_outbound_hangup_webhook_logs(self, monkeypatch, captured_messages):
         from fastapi.testclient import TestClient
@@ -1522,10 +1452,13 @@ class TestUnitServerRoutes:
         assert "MAREALID" not in message and "real-secret-token" not in message
         assert '"from": "+14155550100"' in message
         assert '"to": "<E.164 number to call>"' in message
+        from urllib.parse import quote
+
         assert (
             '"answer_url": "https://t-9.trycloudflare.com/outbound/answer'
-            '?opening_reason=you%20requested%20a%20demo"'
+            f'?greeting={quote(server.READY_EXAMPLE_GREETING)}"'
         ) in message
+        assert "Optional answer_url query param (URL-encoded): greeting" in message
         assert '"hangup_url": "https://t-9.trycloudflare.com/outbound/hangup"' in message
         assert "Must be a valid url" not in message
         assert "Must be a valid url" in server.ready_message(tunnel=True)
@@ -1555,8 +1488,8 @@ WEBHOOK_ROUTES = [
     ("inbound.server", "POST", "/fallback"),
     ("inbound.server", "GET", "/hold"),
     ("inbound.server", "POST", "/hold"),
-    ("outbound.server", "POST", "/outbound/answer?opening_reason=a%20demo"),
-    ("outbound.server", "GET", "/outbound/answer?CallUUID=c-1&objective=book"),
+    ("outbound.server", "POST", "/outbound/answer?greeting=a%20demo"),
+    ("outbound.server", "GET", "/outbound/answer?CallUUID=c-1&greeting=hi"),
     ("outbound.server", "POST", "/outbound/hangup"),
 ]
 
@@ -1570,7 +1503,7 @@ def _server(module: str, monkeypatch, public_url: str = PUBLIC):
 
 
 def _answer_path(module: str) -> str:
-    return "/answer" if module == "inbound.server" else "/outbound/answer?opening_reason=a%20demo"
+    return "/answer" if module == "inbound.server" else "/outbound/answer?greeting=a%20demo"
 
 
 class _RunAgentRecorder:
@@ -1646,17 +1579,17 @@ class TestUnitWebhookAuth:
 
     @pytest.mark.parametrize("method", ["POST", "GET"])
     def test_tampered_outbound_query_string_rejected(self, monkeypatch, method):
-        """The answer_url call details are covered by the signature."""
+        """The answer_url greeting is covered by the signature."""
         from fastapi.testclient import TestClient
 
         client = TestClient(_server("outbound.server", monkeypatch).app)
         data = FORM if method == "POST" else None
-        signed_path = "/outbound/answer?opening_reason=a%20demo&objective=book"
+        signed_path = "/outbound/answer?greeting=a%20demo&x=1"
         headers = signed(method, PUBLIC, signed_path, data)
         for sent in (
-            "/outbound/answer?opening_reason=free%20money&objective=book",
-            "/outbound/answer?opening_reason=a%20demo&objective=book&context=injected",
-            "/outbound/answer?opening_reason=a%20demo",
+            "/outbound/answer?greeting=free%20money&x=1",
+            "/outbound/answer?greeting=a%20demo&x=1&y=injected",
+            "/outbound/answer?greeting=a%20demo",
         ):
             assert client.request(method, sent, data=data, headers=headers).status_code == 403
         ok = client.request(method, signed_path, data=data, headers=headers)
@@ -1667,9 +1600,9 @@ class TestUnitWebhookAuth:
         from plivo.utils.signature_v3 import construct_post_url
 
         base = construct_post_url(
-            f"{PUBLIC}/outbound/answer?opening_reason=a%20demo&context=c", {"To": "1", "From": "2"}
+            f"{PUBLIC}/outbound/answer?x=c&greeting=a%20demo", {"To": "1", "From": "2"}
         )
-        assert base.decode() == f"{PUBLIC}/outbound/answer?context=c&opening_reason=a demo.From2To1"
+        assert base.decode() == f"{PUBLIC}/outbound/answer?greeting=a demo&x=c.From2To1"
 
     @pytest.mark.parametrize("module", SERVER_MODULES)
     def test_signature_checked_against_public_url_not_request_url(self, monkeypatch, module):
@@ -1696,11 +1629,11 @@ class TestUnitWebhookAuth:
             "scheme": "http",
             "server": ("127.0.0.1", 8000),
             "path": "/outbound/answer",
-            "query_string": b"opening_reason=a%20demo&x=1",
+            "query_string": b"greeting=a%20demo&x=1",
             "headers": [(b"host", b"localhost:8000")],
         }
         assert server.public_request_url(Request(scope)) == (
-            "https://agent.example.com/outbound/answer?opening_reason=a%20demo&x=1"
+            "https://agent.example.com/outbound/answer?greeting=a%20demo&x=1"
         )
         scope["query_string"] = b""
         assert server.public_request_url(Request(scope)) == (
@@ -1783,35 +1716,34 @@ INLINE_SETTINGS_SHA256 = {
     "inbound|caller=+15551234567": (
         "f33419bbdb46b83b93f02570d6cb153723a0af1230479186fff4f82955fb9c8d"
     ),
-    "outbound|details=False|numbers=False": (
-        "be1c1fe7126048b2706b74a1a9d58d36f293fa46a647ad8ea5ff8c4867acfe50"
+    "outbound|greeting=False|numbers=False": (
+        "ca17537e2016015790de0d3e5bf9f5bab7bb1279a97ccf095f8cee17524a516d"
     ),
-    "outbound|details=False|numbers=True": (
-        "e60e6fe3a8d1364e6d5b2228b0e4884a833704147ced60fda8285a6a5e270f1a"
+    "outbound|greeting=False|numbers=True": (
+        "bf78d89cb529cf423c5645efba7374b4cb8b5a354a8ec6349199d8b5c43c1b5d"
     ),
-    "outbound|details=True|numbers=False": (
-        "aa4c4ee018172354404e7f744ea80717c5dfd6c2ea4c42694c53c37eac1dc960"
+    "outbound|greeting=True|numbers=False": (
+        "b5bd59bc2cc1c7396042236ba27d4288bb8807d90d459367394fa60a46e5d47d"
     ),
-    "outbound|details=True|numbers=True": (
-        "34d156d2b61c2b43d1bfb5e0b7702a77ed5e1d1e26609d0b686df718baf872e5"
+    "outbound|greeting=True|numbers=True": (
+        "f0c32e2e09e28a729bc78762c9ca4ad44096baf4060f1dc6036a75bd1edebff1"
     ),
 }
 
 # sha256 of the config string in the README create body (default env)
 CREATE_BODY_CONFIG_SHA256 = {
     "inbound": "61191cfbf2c69e83f3f270e55eefb187972a2956f76c56112ff623ba7e005c47",
-    "outbound": "65b5e6ad3f8e3851baf71c4ad4cdc75b32722046176ffcc9af722af809b199f5",
+    "outbound": "16fa1cee1657131afa5f35138bea23b137bd80a0c202d064e08e90154e78e29b",
 }
 
 _DEFAULT_INBOUND_GREETING = (
     "Hi, this is Alex from TechFlow. I'm built with the Deepgram Voice Agent API "
     "on Plivo. How can I help you today?"
 )
-_CALL_DETAILS = {
-    "opening_reason": "you asked about TechFlow Pro pricing",
-    "objective": "book a demo",
-    "context": "Lead from the pricing page",
-}
+_OUTBOUND_GREETING = (
+    "Hi, this is Alex from TechFlow. I'm reaching out because you asked about TechFlow Pro "
+    "pricing. Is now a good time for a quick chat?"
+)
 
 
 class _FrozenDatetime(datetime):
@@ -1862,16 +1794,16 @@ class TestUnitInlineSettingsSnapshot:
         )
         assert self._wire_sha256(agent) == INLINE_SETTINGS_SHA256[f"inbound|caller={caller}"]
 
-    @pytest.mark.parametrize("details", [False, True])
+    @pytest.mark.parametrize("greeting", [False, True])
     @pytest.mark.parametrize("numbers", [False, True])
-    def test_outbound(self, default_agent_modules, details, numbers):
+    def test_outbound(self, default_agent_modules, greeting, numbers):
         _, outbound_mod = default_agent_modules
-        fields = _CALL_DETAILS if details else {}
+        fields = {"initial_message": _OUTBOUND_GREETING} if greeting else {}
         phones = {"from_number": "+14155550100", "to_number": "+15551234567"} if numbers else {}
         agent = outbound_mod.DeepgramVoiceAgent(
             None, CALL_ID, agent_config_id="", **phones, **fields
         )
-        key = f"outbound|details={details}|numbers={numbers}"
+        key = f"outbound|greeting={greeting}|numbers={numbers}"
         assert self._wire_sha256(agent) == INLINE_SETTINGS_SHA256[key]
 
 
@@ -2606,9 +2538,10 @@ class TestUnitSavedAgentConfig:
 
         assert json.loads(readme_bodies["inbound"]["config"])["think"]["prompt"] == SYSTEM_PROMPT
 
-    def test_readme_outbound_prompt_points_at_this_call(self, readme_bodies):
-        prompt = json.loads(readme_bodies["outbound"]["config"])["think"]["prompt"]
-        assert prompt.count('"This Call"') >= 3  # opening reason, objective, context
+    def test_readme_outbound_prompt_is_system_prompt(self, readme_bodies):
+        from outbound.agent import SYSTEM_PROMPT
+
+        assert json.loads(readme_bodies["outbound"]["config"])["think"]["prompt"] == SYSTEM_PROMPT
 
     def test_readme_create_body_matches_snapshot(self, readme_bodies):
         """The README create body's config string is byte-identical to the pinned snapshot."""
@@ -2629,14 +2562,20 @@ class TestUnitSavedAgentConfig:
         del created["think"]["prompt"]
         assert inline == created
 
-    def test_outbound_inline_settings_use_rendered_prompt_and_greeting(self):
-        from outbound.agent import build_outbound_greeting, build_outbound_prompt
+    def test_outbound_inline_settings_are_create_body_plus_greeting_and_context(
+        self, readme_bodies
+    ):
+        from outbound.agent import SYSTEM_PROMPT
 
-        agent, _ = make_outbound_agent(opening_reason="a demo")
+        agent, _ = make_outbound_agent(initial_message="Hello from a test.")
+        context = agent._build_call_context()
+        assert "+15551234567" in context
         inline = agent._build_settings()["agent"]
-        assert inline["greeting"] == build_outbound_greeting("a demo")
-        expected = build_outbound_prompt("a demo") + agent._build_call_context()
-        assert inline["think"]["prompt"] == expected
+        assert inline.pop("greeting") == "Hello from a test."
+        assert inline["think"].pop("prompt") == SYSTEM_PROMPT + context
+        created = json.loads(readme_bodies["outbound"]["config"])
+        del created["think"]["prompt"]
+        assert inline == created
 
     async def test_saved_handshake_sends_context_then_greeting_then_flushes(self):
         agent, plivo_ws, dg = make_agent(
@@ -2706,13 +2645,9 @@ class TestUnitSavedAgentConfig:
         (session_end,) = of_event(captured_events, "session_end")
         assert session_end["agent_config"] == expected
 
-    async def test_outbound_saved_mode_appends_call_details(self):
+    async def test_outbound_saved_mode_sends_call_context_then_greeting(self):
         agent, dg = make_outbound_agent(
-            agent_config_id=SAVED_UUID,
-            initial_message="Hi, this is Alex from TechFlow.",
-            opening_reason="your trial ends soon",
-            objective="book a renewal call",
-            context="customer since 2024",
+            agent_config_id=SAVED_UUID, initial_message="Hi, this is Alex from TechFlow."
         )
         agent._settings_applied.clear()
         dg.feed({"type": "Welcome", "request_id": "r"})
@@ -2720,35 +2655,26 @@ class TestUnitSavedAgentConfig:
         await agent._handshake(dg)
         settings, update, greeting = dg.sent_json()
         assert settings["agent"] == SAVED_UUID
-        prompt = update["prompt"]
-        assert "## This Call" in prompt
-        for text in (
-            "your trial ends soon",
-            "book a renewal call",
-            "customer since 2024",
-            '"Hi, this is Alex from TechFlow."',
-            "+15551234567",
-        ):
-            assert text in prompt, text
+        assert update == {"type": "UpdatePrompt", "prompt": agent._build_call_context()}
+        assert "+15551234567" in update["prompt"]
         assert greeting == {
             "type": "InjectAgentMessage",
             "message": "Hi, this is Alex from TechFlow.",
         }
 
-    async def test_outbound_saved_mode_without_details_is_neutral(self):
-        from outbound import agent as agent_mod
+    async def test_outbound_saved_mode_without_numbers_sends_only_greeting(self):
+        from outbound.agent import DEFAULT_OUTBOUND_GREETING
 
-        agent, _ = make_outbound_agent(agent_config_id=SAVED_UUID)
-        update = agent._build_prompt_update()
-        assert f'"{agent_mod.DEFAULT_OUTBOUND_GREETING}"' in update
-        for fallback in (
-            agent_mod.FALLBACK_OPENING_REASON,
-            agent_mod.FALLBACK_OBJECTIVE,
-            agent_mod.FALLBACK_CONTEXT,
-        ):
-            assert fallback in update
+        agent, dg = make_outbound_agent(agent_config_id=SAVED_UUID, from_number="", to_number="")
+        agent._settings_applied.clear()
+        dg.feed({"type": "Welcome", "request_id": "r"})
+        dg.feed({"type": "SettingsApplied"})
+        await agent._handshake(dg)
+        settings, greeting = dg.sent_json()
+        assert settings["agent"] == SAVED_UUID
+        assert greeting == {"type": "InjectAgentMessage", "message": DEFAULT_OUTBOUND_GREETING}
 
-    def test_outbound_ws_passes_call_details_to_agent(self, monkeypatch):
+    def test_outbound_ws_passes_greeting_to_agent(self, monkeypatch):
         from fastapi.testclient import TestClient
 
         from outbound import server
@@ -2761,18 +2687,14 @@ class TestUnitSavedAgentConfig:
         monkeypatch.setattr(server, "PUBLIC_URL", "https://example.ngrok.app")
         monkeypatch.setattr(server, "run_agent", fake_run_agent)
         client = TestClient(server.app)
-        path = "/outbound/answer?opening_reason=a%20demo&objective=book&context=ctx"
+        path = "/outbound/answer?greeting=Hi%20there%2C%20a%20demo"
         form = {"CallUUID": "u", "From": "+14155550100", "To": "+15551234567"}
         answer = client.post(
             path, data=form, headers=signed("POST", "https://example.ngrok.app", path, form)
         )
         with client.websocket_connect(ws_path(answer.text)) as ws:
             ws.send_text(json.dumps({"event": "start", "start": {"callId": "u", "streamId": "s"}}))
-        assert (seen["opening_reason"], seen["objective"], seen["context"]) == (
-            "a demo",
-            "book",
-            "ctx",
-        )
+        assert seen["greeting"] == "Hi there, a demo"
         assert (seen["from_number"], seen["to_number"]) == ("+14155550100", "+15551234567")
         assert "system_prompt" not in seen and "initial_message" not in seen
 

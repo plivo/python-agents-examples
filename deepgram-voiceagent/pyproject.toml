@@ -12,8 +12,6 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "python-multipart>=0.0.9",
     "loguru>=0.7.0",
-    "numpy>=1.24.0",
-    "scipy>=1.11.0",
     "phonenumbers>=8.13.0",
     "httpx>=0.27.0",
 ]

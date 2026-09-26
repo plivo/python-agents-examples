@@ -53,8 +53,8 @@ from tests.helpers import (
     start_server,
     stop_server,
     stream_url_from_xml,
+    ulaw_to_pcm,
 )
-from utils import ulaw_to_pcm
 
 load_dotenv()
 ensure_ffmpeg_on_path()

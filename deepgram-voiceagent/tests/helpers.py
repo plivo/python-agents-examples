@@ -6,7 +6,9 @@ import base64
 import json
 import os
 import secrets
+import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -22,8 +24,28 @@ from plivo.utils.signature_v3 import construct_get_url, construct_post_url, get_
 
 NGROK_BIN = os.getenv("NGROK_BIN", "ngrok")
 NGROK_API = "http://127.0.0.1:4040/api/tunnels"
+# Plivo rejects webhook URLs whose hostname it can't resolve yet ("Must be a valid url");
+# a fresh trycloudflare.com hostname took ~70s to be accepted in testing.
+PLIVO_URL_ACCEPT_TIMEOUT_S = 180.0
+PLIVO_URL_RETRY_INTERVAL_S = 5.0
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
+
+
+def ulaw_to_pcm(ulaw_audio: bytes) -> bytes:
+    """G.711 μ-law -> 16-bit little-endian PCM (test-only: recordings, RMS, transcripts).
+
+    The agent never decodes audio (Plivo and Deepgram both speak μ-law 8kHz), so the
+    codec lives here rather than in utils.py.
+    """
+    samples = []
+    for byte in ulaw_audio:
+        code = ~byte & 0xFF
+        exponent = (code >> 4) & 0x07
+        mantissa = code & 0x0F
+        magnitude = (((mantissa << 3) + 0x84) << exponent) - 0x84
+        samples.append(-magnitude if code & 0x80 else magnitude)
+    return struct.pack(f"<{len(samples)}h", *samples)
 
 
 def ensure_ffmpeg_on_path() -> None:
@@ -273,20 +295,48 @@ def get_app_id_for_number(client: plivo.RestClient, number_digits: str) -> str:
     return ""
 
 
+def is_invalid_url_error(e: Exception) -> bool:
+    """Plivo's API rejects answer/hangup URLs whose hostname it can't resolve yet."""
+    return isinstance(e, plivo.exceptions.ValidationError) and "valid url" in str(e).lower()
+
+
+def until_plivo_accepts_url(action, what: str, timeout_s: float = PLIVO_URL_ACCEPT_TIMEOUT_S):
+    """Call ``action()`` until Plivo stops answering "Must be a valid url" (new tunnel host)."""
+    deadline = time.time() + timeout_s
+    while True:
+        try:
+            return action()
+        except Exception as e:
+            if not is_invalid_url_error(e) or time.time() >= deadline:
+                raise
+            print(f"[Plivo] {what}: hostname not accepted yet, retrying...")
+            time.sleep(PLIVO_URL_RETRY_INTERVAL_S)
+
+
 def upsert_application(
     client: plivo.RestClient, app_name: str, answer_url: str, hangup_url: str = ""
 ) -> str:
-    """Create or update a Plivo application and return its app_id."""
+    """Create or update a Plivo application and return its app_id.
+
+    Retries while Plivo rejects a tunnel hostname it can't resolve yet.
+    """
     params = {"answer_url": answer_url, "answer_method": "POST"}
     if hangup_url:
         params.update(hangup_url=hangup_url, hangup_method="POST")
     # app_name filters by prefix server-side (the unfiltered list is paged at 20)
     apps = client.applications.list(app_name=app_name)
-    for app_obj in apps["objects"]:
-        if app_obj["app_name"] == app_name:
-            client.applications.update(app_id=app_obj["app_id"], **params)
-            return app_obj["app_id"]
-    return client.applications.create(app_name=app_name, **params)["app_id"]
+    existing = [a["app_id"] for a in apps["objects"] if a["app_name"] == app_name]
+    if existing:
+        app_id = existing[0]
+        until_plivo_accepts_url(
+            lambda: client.applications.update(app_id=app_id, **params),
+            f"update application {app_name}",
+        )
+        return app_id
+    return until_plivo_accepts_url(
+        lambda: client.applications.create(app_name=app_name, **params),
+        f"create application {app_name}",
+    )["app_id"]
 
 
 def _running_ngrok_pids() -> list[str]:
@@ -353,6 +403,28 @@ def start_ngrok(port: int) -> tuple[subprocess.Popen, str]:
         pytest.skip("ngrok did not start or no HTTPS tunnel found")
 
     return proc, public_url
+
+
+def start_tunnel(port: int) -> tuple[subprocess.Popen, str]:
+    """Public HTTPS tunnel to ``port``: ngrok, or a Cloudflare quick tunnel as fallback.
+
+    ngrok's free plan allows one agent session per machine, so when an ngrok agent is
+    already running (another session, a manual tunnel) and ``cloudflared`` is on PATH,
+    this uses ``utils.start_quick_tunnel`` instead of skipping. A fresh trycloudflare.com
+    hostname takes Plivo up to a few minutes to accept; ``upsert_application`` retries.
+    """
+    if _ngrok_agent_running() and shutil.which("cloudflared"):
+        from utils import start_quick_tunnel
+
+        print("\n[tunnel] ngrok is busy (another session); using a Cloudflare quick tunnel")
+        public_url, proc = start_quick_tunnel(port)
+        return proc, public_url
+    return start_ngrok(port)
+
+
+def stop_tunnel(proc: subprocess.Popen) -> None:
+    """Stop the tunnel process started by ``start_tunnel`` (only that one, by its handle)."""
+    stop_ngrok(proc)
 
 
 def stop_ngrok(proc: subprocess.Popen) -> None:

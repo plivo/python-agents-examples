@@ -20,10 +20,10 @@ sentinel travels through the send queue behind the last audio chunk, so the
 checkpoint event is always sent after the audio it marks.
 
 Calls are placed with Plivo's Make Call API directly. Its answer_url
-(``/outbound/answer?opening_reason=&objective=&context=``) carries the per-call
-context, which server.py passes to run_agent(). The prompt is outbound/system_prompt.md
-rendered by build_outbound_prompt(); the greeting (build_outbound_greeting()) is literal
-text the speak model says verbatim when the callee answers (Deepgram ``agent.greeting``).
+(``/outbound/answer?greeting=``) may carry the greeting, which server.py passes to
+run_agent() unchanged: it becomes Deepgram's ``agent.greeting``, literal text the speak
+model says verbatim when the callee answers (DEFAULT_OUTBOUND_GREETING when absent).
+The prompt is outbound/system_prompt.md, sent as is.
 
 Pipeline logging is controlled by the LOG_LEVEL env var:
   verbose — every pipeline event: Deepgram events, packet counts, queue sizes
@@ -32,8 +32,8 @@ Pipeline logging is controlled by the LOG_LEVEL env var:
 
 Two ways to define the agent, chosen by DEEPGRAM_OUTBOUND_AGENT_ID:
   inline (default, empty) — Settings.agent carries the full definition built here
-  reusable config (a UUID) — Settings.agent is that UUID; the per-call details + context
-      (UpdatePrompt, "This Call") and greeting (InjectAgentMessage) follow SettingsApplied.
+  reusable config (a UUID) — Settings.agent is that UUID; the per-call context
+      (UpdatePrompt) and greeting (InjectAgentMessage) follow SettingsApplied.
 Creating a reusable config is a one-off REST call; see the README.
 """
 
@@ -146,7 +146,6 @@ class _CallTrace:
         self.session: Any = None
         self.llm_attributes: dict[str, Any] = {}
         self.turn: Any = None
-        self.turn_start_ns = 0
         self.turn_awaiting_eot = False  # user turn started without an EndOfTurn yet
         self.playback: Any = None
         self.playback_started = False
@@ -223,7 +222,6 @@ class _CallTrace:
             attributes["eot.trigger"] = pending[0]
             start = pending[1]
         self.turn = self._span("turn", self.session, attributes, start_time=start)
-        self.turn_start_ns = start
         self.turn_awaiting_eot = source != "greeting" and "eot.trigger" not in attributes
         self.playback = None
         self.playback_started = False
@@ -389,60 +387,15 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "normal").lower()
 # =============================================================================
 
 # The only prompt source: edit the file, or mount another file over it (see the README).
-_OUTBOUND_PROMPT_TEMPLATE = (Path(__file__).parent / "system_prompt.md").read_text().strip()
+# It is sent to Deepgram as is (plus the call context); there is no templating.
+SYSTEM_PROMPT = (Path(__file__).parent / "system_prompt.md").read_text().strip()
 
 # Deepgram speaks agent.greeting verbatim via TTS — literal text, not an LLM instruction.
+# Used when the answer_url carries no ``greeting`` query param.
 DEFAULT_OUTBOUND_GREETING = (
     "Hi, this is Alex from TechFlow, following up on your recent interest in our "
     "products. Is now a good time for a quick chat?"
 )
-
-# Neutral wording for per-call fields the answer_url did not carry, so the LLM never sees
-# an unfilled {{placeholder}} or a dangling "because ." (matches DEFAULT_OUTBOUND_GREETING).
-FALLBACK_OPENING_REASON = "a follow-up on their recent interest in TechFlow's products"
-FALLBACK_OBJECTIVE = (
-    "learn what they are looking for, qualify their interest, and offer a meeting "
-    "with a sales specialist if it fits"
-)
-FALLBACK_CONTEXT = "No additional context was provided for this call."
-
-
-def build_outbound_greeting(opening_reason: str = "") -> str:
-    """The literal greeting spoken when the callee answers."""
-    reason = opening_reason.strip().rstrip(".")
-    if not reason:
-        return DEFAULT_OUTBOUND_GREETING
-    return (
-        f"Hi, this is Alex from TechFlow. I'm reaching out because {reason}. "
-        "Is now a good time for a quick chat?"
-    )
-
-
-def build_outbound_prompt(
-    opening_reason: str = "",
-    objective: str = "",
-    context: str = "",
-    greeting: str | None = None,
-) -> str:
-    """Render outbound/system_prompt.md for one call.
-
-    Empty fields get neutral fallbacks. ``greeting`` defaults to the quoted text of
-    build_outbound_greeting(opening_reason), i.e. exactly what the call speaks. The
-    README's reusable-config create command passes pointers to the "This Call" section
-    instead, which each call appends via UpdatePrompt (see _build_prompt_update()).
-    """
-    if greeting is None:
-        greeting = f'"{build_outbound_greeting(opening_reason)}"'
-    values = {
-        "greeting": greeting,
-        "opening_reason": opening_reason.strip() or FALLBACK_OPENING_REASON,
-        "objective": objective.strip() or FALLBACK_OBJECTIVE,
-        "context": context.strip() or FALLBACK_CONTEXT,
-    }
-    prompt = _OUTBOUND_PROMPT_TEMPLATE
-    for name, value in values.items():
-        prompt = prompt.replace("{{" + name + "}}", value)
-    return prompt
 
 
 # =============================================================================
@@ -676,16 +629,12 @@ class DeepgramVoiceAgent:
         call_id: str,
         from_number: str = "",
         to_number: str = "",
-        system_prompt: str | None = None,
-        initial_message: str | None = None,
+        initial_message: str = "",
         stream_id: str = "",
         parent_call_id: str = "",
         sip_headers: dict[str, str] | None = None,
         hangup_callback: Callable[[], Awaitable[None]] | None = None,
         agent_config_id: str | None = None,
-        opening_reason: str = "",
-        objective: str = "",
-        context: str = "",
         saved_agent_models: dict[str, str] | None = None,
     ):
         self.websocket = websocket
@@ -695,21 +644,12 @@ class DeepgramVoiceAgent:
         self._logger = logger.bind(call_id=self.parent_call_id, leg_call_id=self.call_id)
         self.from_number = from_number
         self.to_number = to_number
-        # Prompt + greeting rendered from the per-call details (answer_url query params)
-        if system_prompt is None:
-            system_prompt = build_outbound_prompt(opening_reason, objective, context)
-        self.system_prompt = system_prompt
-        if initial_message is None:
-            initial_message = build_outbound_greeting(opening_reason)
-        self.initial_message = initial_message
+        self.system_prompt = SYSTEM_PROMPT
+        # The answer_url ``greeting`` as is (Deepgram agent.greeting); default when absent
+        self.initial_message = initial_message or DEFAULT_OUTBOUND_GREETING
         self.sip_headers = sip_headers or {}
         self.hangup_callback = hangup_callback
         self._stream_id = stream_id  # Plivo stream ID for checkpoint/clearAudio events
-        # Per-call details: inline mode has them rendered into system_prompt;
-        # saved mode sends them via UpdatePrompt ("This Call")
-        self.opening_reason = opening_reason
-        self.objective = objective
-        self.call_details_context = context
         # Reusable agent configuration UUID ("" = inline Settings)
         self.agent_config_id = (
             DEEPGRAM_OUTBOUND_AGENT_ID if agent_config_id is None else agent_config_id
@@ -752,7 +692,6 @@ class DeepgramVoiceAgent:
         self._session_start = time.monotonic()
         self._plivo_rx_bytes = 0
         self._plivo_tx_chunks = 0
-        self._dg_rx_audio_bytes = 0
         self._speech_end_time: float | None = None
         self._ttfs_samples: list[float] = []
 
@@ -826,22 +765,6 @@ class DeepgramVoiceAgent:
         """Build system prompt with call context (inline mode)."""
         return self.system_prompt + self._build_call_context()
 
-    def _build_prompt_update(self) -> str:
-        """Saved mode: "This Call" details + call context, appended via UpdatePrompt.
-
-        Every line is always present (neutral fallbacks for missing fields), because the
-        saved prompt points at each of them.
-        """
-        opening_reason = self.opening_reason.strip() or FALLBACK_OPENING_REASON
-        lines = [
-            "## This Call",
-            f'- Greeting you already spoke: "{self.initial_message}"',
-            f"- Opening reason (why you are calling): {opening_reason}",
-            f"- Objective: {self.objective.strip() or FALLBACK_OBJECTIVE}",
-            f"- Additional context: {self.call_details_context.strip() or FALLBACK_CONTEXT}",
-        ]
-        return "\n\n" + "\n".join(lines) + self._build_call_context()
-
     def _build_settings(self) -> dict[str, Any]:
         """Build the Deepgram Voice Agent Settings message.
 
@@ -887,7 +810,7 @@ class DeepgramVoiceAgent:
         UpdatePrompt appends to the saved prompt; InjectAgentMessage is spoken verbatim
         and flows back as ConversationText(assistant) like an inline greeting (turn 1).
         """
-        prompt_update = self._build_prompt_update()
+        prompt_update = self._build_call_context()
         if prompt_update:
             await dg_ws.send(json.dumps({"type": "UpdatePrompt", "prompt": prompt_update}))
         if self.initial_message:
@@ -1301,7 +1224,6 @@ class DeepgramVoiceAgent:
         if not self._is_playing:
             self._logv("deepgram", "first agent audio of response")
         self._is_playing = True
-        self._dg_rx_audio_bytes += len(data)
         self._send_queue.put_nowait(deepgram_to_plivo(data))
 
     async def _on_user_started_speaking(self) -> None:
@@ -1693,32 +1615,25 @@ async def run_agent(
     parent_call_id: str = "",
     sip_headers: dict[str, str] | None = None,
     hangup_callback: Callable[[], Awaitable[None]] | None = None,
-    opening_reason: str = "",
-    objective: str = "",
-    context: str = "",
+    greeting: str = "",
     saved_agent_models: dict[str, str] | None = None,
 ) -> None:
     """Run a voice agent session for an outbound call.
 
-    ``opening_reason`` / ``objective`` / ``context`` come from the answer_url query string
-    (all optional). They render the prompt (build_outbound_prompt()) and the greeting
-    (build_outbound_greeting()); on the reusable-config path they form the "This Call"
-    section sent with UpdatePrompt.
+    ``greeting`` is the answer_url query param of the same name (optional). It is passed
+    through unchanged as Deepgram's ``agent.greeting`` (inline) or ``InjectAgentMessage``
+    (reusable config); DEFAULT_OUTBOUND_GREETING is used when it is empty.
     """
     agent = DeepgramVoiceAgent(
         websocket=websocket,
         call_id=call_id,
         from_number=from_number,
         to_number=to_number,
-        system_prompt=build_outbound_prompt(opening_reason, objective, context),
-        initial_message=build_outbound_greeting(opening_reason),
+        initial_message=greeting,
         stream_id=stream_id,
         parent_call_id=parent_call_id,
         sip_headers=sip_headers,
         hangup_callback=hangup_callback,
-        opening_reason=opening_reason,
-        objective=objective,
-        context=context,
         saved_agent_models=saved_agent_models,
     )
     await agent.run()

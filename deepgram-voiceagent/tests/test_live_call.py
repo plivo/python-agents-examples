@@ -41,10 +41,10 @@ from tests.helpers import (
     read_log_events,
     server_log_path,
     signed_webhook,
-    start_ngrok,
     start_server,
-    stop_ngrok,
+    start_tunnel,
     stop_server,
+    stop_tunnel,
     upsert_application,
 )
 from utils import normalize_phone_number
@@ -76,16 +76,16 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(scope="module")
-def ngrok_tunnel():
+def tunnel_url():
     """Start ngrok first: the server needs PUBLIC_URL to build the wss:// stream URL."""
-    proc, public_url = start_ngrok(TEST_PORT)
-    print(f"\n[ngrok] Tunnel URL: {public_url}")
+    proc, public_url = start_tunnel(TEST_PORT)
+    print(f"\n[tunnel] URL: {public_url}")
     yield public_url
-    stop_ngrok(proc)
+    stop_tunnel(proc)
 
 
 @pytest.fixture(scope="module")
-def server_process(ngrok_tunnel):
+def server_process(tunnel_url):
     """Start the inbound server (SIGTERM -> wait(5) -> SIGKILL on teardown).
 
     PLIVO_PHONE_NUMBER is blanked so the server skips its own webhook auto-config;
@@ -95,7 +95,7 @@ def server_process(ngrok_tunnel):
         "inbound.server",
         TEST_PORT,
         LOG_PATH,
-        {"PUBLIC_URL": ngrok_tunnel, "PLIVO_PHONE_NUMBER": ""},
+        {"PUBLIC_URL": tunnel_url, "PLIVO_PHONE_NUMBER": ""},
     )
     print(f"[server] logs: {LOG_PATH}")
     yield proc
@@ -103,19 +103,19 @@ def server_process(ngrok_tunnel):
 
 
 @pytest.fixture(scope="module")
-def plivo_configured(server_process, ngrok_tunnel):
+def plivo_configured(server_process, tunnel_url):
     """Point PLIVO_PHONE_NUMBER at a test app on the tunnel; restore it afterwards."""
     client = plivo.RestClient(auth_id=PLIVO_AUTH_ID, auth_token=PLIVO_AUTH_TOKEN)
     phone_digits = normalize_phone_number(PLIVO_PHONE_NUMBER)
     original_app_id = get_app_id_for_number(client, phone_digits)
 
     app_id = upsert_application(
-        client, APP_NAME, f"{ngrok_tunnel}/answer", hangup_url=f"{ngrok_tunnel}/hangup"
+        client, APP_NAME, f"{tunnel_url}/answer", hangup_url=f"{tunnel_url}/hangup"
     )
     client.numbers.update(number=phone_digits, app_id=app_id)
     print(f"[Plivo] Assigned {phone_digits} to {APP_NAME} ({app_id})")
 
-    yield {"client": client, "public_url": ngrok_tunnel}
+    yield {"client": client, "public_url": tunnel_url}
 
     if original_app_id and original_app_id != app_id:
         client.numbers.update(number=phone_digits, app_id=original_app_id)
@@ -157,8 +157,8 @@ GREETING_WORDS = ["alex", "techflow", "deepgram", "help", "hi", "hello"]
 class TestLiveCall:
     """End-to-end tests that place a real call through Plivo."""
 
-    def test_ngrok_tunnel_accessible(self, server_process, ngrok_tunnel):
-        resp = httpx.get(ngrok_tunnel, timeout=10.0)
+    def test_tunnel_accessible(self, server_process, tunnel_url):
+        resp = httpx.get(tunnel_url, timeout=10.0)
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
 

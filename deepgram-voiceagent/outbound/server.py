@@ -2,8 +2,8 @@
 
 Calls are placed with Plivo's Make Call API directly (see the Ready line logged at
 startup and the README). This server only answers Plivo's webhooks and bridges audio:
-/outbound/answer reads the per-call context from its query string (opening_reason,
-objective, context) and returns <Stream> XML; /ws runs the agent.
+/outbound/answer reads the optional greeting from its query string (greeting) and
+returns <Stream> XML; /ws runs the agent.
 """
 
 from __future__ import annotations
@@ -143,13 +143,17 @@ PUBLIC_URL = os.getenv("PUBLIC_URL", "")
 
 _tunnel_proc = None  # cloudflared process started by --tunnel
 
-# Per-call context accepted on the answer_url query string (all optional)
-CALL_DETAIL_PARAMS = ("opening_reason", "objective", "context")
+# Optional answer_url query param: the greeting Deepgram speaks verbatim when the callee
+# answers (agent.greeting). Passed through as is; DEFAULT_OUTBOUND_GREETING when absent.
+GREETING_PARAM = "greeting"
 
 # Startup "Ready!" line: logged once uvicorn accepts connections
 READY_PROBE_TIMEOUT_S = 30.0
 READY_PROBE_INTERVAL_S = 0.1
-READY_EXAMPLE_OPENING_REASON = "you requested a demo"
+READY_EXAMPLE_GREETING = (
+    "Hi, this is Alex from TechFlow. I'm reaching out because you requested a demo. "
+    "Is now a good time for a quick chat?"
+)
 
 
 async def _wait_until_serving(port: int, timeout_s: float = READY_PROBE_TIMEOUT_S) -> bool:
@@ -182,7 +186,7 @@ def ready_message(tunnel: bool = False) -> str:
     base = PUBLIC_URL.rstrip("/") or "<PUBLIC_URL>"
     phone = normalize_phone_number(PLIVO_PHONE_NUMBER)
     from_number = f"+{phone}" if phone else "<your Plivo number>"
-    query = urlencode({"opening_reason": READY_EXAMPLE_OPENING_REASON}, quote_via=quote)
+    query = urlencode({GREETING_PARAM: READY_EXAMPLE_GREETING}, quote_via=quote)
     lines = [
         "Ready! Place a call with Plivo's Make Call API; Plivo then requests this server's "
         "answer URL:",
@@ -192,7 +196,9 @@ def ready_message(tunnel: bool = False) -> str:
         f'         "answer_url": "{base}/outbound/answer?{query}",',
         f'         "hangup_url": "{base}/outbound/hangup",',
         '         "answer_method": "POST", "hangup_method": "POST"}\'',
-        f"  Optional answer_url query params (URL-encoded): {', '.join(CALL_DETAIL_PARAMS)}.",
+        f"  Optional answer_url query param (URL-encoded): {GREETING_PARAM} — spoken "
+        "verbatim when the callee answers (Deepgram agent.greeting); a default is used "
+        "when absent.",
     ]
     if tunnel:
         lines.append(
@@ -353,14 +359,13 @@ async def outbound_answer_webhook(
 ) -> Response:
     """Plivo answer webhook for a call placed with the Make Call API.
 
-    The answer_url query string may carry the per-call context (``opening_reason``,
-    ``objective``, ``context``). It travels to /ws in the base64 ``body`` of the <Stream>
-    URL together with the Plivo call fields.
+    The answer_url query string may carry the ``greeting``. It travels to /ws in the base64
+    ``body`` of the <Stream> URL together with the Plivo call fields.
     """
     call_uuid = CallUUID
     from_number = From
     to_number = To
-    details = {name: request.query_params.get(name, "").strip() for name in CALL_DETAIL_PARAMS}
+    greeting = request.query_params.get(GREETING_PARAM, "").strip()
 
     parent_call_uuid = ""
     sip_headers = {}
@@ -377,10 +382,9 @@ async def outbound_answer_webhook(
         except Exception as e:
             logger.warning(f"Could not parse answer webhook form: {e}")
 
-    provided = [name for name, value in details.items() if value]
     logger.bind(call_id=call_uuid).info(
         f"Outbound call answered: CallUUID={call_uuid}, To={to_number}, "
-        f"call details: {', '.join(provided) or 'none (neutral defaults)'}"
+        f"greeting: {'from answer_url' if greeting else 'default'}"
     )
 
     body_data = {
@@ -389,7 +393,7 @@ async def outbound_answer_webhook(
         "to": to_number,
         "parent_call_uuid": parent_call_uuid,
         "sip_headers": sip_headers,
-        **details,
+        GREETING_PARAM: greeting,
     }
     ws_url = stream_url(body_data)
     logger.info(f"Outbound WebSocket URL: {ws_url.split('?')[0]}")
@@ -459,9 +463,6 @@ async def websocket_endpoint(
             f"Plivo stream started: callId={call_id}, streamId={stream_id}"
         )
 
-        # Per-call context from the answer_url query string (renders prompt + greeting)
-        details = {name: str(call_data.get(name) or "") for name in CALL_DETAIL_PARAMS}
-
         await run_agent(
             websocket=websocket,
             call_id=call_id,
@@ -471,8 +472,8 @@ async def websocket_endpoint(
             parent_call_id=call_data.get("parent_call_uuid", ""),
             sip_headers=call_data.get("sip_headers"),
             hangup_callback=functools.partial(_hangup_call, call_id),
+            greeting=str(call_data.get(GREETING_PARAM) or ""),
             saved_agent_models=_saved_agent_models or None,
-            **details,
         )
 
     except WebSocketDisconnect:

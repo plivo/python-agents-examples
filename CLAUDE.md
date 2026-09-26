@@ -138,7 +138,7 @@ The system prompt is loaded only from `inbound/system_prompt.md` / `outbound/sys
 
 ## Outbound Calls
 
-New examples use the simple outbound path: Plivo Make Call API → `answer_url` (`/outbound/answer?opening_reason=…&objective=…&context=…`, per-call context as query params) → `<Stream>` (context in the base64 `body`) → `/ws` → agent renders prompt + greeting. The server has no dial endpoint and no `CallManager`/campaign/status tracking; `/outbound/hangup` only logs. Reference: `deepgram-voiceagent/`. Existing examples with `CallManager`, `OutboundCallRecord` and `POST /outbound/call` are legacy; don't add them to new ones.
+New examples use the simple outbound path: Plivo Make Call API → `answer_url` (`/outbound/answer?greeting=…`, the greeting as an optional query param, spoken verbatim; a default applies when absent) → `<Stream>` (greeting in the base64 `body`) → `/ws` → agent. The system prompt is `outbound/system_prompt.md` as is (no per-call templating; customize the use case in the file). The server has no dial endpoint and no `CallManager`/campaign/status tracking; `/outbound/hangup` only logs. Reference: `deepgram-voiceagent/`. Existing examples with `CallManager`, `OutboundCallRecord` and `POST /outbound/call` are legacy; don't add them to new ones.
 
 ## utils.py Requirements
 
@@ -157,6 +157,8 @@ For native examples, also:
 - `SileroVADProcessor` class (reference: `grok3-voice-native/utils.py`)
 
 For framework examples: no VAD in utils (framework handles it).
+
+**Exception — pipelines with no conversion or transcoding.** When the API accepts and emits Plivo's own format (μ-law 8kHz) end to end, the agent never decodes, encodes or resamples audio. Such an example omits `ulaw_to_pcm`, `pcm_to_ulaw`, `resample_audio`, the decode table and the sample-rate constants, and does not carry `numpy`/`scipy` as runtime dependencies for them. `plivo_to_{api}` / `{api}_to_plivo` stay as documented pass-throughs, and `normalize_phone_number` stays. Tests that need to decode recordings (RMS, transcription) keep a small decoder in `tests/helpers.py` instead. Reference: `deepgram-voiceagent/` (Deepgram Voice Agent configured for `mulaw` 8000 in and out). Unused code that exists only to satisfy this list is not required.
 
 ## VAD Strategy
 
