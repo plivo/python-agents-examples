@@ -4,7 +4,7 @@ Plivo bidirectional audio streaming bridged over raw `websockets` + asyncio (no 
 - Models are `.env` config passed verbatim into Settings. Defaults: listen Deepgram Flux `flux-general-en` (`version: v2`, `eot_threshold` 0.7, `eot_timeout_ms` 5000) for end-of-turn detection with no client-side VAD; think `open_ai` `gpt-4.1-mini` hosted by Deepgram with 5 client-side functions (`end_call`/`transfer_call` use `defer_until_eot`); speak Aura-2 `aura-2-thalia-en`.
 - Barge-in on Deepgram `UserStartedSpeaking` while audio is playing: Deepgram cancels its LLM/TTS; the client drains the send queue, sends Plivo `clearAudio` and drops late agent audio until the next user end-of-turn (`ConversationText` user / `EndOfTurn`).
 - Playback end is tracked with Plivo `checkpoint`/`playedStream`; `end_call` hangs up via Plivo REST `calls.delete` after the goodbye's checkpoint is played (15s fallback deadline).
-- Two agent-definition paths per direction: inline (default) sends the full `agent` block in Settings with `agent.greeting`; with `DEEPGRAM_INBOUND_AGENT_ID`/`DEEPGRAM_OUTBOUND_AGENT_ID` set to a Deepgram reusable agent config UUID, Settings sends `agent: "<uuid>"`, then `UpdatePrompt` (per-call context; outbound adds a "This Call" section) and `InjectAgentMessage` (greeting) follow `SettingsApplied`.
+- Two agent-definition paths per direction: inline (default) sends the full `agent` block in Settings with `agent.greeting`; with `DEEPGRAM_INBOUND_AGENT_ID`/`DEEPGRAM_OUTBOUND_AGENT_ID` set to a Deepgram reusable agent config UUID, Settings sends `agent: "<uuid>"`, then `UpdatePrompt` (per-call context) and `InjectAgentMessage` (greeting) follow `SettingsApplied`.
 
 ## Features
 
@@ -15,7 +15,7 @@ Plivo bidirectional audio streaming bridged over raw `websockets` + asyncio (no 
 - **Barge-in**: `UserStartedSpeaking` → queue drain + `clearAudio` (with `streamId`), plus a drop gate for late audio from the cancelled response.
 - **Function calling**: order status, SMS, callbacks, transfers and `end_call`, all executed client-side through `FunctionCallRequest`/`FunctionCallResponse`.
 - **Graceful hangup**: the goodbye plays in full, the checkpoint is acknowledged, and then the call is hung up via REST.
-- **Inbound and outbound**: the inbound server auto-configures the Plivo application and number webhooks on startup. Outbound calls are placed with Plivo's Make Call API directly; the per-call context (`opening_reason`, `objective`, `context`) rides on the `answer_url` query string, and the outbound server only answers the webhooks and bridges audio.
+- **Inbound and outbound**: the inbound server auto-configures the Plivo application and number webhooks on startup. Outbound calls are placed with Plivo's Make Call API directly; the greeting rides on the `answer_url` query string (`greeting`, spoken verbatim as Deepgram's `agent.greeting`), and the outbound server only answers the webhooks and bridges audio.
 - **Structured events**: `call_answered`, `user_text`, `agent_text`, `turn_complete` (with Deepgram `LatencyReport` fields) and `session_end`.
 - **Inline or reusable agent config**: send the agent definition in every `Settings` (default), or store it once in your Deepgram project and reference it by UUID; see [Choosing a path](#choosing-a-path-inline-vs-reusable-agent-config).
 - **Text injection**: Plivo `{"event": "text", "text": "..."}` messages are forwarded as Deepgram `InjectUserMessage` (used by the E2E tests).
@@ -76,7 +76,7 @@ set -a && source .env && set +a   # PLIVO_AUTH_ID / PLIVO_AUTH_TOKEN in the shel
 curl -X POST "https://api.plivo.com/v1/Account/$PLIVO_AUTH_ID/Call/" \
   -u "$PLIVO_AUTH_ID:$PLIVO_AUTH_TOKEN" -H "Content-Type: application/json" \
   -d '{"from": "<your Plivo number>", "to": "+1234567890",
-       "answer_url": "https://<random>.trycloudflare.com/outbound/answer?opening_reason=you%20requested%20a%20demo",
+       "answer_url": "https://<random>.trycloudflare.com/outbound/answer?greeting=Hi%2C%20this%20is%20Alex%20from%20TechFlow.%20Is%20now%20a%20good%20time%20for%20a%20quick%20chat%3F",
        "hangup_url": "https://<random>.trycloudflare.com/outbound/hangup",
        "answer_method": "POST", "hangup_method": "POST"}'
 ```
@@ -114,9 +114,9 @@ deepgram-voiceagent/
 │   └── system_prompt.md    # Inbound system prompt
 ├── outbound/
 │   ├── __init__.py
-│   ├── agent.py            # Same agent + build_outbound_prompt(), build_outbound_greeting(), outbound call-context labels
+│   ├── agent.py            # Same agent + DEFAULT_OUTBOUND_GREETING, outbound call-context labels
 │   ├── server.py           # FastAPI: /, /outbound/answer (answer_url call details -> Stream body), /outbound/hangup (logs), /ws + _hangup_call()
-│   └── system_prompt.md    # Outbound prompt ({{greeting}}, {{opening_reason}}, {{objective}}, {{context}})
+│   └── system_prompt.md    # Outbound prompt, sent as is
 ├── utils.py                # μ-law codec, resample_audio, plivo_to_deepgram/deepgram_to_plivo (pass-through), normalize_phone_number, --tunnel helpers
 ├── tests/
 │   ├── __init__.py
@@ -162,8 +162,8 @@ Three concurrent asyncio tasks, following the canonical `FIRST_COMPLETED` patter
 
 ### Call sequence
 
-1. `/answer` (inbound) or `/outbound/answer` (outbound) returns `<Stream bidirectional keepCallAlive contentType="audio/x-mulaw;rate=8000">` pointing at `/ws`. Call metadata (`call_uuid`, `from`, `to`, `parent_call_uuid`, `sip_headers`, plus the `answer_url`'s `opening_reason`/`objective`/`context` for outbound) travels as base64 JSON in `?body=`.
-2. `/ws` waits for Plivo `start` (`callId`, `streamId`), then calls `run_agent(...)` with `hangup_callback=functools.partial(_hangup_call, callId)`. Outbound `run_agent()` renders the prompt (`build_outbound_prompt()`) and greeting (`build_outbound_greeting()`) from the call details.
+1. `/answer` (inbound) or `/outbound/answer` (outbound) returns `<Stream bidirectional keepCallAlive contentType="audio/x-mulaw;rate=8000">` pointing at `/ws`. Call metadata (`call_uuid`, `from`, `to`, `parent_call_uuid`, `sip_headers`, plus the `answer_url`'s `greeting` for outbound) travels as base64 JSON in `?body=`.
+2. `/ws` waits for Plivo `start` (`callId`, `streamId`), then calls `run_agent(...)` with `hangup_callback=functools.partial(_hangup_call, callId)`. Outbound `run_agent()` passes the `greeting` through unchanged (`DEFAULT_OUTBOUND_GREETING` when absent).
 3. **Handshake** (`_handshake()`): `Welcome{request_id}` → send `Settings` exactly once → `SettingsApplied`, all within 10s. No audio or text goes upstream before `SettingsApplied`; buffered input is flushed right after.
 4. **Greeting**: Deepgram speaks `agent.greeting`. Binary μ-law audio may arrive before `ConversationText{assistant}` (→ `agent_text`, turn 1). `AgentAudioDone` → a `_Checkpoint` is queued behind the last chunk → Plivo `playedStream` → `turn_complete`.
 5. **User turn**: Flux detects end-of-turn → `ConversationText{user}` (→ `user_text`, TTFS clock starts) and `EndOfTurn` → `ConversationText{assistant}` (→ `agent_text`) and binary audio, interleaved with single-key `LatencyReport` messages → `AgentAudioDone` → checkpoint → `playedStream` → `turn_complete`.
@@ -178,7 +178,7 @@ Three concurrent asyncio tasks, following the canonical `FIRST_COMPLETED` patter
 | Module import | `inbound/agent.py`, `outbound/agent.py` | `load_dotenv()`, read the `DEEPGRAM_*` config, load `system_prompt.md`, define `FUNCTION_DEFINITIONS`. No network calls. |
 | Server start: `uv run python -m inbound.server` | `inbound/server.py` → `main()` | Logging sinks (text/JSON/file/Redis) and optional OTel are set up when the module loads. Then `describe_deepgram_agent()` logs the active path, e.g. `Deepgram agent: inline (listen=flux-general-en, think=open_ai/gpt-4.1-mini, speak=aura-2-thalia-en)` or `Deepgram agent: reusable config <uuid> …`. On the reusable path, `verify_deepgram_agent_id()` looks the UUID up in the API key's Deepgram project (`GET /v1/projects`, then `/projects/{id}/agents/{uuid}`) and **exits with code 1 if it isn't found**; when found, it keeps the config's model names for trace attributes. It warns and starts anyway if it can't check (network error, key without `agent:read`). `check_webhook_auth_config()` then **exits with code 1 if `PLIVO_AUTH_TOKEN` is empty** (see [Webhook authentication](#webhook-authentication)). Then `configure_plivo_webhooks()` creates or updates the Plivo application and assigns `PLIVO_PHONE_NUMBER` when `PUBLIC_URL` is set (with `--tunnel`, in a background thread that retries until Plivo accepts the new URL), then uvicorn starts. `Ready! Call +N to talk to the agent (Ctrl+C to stop)` is logged once, when both the server accepts connections (a local TCP connect to `SERVER_PORT`; the lifespan hook runs before uvicorn binds) and the Plivo setup succeeded. No Ready line if the Plivo setup fails or is skipped. |
 | Server start: `uv run python -m outbound.server` | `outbound/server.py` → `main()` | Same agent-path log line, reusable-config ID check and webhook-auth check, then uvicorn on `OUTBOUND_SERVER_PORT` (default 8001). Once the server accepts connections it logs `Ready!` with a cURL for Plivo's Make Call API and this server's answer URL, ending with `(Ctrl+C to stop)`. There is no number auto-config, because you pass the answer and hangup URLs with each call. |
-| You place a call (Plivo Make Call API) | your shell / backend → Plivo | `POST https://api.plivo.com/v1/Account/{auth_id}/Call/` with `from`, `to`, `answer_url=<PUBLIC_URL>/outbound/answer?opening_reason=…&objective=…&context=…` and optional `hangup_url`. The server has no dial endpoint and keeps no call records. |
+| You place a call (Plivo Make Call API) | your shell / backend → Plivo | `POST https://api.plivo.com/v1/Account/{auth_id}/Call/` with `from`, `to`, `answer_url=<PUBLIC_URL>/outbound/answer?greeting=…` and optional `hangup_url`. The server has no dial endpoint and keeps no call records. |
 | Plivo answers (`/answer` or `/outbound/answer`) | `server.py` | `verify_plivo_signature()` checks Plivo's V3 signature (403 if invalid). Then returns `<Stream bidirectional keepCallAlive>` XML that points Plivo at `/ws`. Call metadata (and, outbound, the `answer_url` call details) travels as base64 JSON in `?body=`, percent-encoded so a `+` in the base64 isn't read as a space. |
 | Each call (`/ws`) | `server.py` → `run_agent()` in `agent.py` | Accepts the WebSocket, reads Plivo's `start` event, then runs `DeepgramVoiceAgent.run()`. That opens a **new** Deepgram WebSocket for the call, sends Settings (inline block or reusable config UUID), sends `UpdatePrompt` + `InjectAgentMessage` on the reusable path, and runs the `plivo_rx` / `deepgram_rx` / `plivo_tx` tasks until the call ends. There is no Deepgram connection before a call arrives. |
 | `end_call` tool | `agent.py` → `hangup_callback` | After the goodbye has played, the agent calls `_hangup_call()` from `server.py`, which hangs up via the Plivo REST API. Plivo credentials never leave `server.py`. |
@@ -192,7 +192,7 @@ Both servers are exposed on a public URL, so they accept only requests that come
 - **Plivo webhooks** (`/answer`, `/hangup`, `/fallback`, `/hold`, `/outbound/answer`, `/outbound/hangup`) must carry a valid [Plivo V3 signature](https://www.plivo.com/docs/voice/concepts/signature-validation) (`X-Plivo-Signature-V3` + `X-Plivo-Signature-V3-Nonce`, an HMAC-SHA256 signature keyed with `PLIVO_AUTH_TOKEN`). `verify_plivo_signature()`, a FastAPI dependency in each `server.py`, checks them with the Plivo SDK's `validate_v3_signature()`. The signed params are the form fields for POST and the query string for GET. Otherwise the request gets **403** and a warning is logged with the path and reason (`missing …` or `signature mismatch`). Signatures are never logged.
 - **`/ws`** is not a Plivo webhook, so its handshake is not signed, and it has no extra check of its own, like the other examples in this repo. The stream URL (`wss://…/ws?body=<metadata>`) is only handed to Plivo in the signed answer webhook's `<Stream>` XML.
 
-**`PUBLIC_URL` must be exactly the URL Plivo is configured to call.** Plivo signs the URL it requested. Behind a tunnel or reverse proxy, this server sees `http://localhost:8000/...` instead, so the signed URL is rebuilt as `PUBLIC_URL` (trailing `/` stripped) + request path + raw query string. `request.url` is not used. The scheme (`https` vs `http`), the host and any path prefix must match the answer and hangup URLs in the Plivo application or Make Call request. `PUBLIC_URL=https://agent.example.com` and `https://agent.example.com/` are equivalent. `http://agent.example.com` or another hostname for the same server is not. The outbound `answer_url` query string (`opening_reason`, `objective`, `context`) is part of what Plivo signs: for a POST, the Plivo SDK's base string is `<url>?<query params sorted, URL-decoded>.<form params sorted, name+value concatenated>`. Editing the query string therefore invalidates the signature. This was verified live against Plivo's own signatures (`Plivo signature verified: POST /outbound/answer + query string` in the log).
+**`PUBLIC_URL` must be exactly the URL Plivo is configured to call.** Plivo signs the URL it requested. Behind a tunnel or reverse proxy, this server sees `http://localhost:8000/...` instead, so the signed URL is rebuilt as `PUBLIC_URL` (trailing `/` stripped) + request path + raw query string. `request.url` is not used. The scheme (`https` vs `http`), the host and any path prefix must match the answer and hangup URLs in the Plivo application or Make Call request. `PUBLIC_URL=https://agent.example.com` and `https://agent.example.com/` are equivalent. `http://agent.example.com` or another hostname for the same server is not. The outbound `answer_url` query string (`greeting`) is part of what Plivo signs: for a POST, the Plivo SDK's base string is `<url>?<query params sorted, URL-decoded>.<form params sorted, name+value concatenated>`. Editing the query string therefore invalidates the signature. This was verified live against Plivo's own signatures (`Plivo signature verified: POST /outbound/answer + query string` in the log).
 
 **`--tunnel`**: the quick-tunnel URL becomes `PUBLIC_URL` at startup, and the verifier reads it on each request, so signatures are checked against the tunnel URL. The inbound server points the number at that same URL. For outbound, use the tunnel URL from the `Ready!` line in your `answer_url`.
 
@@ -234,13 +234,13 @@ Both servers are exposed on a public URL, so they accept only requests that come
       "functions": "<FUNCTION_DEFINITIONS: 5 entries, see Function Calling>"
     },
     "speak": {"provider": {"type": "deepgram", "model": "aura-2-thalia-en"}},
-    "greeting": "<initial_message: AGENT_GREETING (inbound) or build_outbound_greeting() (outbound)>"
+    "greeting": "<initial_message: AGENT_GREETING (inbound) or the answer_url greeting / DEFAULT_OUTBOUND_GREETING (outbound)>"
   }
 }
 ```
 
 - The listen/think/speak values come from the `DEEPGRAM_LISTEN_*`, `DEEPGRAM_THINK_*` and `DEEPGRAM_SPEAK_*` env vars (defaults shown); see [Model Configuration](#model-configuration). `tags` is `["plivo", EXAMPLE_NAME]`.
-- `agent.greeting` is spoken **verbatim** by TTS; it is not an instruction to the LLM. Outbound `build_outbound_greeting()` therefore builds a literal greeting from `opening_reason`, or uses `DEFAULT_OUTBOUND_GREETING`.
+- `agent.greeting` is spoken **verbatim** by TTS; it is not an instruction to the LLM. Outbound takes it as is from the `answer_url` `greeting` query param, or uses `DEFAULT_OUTBOUND_GREETING`.
 - The call context labels the numbers by direction. Inbound: `Caller's phone number` (Plivo `From`). Outbound: `Customer's phone number (the person you called)` (`To`, used for SMS and callbacks) and `Our business phone number (caller ID the customer sees)` (`From`, given if the customer asks how to reach us).
 - Do **not** add `agent.language` or `speak.provider.language`. With this configuration Deepgram replies with an `Error` and the session ends.
 - `eot_threshold` sets how confident Flux must be before ending the turn; lower values reply faster but risk cutting the caller off. `eot_timeout_ms` forces an end of turn after that much silence, whatever the confidence.
@@ -264,7 +264,7 @@ Path 1: inline                                 Path 2: reusable config
 Welcome                                        Welcome
 Settings {agent: {listen, think, speak,        Settings {agent: "<uuid>"}
   prompt + call context, functions, greeting}} SettingsApplied
-SettingsApplied                                UpdatePrompt        (call context; outbound: "This Call")
+SettingsApplied                                UpdatePrompt        (call context)
 greeting audio                                 InjectAgentMessage  (greeting)
                                                greeting audio
 ```
@@ -273,7 +273,7 @@ On Path 2 a UUID reference is all-or-nothing: no inline `agent` fields can be mi
 
 [Deepgram's reusable agent configurations](https://developers.deepgram.com/docs/reusable-agent-configurations) exist so that an agent definition can be stored once and referenced by ID instead of being resent in every `Settings`. Deepgram lists these use cases: per-customer configs, regional or regulatory compliance, A/B testing voices or prompts, and multi-agent architectures.
 
-With a UUID set, Deepgram receives **only the UUID**. The `DEEPGRAM_LISTEN_*`, `DEEPGRAM_THINK_*`, `DEEPGRAM_SPEAK_*` vars, the prompt file (`inbound/system_prompt.md`; outbound: `outbound/system_prompt.md` rendered by `build_outbound_prompt()` with pointers to "This Call") and `FUNCTION_DEFINITIONS` matter only at the moment you create the config. `AGENT_GREETING` (inbound), the outbound greeting and "This Call" details, and the per-call context still apply on every call.
+With a UUID set, Deepgram receives **only the UUID**. The `DEEPGRAM_LISTEN_*`, `DEEPGRAM_THINK_*`, `DEEPGRAM_SPEAK_*` vars, the prompt file (`inbound/system_prompt.md` or `outbound/system_prompt.md`) and `FUNCTION_DEFINITIONS` matter only at the moment you create the config. `AGENT_GREETING` (inbound), the outbound `greeting`, and the per-call context still apply on every call.
 
 ### Creating a reusable config
 
@@ -306,23 +306,15 @@ print(json.dumps({"config": json.dumps(config), "metadata": meta}))
 EOF
 ```
 
-**Outbound** (`DEEPGRAM_OUTBOUND_AGENT_ID`). The saved prompt cannot hold one call's details, so the template's `{{greeting}}`, `{{opening_reason}}`, `{{objective}}` and `{{context}}` are filled with pointers to the `## This Call` section. Each call appends that section with `UpdatePrompt`: the greeting already spoken, the opening reason, the objective and the extra context (neutral wording for any the `answer_url` did not carry), followed by the call context.
+**Outbound** (`DEEPGRAM_OUTBOUND_AGENT_ID`). The saved prompt is `outbound/system_prompt.md` as is. Each call appends the call context with `UpdatePrompt` and speaks the `answer_url` greeting with `InjectAgentMessage`.
 
 ```bash
 uv run python - <<'EOF' | curl -sS -X POST "https://api.deepgram.com/v1/projects/$DG_PROJECT_ID/agents" \
   -H "Authorization: Token $DEEPGRAM_API_KEY" -H "Content-Type: application/json" -d @-
 import json
-from outbound.agent import DeepgramVoiceAgent, build_outbound_prompt
+from outbound.agent import DeepgramVoiceAgent
 
-prompt = build_outbound_prompt(
-    opening_reason='[the opening reason under "This Call" below]',
-    objective='[the objective under "This Call" below]',
-    context='See "This Call" below.',
-    greeting='the greeting quoted under "This Call" below.',
-)
-agent = DeepgramVoiceAgent(
-    websocket=None, call_id="create-config", system_prompt=prompt, agent_config_id=""
-)
+agent = DeepgramVoiceAgent(websocket=None, call_id="create-config", agent_config_id="")
 config = agent._build_settings()["agent"]
 del config["greeting"]  # sent per call with InjectAgentMessage
 meta = {"example": "deepgram-voiceagent", "direction": "outbound"}
@@ -360,13 +352,13 @@ You place outbound calls with [Plivo's Make Call API](https://www.plivo.com/docs
 ```
 your shell / backend ──POST /v1/Account/{auth_id}/Call/──► Plivo ──dials──► callee
                                                              │ callee answers
-                        /outbound/answer?opening_reason=…  ◄─┘ (answer_url)
-                          └─► <Stream> ─► /ws ─► run_agent(opening_reason, objective, context)
+                        /outbound/answer?greeting=…       ◄─┘ (answer_url)
+                          └─► <Stream> ─► /ws ─► run_agent(greeting)
 ```
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/outbound/answer` | GET/POST | Plivo answer webhook (your `answer_url`). Reads the optional query params `opening_reason`, `objective` and `context`, plus Plivo's `CallUUID`/`From`/`To`/`ParentCallUUID`/`SIP-*` fields, and returns `<Stream>` to `/ws` with them in the base64 `body` |
+| `/outbound/answer` | GET/POST | Plivo answer webhook (your `answer_url`). Reads the optional query param `greeting`, plus Plivo's `CallUUID`/`From`/`To`/`ParentCallUUID`/`SIP-*` fields, and returns `<Stream>` to `/ws` with them in the base64 `body` |
 | `/outbound/hangup` | POST | Plivo hangup webhook (your optional `hangup_url`); logs `CallUUID`, `Duration`, `HangupCause` |
 | `/ws` | WebSocket | Plivo audio stream; runs the agent |
 | `/` | GET | Health check |
@@ -377,20 +369,18 @@ Once it accepts connections, the server logs a `Ready!` line with the cURL below
 curl -X POST "https://api.plivo.com/v1/Account/$PLIVO_AUTH_ID/Call/" \
   -u "$PLIVO_AUTH_ID:$PLIVO_AUTH_TOKEN" -H "Content-Type: application/json" \
   -d '{"from": "+14155550100", "to": "+1234567890",
-       "answer_url": "https://your-host.example.com/outbound/answer?opening_reason=your%20recent%20demo%20request&objective=book%20a%20meeting%20with%20sales",
+       "answer_url": "https://your-host.example.com/outbound/answer?greeting=Hi%2C%20this%20is%20Alex%20from%20TechFlow.%20I%27m%20reaching%20out%20because%20you%20requested%20a%20demo.%20Is%20now%20a%20good%20time%20for%20a%20quick%20chat%3F",
        "hangup_url": "https://your-host.example.com/outbound/hangup",
        "answer_method": "POST", "hangup_method": "POST"}'
 ```
 
-URL-encode each query value. From Python, `plivo.RestClient().calls.create(from_=..., to_=..., answer_url=..., answer_method="POST", hangup_url=...)` does the same (see `tests/test_outbound_call.py`).
+URL-encode the query value. From Python, `plivo.RestClient().calls.create(from_=..., to_=..., answer_url=..., answer_method="POST", hangup_url=...)` does the same (see `tests/test_outbound_call.py`).
 
 | `answer_url` param | Used for | When missing |
 |---|---|---|
-| `opening_reason` | Greeting: *"Hi, this is Alex from TechFlow. I'm reaching out because {opening_reason}. Is now a good time for a quick chat?"*; the prompt's "you are calling about" | `DEFAULT_OUTBOUND_GREETING` ("…following up on your recent interest in our products…") and a matching neutral reason |
-| `objective` | The prompt's objective | Qualify interest and offer a meeting with sales |
-| `context` | The prompt's "Additional Context" | "No additional context was provided for this call." |
+| `greeting` | Deepgram's `agent.greeting` (inline) or `InjectAgentMessage` (reusable config): spoken **verbatim** by TTS when the callee answers, exactly as passed | `DEFAULT_OUTBOUND_GREETING` ("Hi, this is Alex from TechFlow, following up on your recent interest in our products. Is now a good time for a quick chat?") |
 
-`build_outbound_prompt()` fills `{{greeting}}` (the exact greeting spoken), `{{opening_reason}}`, `{{objective}}` and `{{context}}` in `outbound/system_prompt.md`, so the LLM never sees an unfilled placeholder. On the reusable-config path the same values go into the "This Call" `UpdatePrompt` section. For status, duration or recordings, use Plivo's Call API and call logs, or your `hangup_url`.
+The greeting is the only per-call input. The system prompt is `outbound/system_prompt.md` as is (plus the call context); it tells the LLM that the greeting has already been spoken, so write the prompt for your use case there. For status, duration or recordings, use Plivo's Call API and call logs, or your `hangup_url`.
 
 ## Function Calling
 
@@ -552,7 +542,7 @@ docker run -v "$PWD/my_outbound_prompt.md:/app/outbound/system_prompt.md:ro" \
   uv run python -m outbound.server
 ```
 
-The outbound file is a template: keep `{{greeting}}`, `{{opening_reason}}`, `{{objective}}` and `{{context}}` where the per-call values should go (any you leave out are simply not used). On the reusable-config path the prompt is fixed when the config is created, so create a new config after changing it.
+Both files are sent as is; there is no templating. On the reusable-config path the prompt is fixed when the config is created, so create a new config after changing it.
 
 ## Model Configuration
 
