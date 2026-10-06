@@ -28,10 +28,10 @@ PLIVO_PHONE_NUMBER = os.getenv("PLIVO_PHONE_NUMBER", "")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "")
 
 app = FastAPI(
-    title="GPT-4o Deepgram OpenAI-TTS Pipecat Voice Agent (Inbound)",
+    title="GPT-4o Modulate Velma-2 Cartesia Sonic Pipecat Voice Agent (Inbound)",
     description=(
-        "Inbound voice agent using GPT-4o-mini LLM, Deepgram STT, "
-        "GPT-4o-mini-TTS with Pipecat and Plivo telephony"
+        "Inbound voice agent using GPT-4o LLM, Modulate Velma-2 STT, "
+        "Cartesia Sonic TTS and Tavily web search, with Pipecat and Plivo telephony"
     ),
     version="0.1.0",
 )
@@ -125,7 +125,7 @@ async def health_check() -> dict:
     phone = normalize_phone_number(PLIVO_PHONE_NUMBER)
     return {
         "status": "ok",
-        "service": "gpt4o-deepgramnova3-openaitts4o-pipecat-inbound",
+        "service": "gpt4o-modulatevelma2-cartesiasonic3-pipecat-inbound",
         "phone_number": f"+{phone}" if phone else "not configured",
     }
 
