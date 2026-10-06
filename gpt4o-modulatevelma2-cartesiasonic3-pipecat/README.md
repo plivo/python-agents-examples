@@ -1,4 +1,4 @@
-# GPT-4o + Modulate Velma-2 STT + Cartesia Sonic TTS — Pipecat Voice Agent
+# GPT-4o + Modulate Velma-2 STT + Cartesia Sonic TTS (Pipecat Voice Agent)
 
 Pipecat framework orchestration. Plivo μ-law 8kHz streams into `FastAPIWebsocketTransport` via `PlivoFrameSerializer`, which decodes to PCM16 and drives Silero VAD (ONNX v5) on the user aggregator. STT is Modulate `velma-2` over WebSocket at `wss://platform.modulate.ai/api/velma-2-streaming`, taking raw s16le at the pipeline sample rate with the API key as a query parameter and one JSON config frame before any audio; `partial_clip` events become interim transcripts and `clip` events final ones, each carrying optional emotion, accent and synthetic-voice score which are logged and attached to the frame's `result`. LLM is OpenAI `gpt-4o` with one registered tool, `search_the_web`, backed by Tavily at `search_depth=fast` (measured 1.27s median against 5.46s for `advanced`, which is long enough on a live call that the caller assumes the line dropped). TTS is Cartesia `sonic-3.6`, returned as PCM and resampled to μ-law 8kHz by the serializer. Barge-in is handled by Pipecat interruption handling, which cancels in-flight LLM and TTS frames and emits `clearAudio` to Plivo.
 
@@ -146,14 +146,14 @@ the per-clip emotion and synthetic-voice scores are the live ones.
 
 ## Troubleshooting
 
-**No audio in either direction** — check `PUBLIC_URL` matches the running
+**No audio in either direction.** Check `PUBLIC_URL` matches the running
 tunnel and that the Plivo number's answer URL points at `/answer`.
 
-**Modulate closes immediately with code 4001** — the API key is wrong or
+**Modulate closes immediately with code 4001.** The API key is wrong or
 missing. It goes in the query string, not a header.
 
-**The agent talks over the caller** — Silero VAD is attached to the user
+**The agent talks over the caller.** Silero VAD is attached to the user
 aggregator; confirm `allow_interruptions=True` on `PipelineParams`.
 
-**Long silences before answers** — `TAVILY_SEARCH_DEPTH` is probably set to
+**Long silences before answers.** `TAVILY_SEARCH_DEPTH` is probably set to
 `advanced`. See the measurements above.
