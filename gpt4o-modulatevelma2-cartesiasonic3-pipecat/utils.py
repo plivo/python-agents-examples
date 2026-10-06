@@ -31,6 +31,7 @@ from pipecat.frames.frames import (
     StartFrame,
     TranscriptionFrame,
 )
+from pipecat.services.settings import STTSettings
 from pipecat.services.stt_service import WebsocketSTTService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.time import time_now_iso8601
@@ -391,6 +392,7 @@ def cartesia_to_plivo(pcm_24k: bytes) -> bytes:
 # =============================================================================
 
 MODULATE_STT_URL = "wss://platform.modulate.ai/api/velma-2-streaming"
+MODULATE_STT_MODEL = "velma-2"
 
 
 class ModulateSTTService(WebsocketSTTService):
@@ -423,7 +425,14 @@ class ModulateSTTService(WebsocketSTTService):
         sample_rate: int | None = None,
         **kwargs,
     ) -> None:
-        super().__init__(sample_rate=sample_rate, **kwargs)
+        # Velma-2 auto-detects language and exposes no model selector, so
+        # language is explicitly None rather than left NOT_GIVEN; the base
+        # class asserts every settings field has a real value.
+        super().__init__(
+            sample_rate=sample_rate,
+            settings=STTSettings(model=MODULATE_STT_MODEL, language=None),
+            **kwargs,
+        )
         self._api_key = api_key
         self._config = json.dumps(
             {

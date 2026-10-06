@@ -59,13 +59,13 @@ ngrok http 8000
 Inbound:
 
 ```bash
-uv run python inbound/server.py
+uv run python -m inbound.server
 ```
 
 Outbound:
 
 ```bash
-uv run python outbound/server.py
+uv run python -m outbound.server
 ```
 
 The server configures the webhooks on `PLIVO_PHONE_NUMBER` at startup, so an
