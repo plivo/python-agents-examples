@@ -210,7 +210,21 @@ class ModulateSTTService(WebsocketSTTService):
             # error messages, so neither the URL nor the exception text is ever
             # logged or re-raised: only the exception type and HTTP status.
             status = getattr(getattr(e, "response", None), "status_code", None)
-            detail = type(e).__name__ + (f", HTTP {status}" if status else "")
+            close_code = getattr(getattr(e, "rcvd", None), "code", None)
+            if close_code == MODULATE_AUTH_CLOSE_CODE:
+                # Modulate accepts the handshake and then closes with 4001, so a
+                # rejected key shows up here, on the configuration frame. Retrying
+                # cannot fix it.
+                self._reconnect_on_error = False
+                logger.error("Modulate rejected MODULATE_API_KEY (close 4001); not reconnecting")
+                raise ConnectionError(
+                    "Modulate Velma-2 rejected MODULATE_API_KEY (close 4001)"
+                ) from None
+            detail = type(e).__name__
+            if status:
+                detail += f", HTTP {status}"
+            if close_code:
+                detail += f", close {close_code}"
             raise ConnectionError(f"Modulate Velma-2 connect failed ({detail})") from None
         # Published only after the configuration frame is sent, so run_stt can
         # never put audio ahead of it.
