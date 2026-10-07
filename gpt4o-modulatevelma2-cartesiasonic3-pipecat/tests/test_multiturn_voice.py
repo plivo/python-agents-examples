@@ -3,9 +3,10 @@ Multi-turn voice conversation + barge-in tests against a local inbound server.
 
 The test plays Plivo's side of the bidirectional stream: it fetches the <Stream> URL from
 a Plivo-signed /answer webhook, sends the start event, then μ-law 8kHz audio in 20ms
-frames. User turns are real speech synthesised with gTTS, so they pass through Silero VAD
-and Modulate Velma-2 exactly as caller audio does. No phone call is placed and the server
-gets no Plivo account or number.
+frames. User turns are real speech synthesised with OpenAI TTS (raw PCM16 24kHz, converted
+to μ-law 8kHz by tests/helpers.py), so they pass through Silero VAD and Modulate Velma-2
+exactly as caller audio does. No phone call is placed, no tunnel is started, Plivo's API is
+never called and the server gets no Plivo account or number.
 
 Tests:
 1. Multi-turn: the opening line, then three spoken user turns; each must be answered
@@ -14,12 +15,13 @@ Tests:
    Plivo a clearAudio event (CLAUDE.md "WebSocket Protocol" step 5) and then answer the
    interrupting turn.
 
-Requirements (the tests skip, with the reason, when any is missing):
-    - OPENAI_API_KEY, MODULATE_API_KEY and CARTESIA_API_KEY in .env
-    - gTTS and pydub (not dev dependencies: `uv pip install gTTS pydub`; pydub also
-      needs `audioop-lts` on Python 3.13+), network access for gTTS
-    - ffmpeg binary available (PATH, FFMPEG_DIR, or a parent directory)
-    - Port 18004 available
+Requirements:
+    - OPENAI_API_KEY, MODULATE_API_KEY and CARTESIA_API_KEY in .env. This is the only
+      skip condition, and the skip reason names the missing keys. OPENAI_API_KEY also
+      pays for the caller's speech (model gpt-4o-mini-tts).
+    - A default `uv sync` (dev group). No gTTS, pydub, ffmpeg or other system package.
+    - Network access to OpenAI, Modulate and Cartesia; port 18004 available. A failure
+      here (speech synthesis, server start) fails the test rather than skipping it.
 
 Usage:
     uv run pytest tests/test_multiturn_voice.py -v -s
@@ -31,10 +33,6 @@ import asyncio
 import base64
 import contextlib
 import json
-import os
-import shutil
-import struct
-import tempfile
 import time
 import uuid
 
@@ -45,20 +43,19 @@ from dotenv import load_dotenv
 from tests.helpers import (
     LIVE_API_KEYS,
     TEST_AUTH_TOKEN,
-    ensure_ffmpeg_on_path,
     local_server_env,
     log_tail,
     missing_env,
+    rms_of_ulaw,
     server_log_path,
     signed_webhook,
     start_server,
     stop_server,
     stream_url_from_xml,
+    synthesize_caller_speech,
 )
-from utils import pcm_to_ulaw, ulaw_to_pcm
 
 load_dotenv()
-ensure_ffmpeg_on_path()
 
 TEST_PORT = 18004
 TEST_HTTP_URL = f"http://localhost:{TEST_PORT}"
@@ -77,12 +74,6 @@ pytestmark = pytest.mark.skipif(
 # =============================================================================
 # Helpers
 # =============================================================================
-
-
-def rms_of_ulaw(ulaw_audio: bytes) -> float:
-    pcm = ulaw_to_pcm(ulaw_audio)
-    samples = struct.unpack(f"{len(pcm) // 2}h", pcm)
-    return (sum(s * s for s in samples) / max(len(samples), 1)) ** 0.5
 
 
 class SimulatedCaller:
@@ -180,41 +171,27 @@ def stream_url(call_uuid: str) -> str:
 
 @pytest.fixture(scope="module")
 def synthesize():
-    """text -> μ-law 8kHz speech via gTTS; skips the module when it cannot be produced."""
-    gtts = pytest.importorskip("gtts", reason="gTTS not installed (uv pip install gTTS pydub)")
-    pydub = pytest.importorskip(
-        "pydub", reason="pydub not importable (uv pip install pydub; audioop-lts on 3.13+)"
-    )
-    if not shutil.which("ffmpeg"):
-        pytest.skip("ffmpeg not found (PATH, FFMPEG_DIR or a parent directory)")
+    """text -> μ-law 8kHz caller speech via OpenAI TTS. Never skips: an error fails the test."""
 
     def synth(text: str) -> bytes:
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-            mp3_path = f.name
-        try:
-            try:
-                gtts.gTTS(text=text, lang="en").save(mp3_path)
-            except Exception as e:  # gTTS needs network access to Google
-                pytest.skip(f"gTTS could not synthesise speech: {type(e).__name__}: {e}")
-            audio = pydub.AudioSegment.from_mp3(mp3_path)
-            audio = audio.set_frame_rate(8000).set_channels(1).set_sample_width(2)
-            ulaw = pcm_to_ulaw(audio.raw_data)
-        finally:
-            with contextlib.suppress(OSError):
-                os.unlink(mp3_path)
+        ulaw = synthesize_caller_speech(text)
         assert len(ulaw) > 4000, f"Synthesised speech too short for '{text}'"
+        assert rms_of_ulaw(ulaw) > 500, f"Synthesised speech for '{text}' is silence"
         return ulaw
 
     return synth
 
 
 @pytest.fixture(scope="module")
-def server_process(synthesize):
+def server_process():
     """Inbound server on TEST_PORT (SIGTERM -> wait(5) -> SIGKILL on teardown).
 
-    Depends on ``synthesize`` so no server is started when the speech deps are missing.
+    The env is safe for a local test: dummy PLIVO_AUTH_TOKEN, no Plivo auth ID or number,
+    PUBLIC_URL on localhost. A server that does not start fails the test (no skip).
     """
-    proc = start_server("inbound.server", TEST_PORT, LOG_PATH, local_server_env(TEST_PORT))
+    proc = start_server(
+        "inbound.server", TEST_PORT, LOG_PATH, local_server_env(TEST_PORT), required=True
+    )
     print(f"\n[server] logs: {LOG_PATH}")
     yield proc
     stop_server(proc)

@@ -17,7 +17,7 @@ Pipecat framework orchestration over Plivo telephony. Plivo's bidirectional stre
 
 ## Prerequisites
 
-- Python 3.10+ and [uv](https://docs.astral.sh/uv/)
+- Python 3.11+ and [uv](https://docs.astral.sh/uv/). Pipecat 1.x, which this example is written against (`pipecat-ai>=1.12.0`), does not support Python 3.10
 - A Plivo account: auth ID, auth token and a voice-enabled phone number
 - OpenAI API key
 - Modulate API key (platform.modulate.ai, API Keys tab)
@@ -71,11 +71,11 @@ gpt4o-modulatevelma2-cartesiasonic3-pipecat/
 │   ├── agent.py             # Same service and tool (identical copies) + verbatim greeting
 │   ├── server.py            # FastAPI: /outbound/answer, /outbound/hangup, /ws
 │   └── system_prompt.md     # Outbound system prompt
-├── utils.py                 # Phone normalization, μ-law/PCM conversion and resampling helpers
+├── utils.py                 # Phone number normalization (no audio helpers: Pipecat converts)
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py          # sys.path setup
-│   ├── helpers.py           # Server subprocess, Plivo webhook signing, ngrok, recording, transcription
+│   ├── helpers.py           # Server subprocess, webhook signing, test-only μ-law codec, caller TTS, ngrok, recording
 │   ├── test_integration.py  # Offline unit tests + local integration
 │   ├── test_e2e_live.py     # Real LLM/STT/TTS over a simulated Plivo stream (no phone call)
 │   ├── test_live_call.py    # Real inbound call
@@ -90,7 +90,7 @@ gpt4o-modulatevelma2-cartesiasonic3-pipecat/
 └── README.md
 ```
 
-`ModulateSTTService` and `search_the_web` live in `agent.py` of each direction, as identical copies, because each direction is self-contained. `utils.py` holds only utility functions; the pipeline itself does not call its audio helpers, since `PlivoFrameSerializer` does the conversion.
+`ModulateSTTService` and `search_the_web` live in `agent.py` of each direction, as identical copies, because each direction is self-contained. `utils.py` holds only `normalize_phone_number` (used by both servers). It has no μ-law, PCM or resampling helpers and the example has no `numpy`/`scipy` runtime dependency of its own: `PlivoFrameSerializer` does every conversion on the call path. The tests keep a small pure-Python G.711 codec and downsampler in `tests/helpers.py` for RMS checks, transcription and caller speech.
 
 ## How It Works
 
@@ -117,7 +117,7 @@ Plivo (μ-law 8kHz)
 | Cartesia → serializer | WebSocket | PCM16 (`pcm_s16le`) | 24 kHz |
 | Serializer → Plivo | WebSocket, base64 in JSON `playAudio` events | μ-law | 8 kHz |
 
-16 kHz and 24 kHz are Pipecat's default pipeline input and output rates (`PipelineParams.audio_in_sample_rate` / `audio_out_sample_rate`); the agents do not override them. The lock file resolves Pipecat 0.0.108 on Python 3.10 and 1.12.0 on Python 3.11+, and both use these rates and the VAD defaults below.
+16 kHz and 24 kHz are Pipecat's default pipeline input and output rates (`PipelineParams.audio_in_sample_rate` / `audio_out_sample_rate`); the agents do not override them. The lock file resolves a single Pipecat version, 1.12.0 (Python 3.11+); the rates and the VAD defaults below are that version's. `run_agent()` uses `PipelineWorker` and `WorkerRunner` (`add_workers(worker)` then `run()`), not `PipelineTask` / `PipelineRunner`, which Pipecat deprecated in 1.3.0 and removes in 2.0.0. `WorkerRunner()` is built with its defaults, so `handle_sigterm` stays `False` and uvicorn keeps its own SIGTERM handler.
 
 ### Call flow
 
@@ -194,8 +194,8 @@ The greeting is the only per-call input. The system prompt is `outbound/system_p
 | `CARTESIA_API_KEY` | Cartesia API key (TTS) | Required |
 | `TAVILY_API_KEY` | Tavily API key. Without it `search_the_web` tells the LLM that web search is not configured | Empty |
 | `LLM_MODEL` | OpenAI model | `gpt-4o` |
-| `TTS_MODEL` | Cartesia model | `sonic-3.6` |
-| `TTS_VOICE` | Cartesia voice ID | `71a7ad14-091c-4e8e-a314-022ece01c121` (British Reading Lady) |
+| `TTS_MODEL` | Cartesia model ID. `sonic-3.6` is Cartesia's current stable Sonic model and tracks its latest stable snapshot; pin a dated snapshot such as `sonic-3.6-2026-08-27` for unchanging behaviour. Older IDs (`sonic-3.5`, `sonic-3`) take the same request shape and voice IDs | `sonic-3.6` |
+| `TTS_VOICE` | Cartesia voice ID, from the Cartesia voice library or its List Voices API | `71a7ad14-091c-4e8e-a314-022ece01c121` (a Cartesia library voice) |
 | `TAVILY_SEARCH_DEPTH` | Passed to Tavily as `search_depth`: `ultra-fast`, `fast`, `basic` or `advanced` | `fast` |
 | `PLIVO_AUTH_ID` | Plivo auth ID (inbound auto-configuration; your own Make Call requests) | Required for auto-configuration |
 | `PLIVO_AUTH_TOKEN` | Plivo auth token. Also the key for webhook signature checks: both servers refuse to start without it | Required |
@@ -364,8 +364,8 @@ uv run pytest tests/test_integration.py -v -k Plivo
 # E2E with the real LLM, STT and TTS, no phone call (same three API keys, plus ffmpeg)
 uv run pytest tests/test_e2e_live.py -v -s
 
-# Multi-turn + barge-in over a simulated Plivo stream (same three API keys, plus ffmpeg,
-# gTTS and pydub, which are not dev dependencies: uv pip install gTTS pydub)
+# Multi-turn + barge-in over a simulated Plivo stream (same three API keys, nothing else:
+# the caller's speech is synthesised with OpenAI TTS as raw PCM, so no ffmpeg, gTTS or pydub)
 uv run pytest tests/test_multiturn_voice.py -v -s
 
 # Real calls (the three API keys, Plivo credentials, PLIVO_TEST_NUMBER, ngrok, ffmpeg)
@@ -375,10 +375,10 @@ uv run pytest tests/test_outbound_call.py -v -s
 
 | Test file | Port | What it covers |
 |---|---|---|
-| `test_integration.py` (`-k unit`) | none | Audio conversion, phone normalization, `ModulateSTTService._handle_event`, the Tavily tool with a stubbed client, prompts and the outbound greeting, server routes, webhook authentication for both servers |
+| `test_integration.py` (`-k unit`) | none | The test-only μ-law codec and downsampler, phone normalization, `ModulateSTTService._handle_event`, the Tavily tool with a stubbed client, prompts and the outbound greeting, `PipelineWorker` / `WorkerRunner` wiring with no Pipecat `DeprecationWarning` from the agents, server routes, webhook authentication for both servers |
 | `test_integration.py` (`-k local`) | 18001 | Health, signed and unsigned `/answer`, `playAudio` and speech energy from the opening line |
 | `test_e2e_live.py` | 18005 | Opening line transcribed with faster-whisper |
-| `test_multiturn_voice.py` | 18004 | Three spoken user turns each answered; speaking over an answer produces `clearAudio` |
+| `test_multiturn_voice.py` | 18004 | Three spoken user turns each answered; speaking over an answer produces `clearAudio`. Local only (server subprocess + simulated Plivo stream); skips only when one of the three API keys is missing, and uses `OPENAI_API_KEY` (`gpt-4o-mini-tts`) for the caller's speech |
 | `test_live_call.py` | 18002 | Real inbound call: signed webhook through the tunnel, recorded and transcribed opening line |
 | `test_outbound_call.py` | 18003 | Real outbound call via `calls.create(answer_url=…/outbound/answer?greeting=…)`: greeting spoken, hangup webhook received |
 

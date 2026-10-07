@@ -23,8 +23,6 @@ from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import (
-    CancelFrame,
-    EndFrame,
     Frame,
     InterimTranscriptionFrame,
     LLMContextFrame,
@@ -35,8 +33,7 @@ from pipecat.observers.loggers.llm_log_observer import LLMLogObserver
 from pipecat.observers.loggers.transcription_log_observer import TranscriptionLogObserver
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.runner import PipelineRunner
-from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
@@ -53,6 +50,7 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketTransport,
 )
 from pipecat.utils.time import time_now_iso8601
+from pipecat.workers.runner import WorkerRunner
 from websockets.asyncio.client import connect as websocket_connect
 from websockets.exceptions import ConnectionClosed
 from websockets.protocol import State
@@ -162,16 +160,8 @@ class ModulateSTTService(WebsocketSTTService):
         await super().start(frame)
         await self._connect()
 
-    # Pipecat 1.x disconnects in the base stop()/cancel(); 0.0.108 (the version
-    # the lock resolves on Python 3.10) does not, so these overrides stay.
-    # _disconnect() is idempotent, so the second call on 1.x is a no-op.
-    async def stop(self, frame: EndFrame) -> None:
-        await super().stop(frame)
-        await self._disconnect()
-
-    async def cancel(self, frame: CancelFrame) -> None:
-        await super().cancel(frame)
-        await self._disconnect()
+    # No stop()/cancel() overrides: WebsocketSTTService calls _disconnect() from
+    # its own stop(), cancel() and cleanup() on Pipecat 1.x.
 
     async def _connect(self) -> None:
         await super()._connect()
@@ -502,7 +492,7 @@ async def run_agent(
         logger.info(f"[Latency] user stopped -> bot started: {latency:.2f}s")
 
     # The two log observers print transcripts and LLM text at DEBUG only.
-    task = PipelineTask(
+    worker = PipelineWorker(
         pipeline,
         params=PipelineParams(
             enable_metrics=True,
@@ -522,15 +512,18 @@ async def run_agent(
         ],
         tools=tools,
     )
-    await task.queue_frames([LLMContextFrame(context=opening_context)])
+    await worker.queue_frames([LLMContextFrame(context=opening_context)])
 
-    runner = PipelineRunner()
+    # WorkerRunner's default is handle_sigterm=False, which is what running
+    # inside uvicorn needs: uvicorn keeps its own SIGTERM handler.
+    runner = WorkerRunner()
 
     try:
-        await runner.run(task)
+        await runner.add_workers(worker)
+        await runner.run()
     except Exception as e:
         logger.error(f"Pipeline error: {e}")
     finally:
         with contextlib.suppress(Exception):
-            await task.cancel()
+            await worker.cancel()
         logger.info(f"Pipeline ended for call {call_id}")

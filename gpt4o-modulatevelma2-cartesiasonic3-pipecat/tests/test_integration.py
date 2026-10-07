@@ -2,9 +2,11 @@
 Integration tests for the GPT-4o + Modulate Velma-2 + Cartesia Sonic 3 Pipecat voice agent.
 
 Test Levels:
-1. Unit Tests (offline) - audio conversion, phone normalization, ModulateSTTService event
-   handling, the Tavily search tool with a stubbed client, prompts and the outbound
-   greeting, server routes and Plivo webhook authentication via FastAPI TestClient
+1. Unit Tests (offline) - the test-only audio codec in tests/helpers.py, phone
+   normalization, ModulateSTTService event handling, the Tavily search tool with a
+   stubbed client, prompts and the outbound greeting, the Pipecat worker/runner wiring
+   (no deprecated API), server routes and Plivo webhook authentication via FastAPI
+   TestClient
 2. Local Integration - start the inbound server, drive the Plivo WebSocket protocol
    (needs OPENAI_API_KEY, MODULATE_API_KEY and CARTESIA_API_KEY)
 3. OpenAI Integration - test the OpenAI API connection
@@ -30,6 +32,7 @@ import os
 import struct
 import time
 import uuid
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -45,23 +48,21 @@ from loguru import logger
 from tests.helpers import (
     LIVE_API_KEYS,
     TEST_AUTH_TOKEN,
+    downsample_pcm16,
     local_server_env,
     missing_env,
+    pcm_to_plivo,
+    pcm_to_ulaw,
     plivo_signature_headers,
+    rms_of_ulaw,
     server_log_path,
     start_server,
     stop_server,
     stream_body,
     stream_url_from_xml,
-)
-from utils import (
-    cartesia_to_plivo,
-    normalize_phone_number,
-    pcm_to_ulaw,
-    plivo_to_cartesia,
-    resample_audio,
     ulaw_to_pcm,
 )
+from utils import normalize_phone_number
 
 load_dotenv()
 
@@ -129,19 +130,37 @@ def _answer_path(module: str) -> str:
     return "/answer" if module == "inbound.server" else "/outbound/answer?greeting=a%20demo"
 
 
-def rms_of_ulaw(ulaw_audio: bytes) -> float:
-    pcm = ulaw_to_pcm(ulaw_audio)
-    samples = struct.unpack(f"{len(pcm) // 2}h", pcm)
-    return (sum(s * s for s in samples) / max(len(samples), 1)) ** 0.5
-
-
 # =============================================================================
 # UNIT TESTS - audio conversion, phone normalization
 # =============================================================================
 
 
 class TestUnitAudioConversion:
-    """Unit tests for audio format conversion."""
+    """The test-only G.711 codec and downsampler in tests/helpers.py.
+
+    The agent converts no audio itself (PlivoFrameSerializer does), so utils.py has
+    no audio helpers; these back the RMS, transcription and caller-speech helpers.
+    """
+
+    def test_utils_has_no_audio_helpers(self):
+        import utils
+
+        public = {
+            n
+            for n, v in vars(utils).items()
+            if inspect.isfunction(v) and v.__module__ == utils.__name__
+        }
+        assert public == {"normalize_phone_number"}
+
+    def test_runtime_dependencies_exclude_numpy_and_scipy(self):
+        import tomllib
+
+        project = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text())
+        names = {
+            d.split("[")[0].split(">")[0].split("=")[0].split("<")[0].strip()
+            for d in project["project"]["dependencies"]
+        }
+        assert not names & {"numpy", "scipy"}
 
     def test_ulaw_to_pcm_conversion(self):
         pcm_audio = ulaw_to_pcm(b"\xff" * 160)
@@ -163,16 +182,37 @@ class TestUnitAudioConversion:
         assert orig_energy > 0 and rest_energy > 0
         assert correlation / (orig_energy * rest_energy) ** 0.5 > 0.9
 
-    def test_resample_changes_length_by_ratio(self):
-        pcm_8k = struct.pack("160h", *([1000] * 160))
-        assert len(resample_audio(pcm_8k, 8000, 24000)) == 960
-        assert resample_audio(pcm_8k, 8000, 8000) == pcm_8k
+    def test_ulaw_known_codewords(self):
+        """G.711 reference points: silence, and both full-scale codewords."""
+        assert ulaw_to_pcm(b"\xff\x7f\x00\x80") == struct.pack("<4h", 0, 0, -32124, 32124)
+        assert pcm_to_ulaw(struct.pack("<4h", 0, 32767, -32768, 1000)) == b"\xff\x80\x00\xce"
 
-    def test_plivo_cartesia_helpers(self):
-        """20ms of Plivo μ-law (160 bytes) is 480 PCM16 samples at 24kHz, and back."""
-        pcm_24k = plivo_to_cartesia(b"\xff" * 160)
-        assert len(pcm_24k) == 960
-        assert len(cartesia_to_plivo(pcm_24k)) == 160
+    def test_every_codeword_survives_a_roundtrip(self):
+        """Decode then encode is the identity, except 0x7f (-0), which encodes as 0xff (+0)."""
+        codewords = bytes(range(256))
+        expected = bytes(0xFF if c == 0x7F else c for c in codewords)
+        assert pcm_to_ulaw(ulaw_to_pcm(codewords)) == expected
+
+    def test_downsample_by_whole_factor(self):
+        pcm_24k = struct.pack("<480h", *([300, 600, 900] * 160))
+        pcm_8k = downsample_pcm16(pcm_24k, 24000, 8000)
+        assert struct.unpack("<160h", pcm_8k) == (600,) * 160  # mean of each group of three
+        assert downsample_pcm16(pcm_8k, 8000, 8000) == pcm_8k
+        with pytest.raises(ValueError):
+            downsample_pcm16(pcm_8k, 8000, 24000)
+        with pytest.raises(ValueError):
+            downsample_pcm16(pcm_8k, 22050, 8000)
+
+    def test_pcm_to_plivo_makes_20ms_frames(self):
+        """20ms of PCM16 at 24kHz (480 samples) is one 160-byte Plivo μ-law frame."""
+        samples = [int(16000 * math.sin(2 * math.pi * 440 * i / 24000)) for i in range(480)]
+        ulaw = pcm_to_plivo(struct.pack("<480h", *samples), 24000)
+        assert len(ulaw) == 160
+        assert rms_of_ulaw(ulaw) > 5000
+
+    def test_rms_of_ulaw_silence_and_empty(self):
+        assert rms_of_ulaw(b"\xff" * 160) == 0
+        assert rms_of_ulaw(b"") == 0
 
 
 class TestUnitPhoneNormalization:
@@ -554,10 +594,10 @@ class TestUnitTavilySearchTool:
 # =============================================================================
 
 
-class _FakeTask:
-    """Stands in for PipelineTask: records what run_agent queues, runs nothing."""
+class _FakeWorker:
+    """Stands in for PipelineWorker: records what run_agent queues, runs nothing."""
 
-    created: list[_FakeTask]
+    created: list[_FakeWorker]
 
     def __init__(self, pipeline: Any, **kwargs: Any) -> None:
         self.pipeline = pipeline
@@ -572,11 +612,21 @@ class _FakeTask:
 
 
 class _FakeRunner:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        pass
+    """Stands in for WorkerRunner: records how run_agent drives it."""
 
-    async def run(self, task: Any) -> None:
-        return None
+    created: list[_FakeRunner]
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.init_args, self.init_kwargs = args, kwargs
+        self.workers: list[Any] = []
+        self.run_calls: list[tuple[tuple, dict]] = []
+        type(self).created.append(self)
+
+    async def add_workers(self, *workers: Any) -> None:
+        self.workers.extend(workers)
+
+    async def run(self, *args: Any, **kwargs: Any) -> None:
+        self.run_calls.append((args, kwargs))
 
 
 class _FakeWebSocket:
@@ -589,12 +639,13 @@ class _FakeWebSocket:
 async def run_agent_offline(monkeypatch, module_name: str, **kwargs: Any) -> tuple[Any, list]:
     """Assemble the real pipeline but never run it: no socket is opened to any service.
 
-    Returns (the LLMContext passed to the aggregators, the frames queued on the task).
+    Returns (the LLMContext passed to the aggregators, the frames queued on the worker).
     """
     mod = importlib.import_module(module_name)
     for key in ("OPENAI_API_KEY", "MODULATE_API_KEY", "CARTESIA_API_KEY"):
         monkeypatch.setattr(mod, key, "test-key")
-    _FakeTask.created = []
+    _FakeWorker.created = []
+    _FakeRunner.created = []
     contexts: list[Any] = []
     real_pair = mod.LLMContextAggregatorPair
 
@@ -603,12 +654,12 @@ async def run_agent_offline(monkeypatch, module_name: str, **kwargs: Any) -> tup
         return real_pair(context, *args, **kw)
 
     monkeypatch.setattr(mod, "LLMContextAggregatorPair", recording_pair)
-    monkeypatch.setattr(mod, "PipelineTask", _FakeTask)
-    monkeypatch.setattr(mod, "PipelineRunner", _FakeRunner)
+    monkeypatch.setattr(mod, "PipelineWorker", _FakeWorker)
+    monkeypatch.setattr(mod, "WorkerRunner", _FakeRunner)
     await mod.run_agent(websocket=_FakeWebSocket(), call_id="c-1", stream_id="s-1", **kwargs)
-    (task,) = _FakeTask.created
+    (worker,) = _FakeWorker.created
     (context,) = contexts
-    return context, task.queued
+    return context, worker.queued
 
 
 def _messages(context: Any) -> list[dict]:
@@ -667,6 +718,96 @@ class TestUnitOutboundGreeting:
         if module == "outbound.agent":
             expected.append("greeting")
         assert params == expected
+
+
+class TestUnitPipecatWorkerAPI:
+    """run_agent uses Pipecat 1.x's PipelineWorker / WorkerRunner, not the deprecated aliases.
+
+    PipelineTask, PipelineRunner and WorkerRunner.run(worker) are deprecated since Pipecat
+    1.3.0 and removed in 2.0.0.
+    """
+
+    @pytest.mark.parametrize("module", AGENT_MODULES)
+    def test_deprecated_names_are_not_imported(self, module):
+        mod = importlib.import_module(module)
+        assert not hasattr(mod, "PipelineTask")
+        assert not hasattr(mod, "PipelineRunner")
+        assert mod.PipelineWorker.__module__ == "pipecat.pipeline.worker"
+        assert mod.WorkerRunner.__module__ == "pipecat.workers.runner"
+
+    @pytest.mark.parametrize("module", AGENT_MODULES)
+    async def test_worker_is_added_then_run_without_arguments(self, monkeypatch, module):
+        """add_workers(worker) then run(): passing the worker to run() is the deprecated form.
+
+        The runner is built with its defaults, so handle_sigterm stays False and uvicorn
+        keeps its own SIGTERM handler (CLAUDE.md "Pipecat PipelineRunner signal handling").
+        """
+        from pipecat.workers.runner import WorkerRunner
+
+        await run_agent_offline(monkeypatch, module)
+        (runner,) = _FakeRunner.created
+        assert runner.init_args == () and runner.init_kwargs == {}
+        assert runner.workers == _FakeWorker.created
+        assert runner.run_calls == [((), {})]
+        assert inspect.signature(WorkerRunner).parameters["handle_sigterm"].default is False
+
+    @pytest.mark.parametrize("module", AGENT_MODULES)
+    async def test_building_and_starting_emits_no_deprecation_warning(self, monkeypatch, module):
+        """The real PipelineWorker and WorkerRunner start and finish with no DeprecationWarning
+        attributed to this example's code.
+
+        Offline: the services are constructed for real but the pipeline handed to the
+        worker is empty, so nothing connects to Modulate, OpenAI or Cartesia. The worker
+        starts (StartFrame through the pipeline), then is asked to stop.
+        """
+        from pipecat.pipeline.pipeline import Pipeline
+
+        mod = importlib.import_module(module)
+        for key in ("OPENAI_API_KEY", "MODULATE_API_KEY", "CARTESIA_API_KEY"):
+            monkeypatch.setattr(mod, key, "test-key")
+        workers: list[Any] = []
+        started: list[Any] = []
+
+        async def on_started(worker: Any, frame: Any) -> None:
+            started.append(frame)
+
+        class RecordingWorker(mod.PipelineWorker):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, **kwargs)
+                self.add_event_handler("on_pipeline_started", on_started)
+                workers.append(self)
+
+        monkeypatch.setattr(mod, "PipelineWorker", RecordingWorker)
+        monkeypatch.setattr(mod, "Pipeline", lambda processors: Pipeline([]))
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            run = asyncio.create_task(
+                mod.run_agent(websocket=_FakeWebSocket(), call_id="c-1", stream_id="s-1")
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while not workers and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                (worker,) = workers
+                # An EndFrame behind the opening frame: the pipeline starts, then ends.
+                await worker.stop_when_done()
+                await asyncio.wait_for(run, 15)
+            finally:
+                run.cancel()
+
+        assert len(started) == 1, "the pipeline never started"
+        assert worker.has_finished()
+        project = str(Path(__file__).resolve().parent.parent)
+        site = os.sep + "site-packages" + os.sep
+        own = [
+            f"{w.filename}:{w.lineno}: {w.message}"
+            for w in caught
+            if issubclass(w.category, DeprecationWarning)
+            and w.filename.startswith(project)
+            and site not in w.filename
+        ]
+        assert own == []
 
 
 class TestUnitSystemPromptSource:

@@ -7,6 +7,7 @@ import json
 import os
 import secrets
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -56,6 +57,97 @@ def local_server_env(port: int) -> dict[str, str]:
     }
 
 
+# =============================================================================
+# Test-only audio codec. The agent never converts audio itself (Pipecat's
+# PlivoFrameSerializer does), so the G.711 codec lives here, not in utils.py.
+# Pure Python: no numpy, scipy, pydub or ffmpeg.
+# =============================================================================
+
+PLIVO_SAMPLE_RATE = 8000  # Plivo streams μ-law at 8kHz
+_ULAW_BIAS = 0x84
+_ULAW_CLIP = 32635
+
+# Caller speech for tests/test_multiturn_voice.py is synthesised with OpenAI
+# (OPENAI_API_KEY is already required by the agent). "pcm" is raw PCM16 mono 24kHz.
+CALLER_TTS_MODEL = "gpt-4o-mini-tts"
+CALLER_TTS_VOICE = "alloy"
+CALLER_TTS_SAMPLE_RATE = 24000
+
+
+def ulaw_to_pcm(ulaw_audio: bytes) -> bytes:
+    """G.711 μ-law -> 16-bit little-endian PCM (recordings, RMS, transcripts)."""
+    samples = []
+    for byte in ulaw_audio:
+        code = ~byte & 0xFF
+        exponent = (code >> 4) & 0x07
+        mantissa = code & 0x0F
+        magnitude = (((mantissa << 3) + _ULAW_BIAS) << exponent) - _ULAW_BIAS
+        samples.append(-magnitude if code & 0x80 else magnitude)
+    return struct.pack(f"<{len(samples)}h", *samples)
+
+
+def pcm_to_ulaw(pcm_audio: bytes) -> bytes:
+    """16-bit little-endian PCM -> G.711 μ-law (a trailing odd byte is dropped)."""
+    count = len(pcm_audio) // 2
+    out = bytearray(count)
+    for i, sample in enumerate(struct.unpack(f"<{count}h", pcm_audio[: count * 2])):
+        sign = 0x80 if sample < 0 else 0x00
+        magnitude = min(abs(sample), _ULAW_CLIP) + _ULAW_BIAS
+        exponent = magnitude.bit_length() - 8  # 0..7: magnitude is 132..32767
+        mantissa = (magnitude >> (exponent + 3)) & 0x0F
+        out[i] = ~(sign | (exponent << 4) | mantissa) & 0xFF
+    return bytes(out)
+
+
+def downsample_pcm16(pcm_audio: bytes, input_rate: int, output_rate: int) -> bytes:
+    """Downsample PCM16 mono by a whole factor (24kHz -> 8kHz is 3).
+
+    Each output sample is the mean of ``factor`` input samples: a box low-pass
+    followed by decimation. Enough for speech fed to a VAD and an STT in a test;
+    it is not a general-purpose resampler.
+    """
+    if input_rate == output_rate:
+        return pcm_audio
+    factor, remainder = divmod(input_rate, output_rate)
+    if remainder or factor < 1:
+        raise ValueError(f"{input_rate}Hz -> {output_rate}Hz is not a whole-factor downsample")
+    count = len(pcm_audio) // 2
+    samples = struct.unpack(f"<{count}h", pcm_audio[: count * 2])
+    out = [sum(samples[i : i + factor]) // factor for i in range(0, count - factor + 1, factor)]
+    return struct.pack(f"<{len(out)}h", *out)
+
+
+def rms_of_ulaw(ulaw_audio: bytes) -> float:
+    """RMS of μ-law audio on the PCM16 scale (silence is ~0, speech is in the thousands)."""
+    pcm = ulaw_to_pcm(ulaw_audio)
+    samples = struct.unpack(f"<{len(pcm) // 2}h", pcm)
+    return (sum(s * s for s in samples) / max(len(samples), 1)) ** 0.5
+
+
+def pcm_to_plivo(pcm_audio: bytes, sample_rate: int) -> bytes:
+    """PCM16 mono at ``sample_rate`` -> what Plivo streams: μ-law 8kHz."""
+    return pcm_to_ulaw(downsample_pcm16(pcm_audio, sample_rate, PLIVO_SAMPLE_RATE))
+
+
+def synthesize_caller_speech(text: str) -> bytes:
+    """``text`` spoken by OpenAI TTS, as μ-law 8kHz ready to send as Plivo media frames.
+
+    Needs OPENAI_API_KEY and network access, nothing else: the response is raw
+    PCM, so there is no MP3 to decode and no ffmpeg, gTTS or pydub involved.
+    Errors propagate (a failed synthesis fails the test; it does not skip it).
+    """
+    from openai import OpenAI
+
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=30.0)
+    response = client.audio.speech.create(
+        model=CALLER_TTS_MODEL,
+        voice=CALLER_TTS_VOICE,
+        input=text,
+        response_format="pcm",
+    )
+    return pcm_to_plivo(response.content, CALLER_TTS_SAMPLE_RATE)
+
+
 def ensure_ffmpeg_on_path() -> None:
     """Put a checked-in ffmpeg binary on PATH (faster-whisper needs it).
 
@@ -77,12 +169,18 @@ def server_log_path(name: str) -> Path:
 
 
 def start_server(
-    module: str, port: int, log_path: Path, env_overrides: dict[str, str] | None = None
+    module: str,
+    port: int,
+    log_path: Path,
+    env_overrides: dict[str, str] | None = None,
+    *,
+    required: bool = False,
 ) -> subprocess.Popen:
     """Start ``python -m {module}`` on ``port`` with its output written to ``log_path``.
 
     Output goes to a file, not a pipe, so a chatty server can never block on a full pipe.
-    Skips the calling test if the health check doesn't come up within 15s.
+    If the health check doesn't come up within 15s the calling test is skipped, or
+    failed when ``required`` is true (for tests that may only skip on missing keys).
     """
     env = os.environ.copy()
     env["SERVER_PORT"] = str(port)  # inbound.server
@@ -111,7 +209,10 @@ def start_server(
         time.sleep(0.5)
 
     stop_server(proc)
-    pytest.skip(f"Server did not start in time. Output:\n{log_path.read_text()[-2000:]}")
+    message = f"Server did not start in time. Output:\n{log_path.read_text()[-2000:]}"
+    if required:
+        pytest.fail(message)
+    pytest.skip(message)
 
 
 def stop_server(proc: subprocess.Popen) -> None:
