@@ -292,7 +292,7 @@ response = await asyncio.wait_for(
     client.search(
         query=query,
         search_depth=TAVILY_SEARCH_DEPTH,
-        include_domains=["yourcompany.com"],   # answer only from your own docs
+        include_domains=["yourcompany.com"],  # answer only from your own docs
         include_answer="advanced",
         max_results=3,
         timeout=TAVILY_TIMEOUT_SECS,
