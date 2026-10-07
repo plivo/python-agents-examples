@@ -50,7 +50,7 @@ These examples wire up separate providers for speech-to-text, language model, an
 | [gemini2-deepgramnova2-cartesiasonic2-native](./gemini2-deepgramnova2-cartesiasonic2-native/) | Deepgram Nova 2 | Gemini 2 | Cartesia Sonic 2 | None |
 | [gemini2-deepgramnova2-elevenflashv2.5-native](./gemini2-deepgramnova2-elevenflashv2.5-native/) | Deepgram Nova 2 | Gemini 2 | ElevenLabs Flash v2.5 | None |
 | [gpt4o-deepgramnova3-openaitts4o-pipecat](./gpt4o-deepgramnova3-openaitts4o-pipecat/) | Deepgram Nova 3 | GPT-4o | OpenAI TTS 4o | Pipecat |
-| [gpt4o-modulatevelma2-cartesiasonic3-pipecat](./gpt4o-modulatevelma2-cartesiasonic3-pipecat/) | Modulate Velma 2 | GPT-4o | Cartesia Sonic 3 | Pipecat |
+| [gpt4o-modulatevelma2-cartesiasonic3-pipecat](./gpt4o-modulatevelma2-cartesiasonic3-pipecat/) | Modulate Velma-2 | GPT-4o | Cartesia Sonic 3 | Pipecat |
 | [gpt5.4-assemblyaiu3-cartesiasonic3-native](./gpt5.4-assemblyaiu3-cartesiasonic3-native/) | AssemblyAI U3 | GPT 5.4 | Cartesia Sonic 3 | None |
 | [daily-plivo](./daily-plivo/) | Deepgram | OpenAI | Cartesia | Pipecat + Daily |
 
