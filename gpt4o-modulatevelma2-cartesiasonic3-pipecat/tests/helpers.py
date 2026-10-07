@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import secrets
+import shutil
 import signal
 import struct
 import subprocess
@@ -60,18 +61,13 @@ def local_server_env(port: int) -> dict[str, str]:
 # =============================================================================
 # Test-only audio codec. The agent never converts audio itself (Pipecat's
 # PlivoFrameSerializer does), so the G.711 codec lives here, not in utils.py.
-# Pure Python: no numpy, scipy, pydub or ffmpeg.
+# Pure Python: no numpy or scipy. Only synthesize_caller_speech() below uses
+# gTTS, pydub and ffmpeg (all three come with the dev dependency group).
 # =============================================================================
 
 PLIVO_SAMPLE_RATE = 8000  # Plivo streams μ-law at 8kHz
 _ULAW_BIAS = 0x84
 _ULAW_CLIP = 32635
-
-# Caller speech for tests/test_multiturn_voice.py is synthesised with OpenAI
-# (OPENAI_API_KEY is already required by the agent). "pcm" is raw PCM16 mono 24kHz.
-CALLER_TTS_MODEL = "gpt-4o-mini-tts"
-CALLER_TTS_VOICE = "alloy"
-CALLER_TTS_SAMPLE_RATE = 24000
 
 
 def ulaw_to_pcm(ulaw_audio: bytes) -> bytes:
@@ -129,25 +125,6 @@ def pcm_to_plivo(pcm_audio: bytes, sample_rate: int) -> bytes:
     return pcm_to_ulaw(downsample_pcm16(pcm_audio, sample_rate, PLIVO_SAMPLE_RATE))
 
 
-def synthesize_caller_speech(text: str) -> bytes:
-    """``text`` spoken by OpenAI TTS, as μ-law 8kHz ready to send as Plivo media frames.
-
-    Needs OPENAI_API_KEY and network access, nothing else: the response is raw
-    PCM, so there is no MP3 to decode and no ffmpeg, gTTS or pydub involved.
-    Errors propagate (a failed synthesis fails the test; it does not skip it).
-    """
-    from openai import OpenAI
-
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=30.0)
-    response = client.audio.speech.create(
-        model=CALLER_TTS_MODEL,
-        voice=CALLER_TTS_VOICE,
-        input=text,
-        response_format="pcm",
-    )
-    return pcm_to_plivo(response.content, CALLER_TTS_SAMPLE_RATE)
-
-
 def ensure_ffmpeg_on_path() -> None:
     """Put a checked-in ffmpeg binary on PATH (faster-whisper needs it).
 
@@ -159,6 +136,64 @@ def ensure_ffmpeg_on_path() -> None:
         if (directory / "ffmpeg").is_file():
             os.environ["PATH"] = str(directory) + os.pathsep + os.environ.get("PATH", "")
             return
+
+
+def ffmpeg_executable() -> str:
+    """The ffmpeg binary pydub decodes MP3 with; no system install is needed.
+
+    An ffmpeg already on PATH (or in FFMPEG_DIR / a parent directory) wins. Otherwise
+    the binary inside the ``imageio-ffmpeg`` wheel (a dev dependency) is used: it ships
+    in the wheel for macOS, Linux and Windows, so nothing is downloaded at test time.
+    """
+    ensure_ffmpeg_on_path()
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+    import imageio_ffmpeg
+
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def synthesize_caller_speech(text: str) -> bytes:
+    """``text`` spoken by gTTS, as μ-law 8kHz ready to send as Plivo media frames.
+
+    gTTS (Google's public TTS endpoint: network, no API key) returns MP3; pydub decodes
+    it with ffmpeg and resamples it to 8kHz mono PCM16, which is then μ-law encoded.
+    The MP3 is decoded with ``from_file_using_temporary_files``, pydub's ffmpeg-only
+    path: ``from_mp3`` also runs ffprobe, which the imageio-ffmpeg wheel does not ship.
+    Errors are raised with the failing step named (a test that cannot get its caller
+    speech fails; it does not skip).
+    """
+    import warnings
+
+    from gtts import gTTS
+
+    with warnings.catch_warnings():
+        # pydub 0.25.1 has invalid-escape regexes (SyntaxWarning on Python 3.12+) and
+        # warns at import when ffmpeg is not on PATH; the converter is set explicitly below
+        warnings.simplefilter("ignore", SyntaxWarning)
+        warnings.simplefilter("ignore", RuntimeWarning)
+        from pydub import AudioSegment
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        mp3_path = os.path.join(tmp_dir, "caller.mp3")
+        try:
+            gTTS(text=text, lang="en").save(mp3_path)
+        except Exception as e:
+            raise RuntimeError(
+                f"gTTS could not synthesise {text!r} (it needs network access to "
+                f"translate.google.com): {type(e).__name__}: {e}"
+            ) from e
+        AudioSegment.converter = ffmpeg_executable()
+        try:
+            audio = AudioSegment.from_file_using_temporary_files(mp3_path, format="mp3")
+        except Exception as e:
+            raise RuntimeError(
+                f"pydub could not decode the gTTS MP3 with ffmpeg at "
+                f"{AudioSegment.converter}: {type(e).__name__}: {e}"
+            ) from e
+    audio = audio.set_frame_rate(PLIVO_SAMPLE_RATE).set_channels(1).set_sample_width(2)
+    return pcm_to_plivo(audio.raw_data, audio.frame_rate)
 
 
 def server_log_path(name: str) -> Path:

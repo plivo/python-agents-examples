@@ -3,10 +3,11 @@ Multi-turn voice conversation + barge-in tests against a local inbound server.
 
 The test plays Plivo's side of the bidirectional stream: it fetches the <Stream> URL from
 a Plivo-signed /answer webhook, sends the start event, then μ-law 8kHz audio in 20ms
-frames. User turns are real speech synthesised with OpenAI TTS (raw PCM16 24kHz, converted
-to μ-law 8kHz by tests/helpers.py), so they pass through Silero VAD and Modulate Velma-2
-exactly as caller audio does. No phone call is placed, no tunnel is started, Plivo's API is
-never called and the server gets no Plivo account or number.
+frames. User turns are real speech synthesised with gTTS (MP3, decoded and resampled to
+8kHz mono by pydub with ffmpeg, then μ-law encoded by tests/helpers.py), so they pass
+through Silero VAD and Modulate Velma-2 exactly as caller audio does. No phone call is
+placed, no tunnel is started, Plivo's API is never called and the server gets no Plivo
+account or number.
 
 Tests:
 1. Multi-turn: the opening line, then three spoken user turns; each must be answered
@@ -16,12 +17,15 @@ Tests:
    interrupting turn.
 
 Requirements:
-    - OPENAI_API_KEY, MODULATE_API_KEY and CARTESIA_API_KEY in .env. This is the only
-      skip condition, and the skip reason names the missing keys. OPENAI_API_KEY also
-      pays for the caller's speech (model gpt-4o-mini-tts).
-    - A default `uv sync` (dev group). No gTTS, pydub, ffmpeg or other system package.
-    - Network access to OpenAI, Modulate and Cartesia; port 18004 available. A failure
-      here (speech synthesis, server start) fails the test rather than skipping it.
+    - OPENAI_API_KEY (the agent's LLM), MODULATE_API_KEY and CARTESIA_API_KEY in .env.
+      This is the only skip condition, and the skip reason names the missing keys.
+    - A default `uv sync` (dev group), which installs gTTS, pydub, audioop-lts (Python
+      3.13+, where the stdlib audioop pydub imports is gone) and imageio-ffmpeg, whose
+      wheel carries the ffmpeg binary. No system ffmpeg is needed; one on PATH is used
+      if present. ffprobe is not needed.
+    - Network access to Google's public TTS endpoint (gTTS, no key), OpenAI, Modulate
+      and Cartesia; port 18004 available. A failure here (speech synthesis, server
+      start) fails the test rather than skipping it.
 
 Usage:
     uv run pytest tests/test_multiturn_voice.py -v -s
@@ -171,10 +175,13 @@ def stream_url(call_uuid: str) -> str:
 
 @pytest.fixture(scope="module")
 def synthesize():
-    """text -> μ-law 8kHz caller speech via OpenAI TTS. Never skips: an error fails the test."""
+    """text -> μ-law 8kHz caller speech via gTTS + pydub. Never skips: an error fails the test."""
 
     def synth(text: str) -> bytes:
-        ulaw = synthesize_caller_speech(text)
+        try:
+            ulaw = synthesize_caller_speech(text)
+        except Exception as e:
+            pytest.fail(f"Caller speech could not be produced: {e}")
         assert len(ulaw) > 4000, f"Synthesised speech too short for '{text}'"
         assert rms_of_ulaw(ulaw) > 500, f"Synthesised speech for '{text}' is silence"
         return ulaw

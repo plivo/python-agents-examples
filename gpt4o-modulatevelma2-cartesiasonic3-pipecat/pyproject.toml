@@ -40,6 +40,14 @@ dev = [
     # still passes, which breaks the local transcription helper in
     # tests/test_e2e_live.py. Affects every example in the repo.
     "av<19",
+    # Caller speech for tests/test_multiturn_voice.py: gTTS -> MP3 -> pydub/ffmpeg
+    # -> 8kHz mono -> μ-law. Declared so the test never skips for a missing tool.
+    "gTTS>=2.5.4",
+    "pydub>=0.25.1",
+    # pydub imports the stdlib audioop module, removed in Python 3.13
+    "audioop-lts>=0.2.1; python_version >= '3.13'",
+    # ffmpeg binary inside the wheel (macOS, Linux, Windows): no system install
+    "imageio-ffmpeg>=0.6.0",
 ]
 
 [tool.ruff]

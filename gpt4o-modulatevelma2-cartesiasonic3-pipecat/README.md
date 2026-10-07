@@ -90,7 +90,7 @@ gpt4o-modulatevelma2-cartesiasonic3-pipecat/
 └── README.md
 ```
 
-`ModulateSTTService` and `search_the_web` live in `agent.py` of each direction, as identical copies, because each direction is self-contained. `utils.py` holds only `normalize_phone_number` (used by both servers). It has no μ-law, PCM or resampling helpers and the example has no `numpy`/`scipy` runtime dependency of its own: `PlivoFrameSerializer` does every conversion on the call path. The tests keep a small pure-Python G.711 codec and downsampler in `tests/helpers.py` for RMS checks, transcription and caller speech.
+`ModulateSTTService` and `search_the_web` live in `agent.py` of each direction, as identical copies, because each direction is self-contained. `utils.py` holds only `normalize_phone_number` (used by both servers). It has no μ-law, PCM or resampling helpers and the example has no `numpy`/`scipy` runtime dependency of its own: `PlivoFrameSerializer` does every conversion on the call path. The tests keep a small pure-Python G.711 codec and downsampler in `tests/helpers.py` for RMS checks, transcription and caller speech; the caller speech itself comes from gTTS and pydub (dev dependencies).
 
 ## How It Works
 
@@ -206,7 +206,7 @@ The greeting is the only per-call input. The system prompt is `outbound/system_p
 | `DEFAULT_COUNTRY_CODE` | Default region (ISO 3166-1 alpha-2) for phone numbers without a country prefix | `US` |
 | `PLIVO_TEST_NUMBER` | Tests only: second Plivo number (caller for inbound tests, destination for outbound tests) | Empty |
 | `NGROK_BIN` | Tests only: path to the ngrok binary | `ngrok` |
-| `FFMPEG_DIR` | Tests only: directory holding an `ffmpeg` binary for faster-whisper | Empty |
+| `FFMPEG_DIR` | Tests only: directory holding an `ffmpeg` binary to prefer over the one bundled with the `imageio-ffmpeg` dev dependency | Empty |
 | `TEST_LOG_DIR` | Tests only: where test server logs are written | System temp dir |
 
 The Modulate endpoint (`MODULATE_STT_URL`), the Tavily timeout (`TAVILY_TIMEOUT_SECS = 5.0`) and `max_results=5` are constants in the agent files, not env vars.
@@ -364,8 +364,8 @@ uv run pytest tests/test_integration.py -v -k Plivo
 # E2E with the real LLM, STT and TTS, no phone call (same three API keys, plus ffmpeg)
 uv run pytest tests/test_e2e_live.py -v -s
 
-# Multi-turn + barge-in over a simulated Plivo stream (same three API keys, nothing else:
-# the caller's speech is synthesised with OpenAI TTS as raw PCM, so no ffmpeg, gTTS or pydub)
+# Multi-turn + barge-in over a simulated Plivo stream (same three API keys, nothing else to
+# install: the caller's speech is gTTS -> pydub/ffmpeg -> μ-law 8kHz, all from the dev group)
 uv run pytest tests/test_multiturn_voice.py -v -s
 
 # Real calls (the three API keys, Plivo credentials, PLIVO_TEST_NUMBER, ngrok, ffmpeg)
@@ -378,9 +378,11 @@ uv run pytest tests/test_outbound_call.py -v -s
 | `test_integration.py` (`-k unit`) | none | The test-only μ-law codec and downsampler, phone normalization, `ModulateSTTService._handle_event`, the Tavily tool with a stubbed client, prompts and the outbound greeting, `PipelineWorker` / `WorkerRunner` wiring with no Pipecat `DeprecationWarning` from the agents, server routes, webhook authentication for both servers |
 | `test_integration.py` (`-k local`) | 18001 | Health, signed and unsigned `/answer`, `playAudio` and speech energy from the opening line |
 | `test_e2e_live.py` | 18005 | Opening line transcribed with faster-whisper |
-| `test_multiturn_voice.py` | 18004 | Three spoken user turns each answered; speaking over an answer produces `clearAudio`. Local only (server subprocess + simulated Plivo stream); skips only when one of the three API keys is missing, and uses `OPENAI_API_KEY` (`gpt-4o-mini-tts`) for the caller's speech |
+| `test_multiturn_voice.py` | 18004 | Three spoken user turns each answered; speaking over an answer produces `clearAudio`. Local only (server subprocess + simulated Plivo stream); skips only when one of the three API keys is missing. The caller's speech is gTTS (Google's public TTS endpoint, no key) decoded by pydub; a synthesis failure fails the test |
 | `test_live_call.py` | 18002 | Real inbound call: signed webhook through the tunnel, recorded and transcribed opening line |
 | `test_outbound_call.py` | 18003 | Real outbound call via `calls.create(answer_url=…/outbound/answer?greeting=…)`: greeting spoken, hangup webhook received |
+
+`test_multiturn_voice.py` synthesises the caller's turns the way the other examples do: gTTS → MP3 → pydub/ffmpeg → 8kHz mono → μ-law. Unlike them, the tools are dev dependencies, so a default `uv sync` is enough and the test does not skip for a missing tool: `gTTS`, `pydub`, `audioop-lts` (Python 3.13+ only, where the stdlib `audioop` that pydub imports was removed) and `imageio-ffmpeg`, whose wheel contains the ffmpeg binary for macOS, Linux and Windows. An `ffmpeg` on `PATH` or in `FFMPEG_DIR` is used instead when there is one. `ffprobe` is not required: the MP3 is decoded through pydub's ffmpeg-only path (`AudioSegment.from_file_using_temporary_files`).
 
 The live call tests use `PLIVO_TEST_NUMBER`, a second Plivo number on the same account. They assign test-only Plivo applications to the numbers involved and restore the original application afterwards. They start their own ngrok agent and skip if one is already running.
 
