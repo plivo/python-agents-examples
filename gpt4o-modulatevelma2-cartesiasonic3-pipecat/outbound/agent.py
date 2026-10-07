@@ -537,6 +537,13 @@ async def run_agent(
     # so the assistant aggregator must not append it a second time.
     await worker.queue_frames([TTSSpeakFrame(opening_line, append_to_context=False)])
 
+    @transport.event_handler("on_client_disconnected")
+    async def _on_client_disconnected(_transport, _client):
+        # Plivo closes the stream when the call ends. Without this the pipeline,
+        # and its Modulate and Cartesia sockets, stay up until the idle timeout.
+        logger.info(f"Plivo stream closed for call {call_id}; stopping the pipeline")
+        await worker.cancel()
+
     # WorkerRunner's default is handle_sigterm=False, which is what running
     # inside uvicorn needs: uvicorn keeps its own SIGTERM handler.
     runner = WorkerRunner()
