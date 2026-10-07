@@ -240,12 +240,60 @@ else
     fail "PLIVO_CHUNK_SIZE = 160 not found in agent.py"
 fi
 
-# playAudio format
-if grep -rq "audio/x-mulaw" "$EXAMPLE_DIR/inbound/agent.py" 2>/dev/null; then
-    pass "playAudio uses audio/x-mulaw content type"
-else
-    fail "playAudio content type 'audio/x-mulaw' not found in inbound/agent.py"
-fi
+# playAudio format. Parsed from the syntax tree, so a comment or docstring that merely
+# mentions the content type does not count:
+#   - an agent that writes playAudio itself must build a dict literal with
+#     "contentType": "audio/x-mulaw" and "sampleRate": 8000;
+#   - a framework agent may instead instantiate the framework's Plivo serializer
+#     (e.g. Pipecat's PlivoFrameSerializer), which emits that message for it.
+# Prints "dict", "serializer" or "missing".
+playaudio_source() {
+    python3 - "$1" <<'PY' 2>/dev/null || echo "missing"
+import ast
+import sys
+
+tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
+found = "missing"
+for node in ast.walk(tree):
+    if isinstance(node, ast.Dict):
+        items = {
+            k.value: v
+            for k, v in zip(node.keys, node.values)
+            if isinstance(k, ast.Constant) and isinstance(v, ast.Constant)
+        }
+        content_type = items.get("contentType")
+        sample_rate = items.get("sampleRate")
+        if (
+            content_type is not None
+            and content_type.value == "audio/x-mulaw"
+            and sample_rate is not None
+            and sample_rate.value == 8000
+        ):
+            found = "dict"
+            break
+    elif isinstance(node, ast.Call):
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        if "Plivo" in name and name.endswith("Serializer"):
+            found = "serializer"
+print(found)
+PY
+}
+
+for side in inbound outbound; do
+    agent_file="$EXAMPLE_DIR/$side/agent.py"
+    [[ -f "$agent_file" ]] || continue
+    source_kind=$(playaudio_source "$agent_file")
+    if [[ "$source_kind" == "dict" ]]; then
+        pass "$side/agent.py builds playAudio as audio/x-mulaw at 8000 Hz"
+    elif [[ "$source_kind" == "serializer" && "$ORCHESTRATION" == "framework" ]]; then
+        pass "$side/agent.py uses the framework's Plivo serializer for playAudio"
+    elif [[ "$ORCHESTRATION" == "framework" ]]; then
+        fail "$side/agent.py neither uses a Plivo serializer nor builds an audio/x-mulaw playAudio message"
+    else
+        fail "$side/agent.py does not build a playAudio message with contentType audio/x-mulaw and sampleRate 8000"
+    fi
+done
 
 # Stream XML content type
 if grep -rq "audio/x-mulaw" "$EXAMPLE_DIR/inbound/server.py" 2>/dev/null; then
