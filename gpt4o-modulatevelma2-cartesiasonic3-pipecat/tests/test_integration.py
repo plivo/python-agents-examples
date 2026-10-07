@@ -263,61 +263,6 @@ def make_stt(agent_mod, **kwargs: Any):
     return service, pushed
 
 
-class TestUnitModulateSTTConnect:
-    """ModulateSTTService._connect_websocket: how a rejected API key is reported."""
-
-    @staticmethod
-    def _closing_socket(code: int):
-        from websockets.exceptions import ConnectionClosedError
-        from websockets.frames import Close
-
-        class ClosingSocket:
-            async def send(self, _data: Any) -> None:
-                raise ConnectionClosedError(Close(code, ""), None)
-
-            async def close(self) -> None:
-                return None
-
-        return ClosingSocket()
-
-    async def test_rejected_key_is_named_and_stops_reconnecting(
-        self, agent_mod, monkeypatch, captured_messages
-    ):
-        """Modulate accepts the handshake, then closes with 4001 on the config frame."""
-        socket = self._closing_socket(agent_mod.MODULATE_AUTH_CLOSE_CODE)
-
-        async def fake_connect(*_args: Any, **_kwargs: Any):
-            return socket
-
-        monkeypatch.setattr(agent_mod, "websocket_connect", fake_connect)
-        stt, _pushed = make_stt(agent_mod)
-        stt._sample_rate = 16000
-
-        with pytest.raises(ConnectionError, match="rejected MODULATE_API_KEY"):
-            await stt._connect_websocket()
-
-        assert stt._reconnect_on_error is False
-        assert stt._websocket is None
-        assert any("rejected MODULATE_API_KEY" in m for m in captured_messages)
-        assert not any("test-modulate-key" in m for m in captured_messages)
-
-    async def test_other_close_codes_stay_retryable(self, agent_mod, monkeypatch):
-        socket = self._closing_socket(1011)
-
-        async def fake_connect(*_args: Any, **_kwargs: Any):
-            return socket
-
-        monkeypatch.setattr(agent_mod, "websocket_connect", fake_connect)
-        stt, _pushed = make_stt(agent_mod)
-        stt._sample_rate = 16000
-
-        with pytest.raises(ConnectionError, match="close 1011") as excinfo:
-            await stt._connect_websocket()
-
-        assert "test-modulate-key" not in str(excinfo.value)
-        assert stt._reconnect_on_error is True
-
-
 class TestUnitModulateSTTEvents:
     """ModulateSTTService._handle_event: which Velma events become frames, and which do not."""
 

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -13,6 +15,8 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from xml.etree import ElementTree
@@ -285,6 +289,239 @@ def log_tail(log_path: Path, chars: int = 2000) -> str:
 
 
 # =============================================================================
+# What the pipeline did, read from the server's DEBUG log (Pipecat's own lines)
+# =============================================================================
+
+# Pipecat broadcasts an interruption at the start of every user turn; the serializer
+# turns it into clearAudio. It is a barge-in only when the bot was speaking at the time.
+INTERRUPTION_LOG = "broadcasting interruption"
+_BOT_STARTED = re.compile(r"- Bot started speaking$", re.MULTILINE)
+_BOT_STOPPED = re.compile(r"- Bot stopped speaking$", re.MULTILINE)
+_TTS_TEXT = re.compile(r"Generating TTS \[(.*)\]$", re.MULTILINE)
+_FINAL_TRANSCRIPT = re.compile(r"(?<!INTERIM )TRANSCRIPTION: (['\"])(.*)\1 from ")
+
+
+def log_offset(log_path: Path) -> int:
+    """A position in the server log; pass it back to read only what is logged after it."""
+    return len(read_log_text(log_path))
+
+
+def tts_texts(log_text: str) -> list[str]:
+    """Every sentence handed to TTS (``Generating TTS [...]``), in order."""
+    return _TTS_TEXT.findall(log_text)
+
+
+def final_transcripts(log_text: str) -> list[str]:
+    """Every final STT transcript (TranscriptionLogObserver's ``TRANSCRIPTION:`` lines)."""
+    return [match[1] for match in _FINAL_TRANSCRIPT.findall(log_text)]
+
+
+def barge_ins(log_text: str) -> list[str]:
+    """The interruption log lines that cut the bot off while it was speaking."""
+    speaking = False
+    cut_offs = []
+    for line in log_text.splitlines():
+        if _BOT_STARTED.search(line):
+            speaking = True
+        elif _BOT_STOPPED.search(line):
+            speaking = False
+        elif INTERRUPTION_LOG in line and speaking:
+            cut_offs.append(line)
+    return cut_offs
+
+
+def tool_call_offsets(log_text: str, name: str = "") -> list[int]:
+    """Where in ``log_text`` the LLM service started a tool call (``name``, or any tool).
+
+    Pipecat's LLM service logs ``Calling function [<name>:<tool_call_id>] with arguments``
+    when it runs a registered function.
+    """
+    return [m.start() for m in re.finditer(rf"Calling function \[{name or '[^:]+'}:", log_text)]
+
+
+def _spoke_after_last_tool_call(log_text: str) -> bool:
+    calls = tool_call_offsets(log_text)
+    return not calls or bool(_BOT_STARTED.search(log_text, calls[-1]))
+
+
+def _bot_activity(log_text: str) -> tuple[int, ...]:
+    return (
+        len(_BOT_STARTED.findall(log_text)),
+        len(_BOT_STOPPED.findall(log_text)),
+        log_text.count("LLM START RESPONSE"),
+        log_text.count("LLM END RESPONSE"),
+        len(tool_call_offsets(log_text)),
+        len(_TTS_TEXT.findall(log_text)),
+    )
+
+
+def wait_for_bot_turn(
+    log_path: Path, offset: int, timeout: float = 45.0, settle_secs: float = 2.0
+) -> bool:
+    """Wait until the agent has spoken a whole turn after ``offset`` and gone quiet.
+
+    A turn is over when, in the log after ``offset``, the bot has started speaking at
+    least once (and again after its last tool call, so a search in progress is waited
+    for), every start has its "Bot stopped speaking", every LLM response has ended, and
+    none of those counters (nor the number of sentences sent to TTS) has moved for
+    ``settle_secs``. The settle time covers the gap between two sentences
+    of one answer and the audio still in flight to the phone, so whoever speaks next
+    does not talk over the agent. Returns False on timeout.
+    """
+    deadline = time.time() + timeout
+    last_activity: tuple[int, ...] | None = None
+    changed_at = time.time()
+    while time.time() < deadline:
+        log_text = read_log_text(log_path)[offset:]
+        activity = _bot_activity(log_text)
+        if activity != last_activity:
+            last_activity, changed_at = activity, time.time()
+        started, stopped, llm_starts, llm_ends, _, _ = activity
+        quiet = stopped >= started and llm_ends >= llm_starts
+        answered = started and _spoke_after_last_tool_call(log_text)
+        if answered and quiet and time.time() - changed_at >= settle_secs:
+            return True
+        time.sleep(0.2)
+    return False
+
+
+# =============================================================================
+# A scripted human on the far leg of a live call (test_live_call, test_outbound_call)
+# =============================================================================
+
+# Answer URL path of the human's leg. ngrok answers it itself (static_xml_policy); the
+# request never reaches the example's servers.
+SILENT_LEG_PATH = "/test-silent-leg/answer"
+# Someone who picks up and listens. The background session recording answers the call
+# without a sound (a <Wait>-only answer never picks up an inbound call) and records the
+# leg from its first instant; the two <Wait>s keep the line open and silent for up to 4
+# minutes. The human's lines are spoken into this leg with Plivo's Speak API meanwhile.
+SILENT_LEG_XML = (
+    '<?xml version="1.0" encoding="UTF-8"?><Response>'
+    '<Record recordSession="true" redirect="false" maxLength="600"/>'
+    '<Wait length="120"/><Wait length="120"/>'
+    "</Response>"
+)
+
+
+@dataclass(frozen=True)
+class SpokenTurn:
+    """One line the human says, and how to recognise it and the agent's answer."""
+
+    text: str  # spoken into the human's leg with Plivo's Speak API
+    heard: tuple[str, ...]  # words the STT's final transcripts of the line must contain
+    answer: tuple[str, ...] = ()  # words the agent's reply must contain (any phrasing)
+    tool: str = ""  # tool the agent must call before it replies
+
+
+def missing_words(words: tuple[str, ...] | list[str], text: str) -> list[str]:
+    """The ``words`` that do not occur in ``text`` (case-insensitive)."""
+    return [w for w in words if w.lower() not in text.lower()]
+
+
+def speak_turns(
+    client: plivo.RestClient, leg_uuid: str, turns: tuple[SpokenTurn, ...], log_path: Path, who: str
+) -> list[int]:
+    """Say each turn on ``leg_uuid`` and wait for the agent to finish answering it.
+
+    The agent hears the lines as real telephone audio (Plivo Speak API, ``legs="aleg"``:
+    towards the other party of that leg). Call this once the agent is quiet; each line
+    is spoken only after ``wait_for_bot_turn`` says the previous answer is over, so the
+    human never talks over the agent. Returns the log offset at which each line was
+    spoken, plus the offset after the last answer: turn ``i`` is logged in
+    ``log[offsets[i]:offsets[i + 1]]``.
+    """
+    offsets = []
+    for turn in turns:
+        offsets.append(log_offset(log_path))
+        print(f"[{who}] says: '{turn.text}'")
+        client.calls.speak(leg_uuid, text=turn.text, language="en-US", legs="aleg")
+        assert wait_for_bot_turn(log_path, offsets[-1], timeout=60), (
+            f"The agent never finished answering '{turn.text}'\n{log_tail(log_path)}"
+        )
+    offsets.append(log_offset(log_path))
+    return offsets
+
+
+def check_spoken_turns(turns: tuple[SpokenTurn, ...], log_text: str, offsets: list[int]) -> None:
+    """Assert, from the server log, that every turn was heard and answered in speech.
+
+    For each turn: the STT's final transcripts contain ``heard``; a non-empty reply went
+    to TTS and contains ``answer``; ``tool`` (if any) was called and the agent spoke
+    after the call; and nothing cut the agent off while it was speaking (``barge_ins``).
+    Prints what was heard and said, turn by turn.
+    """
+    assert len(offsets) == len(turns) + 1, "offsets must be speak_turns()'s return value"
+    for turn, start, stop in zip(turns, offsets, offsets[1:], strict=False):
+        turn_log = log_text[start:stop]
+        heard = " ".join(final_transcripts(turn_log))
+        reply = " ".join(tts_texts(turn_log))
+        print(f"[Turn] said     : '{turn.text}'")
+        print(f"       STT heard: {final_transcripts(turn_log)}")
+        print(f"       tool     : {len(tool_call_offsets(turn_log))} call(s)")
+        print(f"       reply    : {tts_texts(turn_log)}")
+        assert not missing_words(turn.heard, heard), (
+            f"The STT transcribed '{turn.text}' as '{heard}': lacks "
+            f"{missing_words(turn.heard, heard)}"
+        )
+        assert reply.strip(), f"No spoken reply to '{turn.text}'\n{turn_log[-1500:]}"
+        assert not missing_words(turn.answer, reply), (
+            f"The reply to '{turn.text}' lacks {missing_words(turn.answer, reply)}: '{reply}'"
+        )
+        if turn.tool:
+            calls = tool_call_offsets(turn_log, turn.tool)
+            assert calls, f"The agent answered '{turn.text}' without calling {turn.tool}: '{reply}'"
+            after_tool = " ".join(tts_texts(turn_log[calls[-1] :]))
+            assert after_tool.strip(), f"No spoken reply after the {turn.tool} call"
+            assert _BOT_STARTED.search(turn_log, calls[-1]), (
+                f"The agent never spoke after the {turn.tool} call"
+            )
+        assert not barge_ins(turn_log), (
+            f"The agent was cut off after '{turn.text}': {barge_ins(turn_log)}"
+        )
+
+
+@contextlib.contextmanager
+def number_on_app(
+    client: plivo.RestClient, number_digits: str, app_name: str, answer_url: str, hangup_url: str
+) -> Iterator[str]:
+    """Assign ``number_digits`` to a test application; always put its own application back.
+
+    Yields the test application's id. The restore is in a ``finally``: it runs whether
+    the tests passed or failed, and also when the reassignment itself raised.
+    ``hangup_url`` is always set: Plivo otherwise keeps the application's previous one.
+    """
+    tail = number_digits[-4:]
+    original_app_id = get_app_id_for_number(client, number_digits)
+    app_id = ""
+    try:
+        app_id = upsert_application(client, app_name, answer_url, hangup_url=hangup_url)
+        client.numbers.update(number=number_digits, app_id=app_id)
+        print(f"\n[Plivo] Number ...{tail} assigned to test app {app_name} ({app_id})")
+        yield app_id
+    finally:
+        if not original_app_id or original_app_id == app_id:
+            print(
+                f"\n[Plivo] Number ...{tail} had no other application before the test "
+                f"(found: {original_app_id or 'none'}); nothing to restore"
+            )
+        else:
+            client.numbers.update(number=number_digits, app_id=original_app_id)
+            print(f"\n[Plivo] Restored number ...{tail} to its original app {original_app_id}")
+
+
+def assert_silent_leg_served(tunnel_url: str) -> str:
+    """The silent leg's answer URL, after checking that ngrok really serves the XML."""
+    url = f"{tunnel_url}{SILENT_LEG_PATH}"
+    served = httpx.post(url, timeout=10.0)
+    assert served.status_code == 200 and served.text == SILENT_LEG_XML, (
+        f"ngrok does not serve the silent-leg XML at {SILENT_LEG_PATH}: "
+        f"HTTP {served.status_code} (Traffic Policy needs ngrok v3)"
+    )
+    return url
+
+
+# =============================================================================
 # Plivo webhook signing (V3) and /ws stream URLs — what Plivo itself sends
 # =============================================================================
 
@@ -425,8 +662,41 @@ def _ngrok_agent_running() -> bool:
     return True
 
 
-def start_ngrok(port: int) -> tuple[subprocess.Popen, str]:
+def static_xml_policy(responses: dict[str, str]) -> dict:
+    """An ngrok Traffic Policy that answers ``{path: xml}`` at ngrok's edge.
+
+    Requests for any other path go on to the tunnelled server untouched. This lets a
+    test give Plivo an answer URL for the far leg of a call without adding a route to
+    the example's servers and without a second tunnel: ngrok's free plan allows one
+    agent, and every tunnel that agent opens gets the same (single) domain, so a second
+    local server could not have a URL of its own. The XML is static and public for as
+    long as the tunnel is up; it must not contain anything secret.
+    """
+    return {
+        "on_http_request": [
+            {
+                "expressions": [f"req.url.path == '{path}'"],
+                "actions": [
+                    {
+                        "type": "custom-response",
+                        "config": {
+                            "status_code": 200,
+                            "headers": {"content-type": "application/xml"},
+                            "body": xml,
+                        },
+                    }
+                ],
+            }
+            for path, xml in responses.items()
+        ]
+    }
+
+
+def start_ngrok(port: int, traffic_policy: dict | None = None) -> tuple[subprocess.Popen, str]:
     """Start our own ngrok tunnel to ``port`` and return (process, public_url).
+
+    ``traffic_policy`` (see ``static_xml_policy``) is written to a temp file and passed
+    as ``--traffic-policy-file``; ``stop_ngrok`` deletes the file.
 
     Never kills other ngrok processes: an agent already running on this machine belongs
     to another session or to a manual tunnel, and killing it would break that session's
@@ -442,11 +712,17 @@ def start_ngrok(port: int) -> tuple[subprocess.Popen, str]:
             "tunnel; stop it and re-run"
         )
 
-    proc = subprocess.Popen(
-        [NGROK_BIN, "http", str(port)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    command = [NGROK_BIN, "http", str(port)]
+    policy_path = ""
+    if traffic_policy:
+        # JSON is valid YAML, which is what ngrok reads; no YAML writer is needed
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as policy_file:
+            json.dump(traffic_policy, policy_file)
+            policy_path = policy_file.name
+        command += ["--traffic-policy-file", policy_path]
+
+    proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc.policy_path = policy_path  # type: ignore[attr-defined]
 
     public_url = None
     for _ in range(30):
@@ -475,14 +751,16 @@ def start_ngrok(port: int) -> tuple[subprocess.Popen, str]:
 
 def stop_ngrok(proc: subprocess.Popen) -> None:
     """Stop the ngrok process started by ``start_ngrok`` (only that one, by its handle)."""
-    if proc.poll() is not None:
-        return
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    policy_path = getattr(proc, "policy_path", "")
+    if policy_path:
+        Path(policy_path).unlink(missing_ok=True)
 
 
 def wait_for_recording(
@@ -592,22 +870,35 @@ def hangup_quietly(client: plivo.RestClient, *call_uuids: str) -> None:
             print(f"[Call] hangup {call_uuid}: {e}")
 
 
-def best_transcript(client: plivo.RestClient, call_uuids: list[str]) -> str:
-    """Download each leg's recording, transcribe it and return the longest transcript."""
-    transcript = ""
-    for call_uuid in call_uuids:
+def leg_transcripts(client: plivo.RestClient, legs: dict[str, str]) -> dict[str, str]:
+    """Download and transcribe each leg's recording: ``{label: transcript}``.
+
+    ``legs`` is ``{label: call_uuid}``, e.g. ``{"CALLER leg": ..., "AGENT leg": ...}``; the
+    label is printed with the transcript. A Plivo leg recording carries both directions
+    of that leg, so each transcript normally has both speakers: one started with the
+    record API is mono (both voices mixed); the session recording of SILENT_LEG_XML is
+    stereo, with the far party (the agent) on the left and that leg's own Speak audio
+    on the right.
+    Legs with no recording (or an empty one) are left out.
+    """
+    transcripts: dict[str, str] = {}
+    for label, call_uuid in legs.items():
         if not call_uuid:
             continue
         url = wait_for_recording(client, call_uuid, timeout=45)
         if not url:
-            print(f"[Recording] none for {call_uuid}")
+            print(f"[Recording] {label}: none for {call_uuid}")
             continue
         audio = download_recording(url)
-        print(f"[Recording] {call_uuid}: {len(audio)} bytes")
+        print(f"[Recording] {label} ({call_uuid}): {len(audio)} bytes")
         if len(audio) < 1000:
             continue
-        text = transcribe_audio(audio)
-        print(f"[Transcript] ({call_uuid}): {text}")
-        if len(text) > len(transcript):
-            transcript = text
-    return transcript
+        transcripts[label] = transcribe_audio(audio)
+        print(f"[Transcript] {label}: {transcripts[label]}")
+    return transcripts
+
+
+def best_transcript(client: plivo.RestClient, call_uuids: list[str]) -> str:
+    """Download each leg's recording, transcribe it and return the longest transcript."""
+    legs = {call_uuid: call_uuid for call_uuid in call_uuids}
+    return max(leg_transcripts(client, legs).values(), key=len, default="")

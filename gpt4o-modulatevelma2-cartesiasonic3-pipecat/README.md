@@ -368,7 +368,8 @@ uv run pytest tests/test_e2e_live.py -v -s
 # install: the caller's speech is gTTS -> pydub/ffmpeg -> μ-law 8kHz, all from the dev group)
 uv run pytest tests/test_multiturn_voice.py -v -s
 
-# Real calls (the three API keys, Plivo credentials, PLIVO_TEST_NUMBER, ngrok, ffmpeg)
+# Real multi-turn calls (the three API keys, TAVILY_API_KEY for test_live_call.py, Plivo
+# credentials, PLIVO_TEST_NUMBER, ngrok v3, ffmpeg)
 uv run pytest tests/test_live_call.py -v -s
 uv run pytest tests/test_outbound_call.py -v -s
 ```
@@ -379,12 +380,12 @@ uv run pytest tests/test_outbound_call.py -v -s
 | `test_integration.py` (`-k local`) | 18001 | Health, signed and unsigned `/answer`, `playAudio` and speech energy from the opening line |
 | `test_e2e_live.py` | 18005 | Opening line transcribed with faster-whisper |
 | `test_multiturn_voice.py` | 18004 | Three spoken user turns each answered; speaking over an answer produces `clearAudio`. Local only (server subprocess + simulated Plivo stream); skips only when one of the three API keys is missing. The caller's speech is gTTS (Google's public TTS endpoint, no key) decoded by pydub; a synthesis failure fails the test |
-| `test_live_call.py` | 18002 | Real inbound call: signed webhook through the tunnel, recorded and transcribed opening line |
-| `test_outbound_call.py` | 18003 | Real outbound call via `calls.create(answer_url=…/outbound/answer?greeting=…)`: greeting spoken, hangup webhook received |
+| `test_live_call.py` | 18002 | Real inbound call as a conversation: signed `/answer` and `/hold` through the tunnel (unsigned: 403); the caller listens to the opening line (heard uninterrupted in the recording), then speaks three turns with Plivo's Speak API, each after the agent has finished: a factual question (Paris), a current-price question that must call `search_the_web` before the spoken answer, and a goodbye. Each line is transcribed by Modulate and answered; no barge-in; `/hangup` received and pipeline stopped. Needs `TAVILY_API_KEY` too |
+| `test_outbound_call.py` | 18003 | Real outbound call via `calls.create(answer_url=…/outbound/answer?greeting=…)` to a callee that listens first: the greeting is heard in full with no barge-in (recording transcript), then three callee turns spoken with Plivo's Speak API, each one transcribed by Modulate and answered only after the agent has finished its previous turn; hangup webhook received and pipeline stopped |
 
 `test_multiturn_voice.py` synthesises the caller's turns the way the other examples do: gTTS → MP3 → pydub/ffmpeg → 8kHz mono → μ-law. Unlike them, the tools are dev dependencies, so a default `uv sync` is enough and the test does not skip for a missing tool: `gTTS`, `pydub`, `audioop-lts` (Python 3.13+ only, where the stdlib `audioop` that pydub imports was removed) and `imageio-ffmpeg`, whose wheel contains the ffmpeg binary for macOS, Linux and Windows. An `ffmpeg` on `PATH` or in `FFMPEG_DIR` is used instead when there is one. `ffprobe` is not required: the MP3 is decoded through pydub's ffmpeg-only path (`AudioSegment.from_file_using_temporary_files`).
 
-The live call tests use `PLIVO_TEST_NUMBER`, a second Plivo number on the same account. They assign test-only Plivo applications to the numbers involved and restore the original application afterwards. They start their own ngrok agent and skip if one is already running.
+The live call tests use `PLIVO_TEST_NUMBER`, a second Plivo number on the same account. They assign test-only Plivo applications to the numbers involved and restore the original application afterwards. They start their own ngrok agent and skip if one is already running. In both, the human's leg (the caller in `test_live_call.py`, the callee in `test_outbound_call.py`) answers with static XML (a silent session recording plus `<Wait>`) that ngrok serves itself from a Traffic Policy on the same tunnel (ngrok v3), so the servers need no test-only route and one free-plan tunnel is enough. The human's lines are spoken with Plivo's Speak API only after the server log shows the agent has finished its turn (`wait_for_bot_turn` in `tests/helpers.py`). Each test prints both legs' transcripts, labelled. The human leg's recording is stereo (agent on the left channel, human on the right); the agent leg's recording is mono with both voices mixed.
 
 From the repo root:
 

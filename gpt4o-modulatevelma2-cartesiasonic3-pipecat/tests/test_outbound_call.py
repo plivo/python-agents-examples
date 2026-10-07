@@ -4,22 +4,43 @@ Outbound call E2E tests: place the call with Plivo's Make Call API, as a user wo
 Tests:
 1. /outbound/answer (reached through the tunnel) returns Stream XML whose body carries
    the answer_url greeting; unsigned requests get 403
-2. Full outbound call cycle: plivo.RestClient().calls.create(answer_url=<tunnel>/outbound/
-   answer?greeting=..., hangup_url=<tunnel>/outbound/hangup), record, transcribe, and
-   verify that the greeting from the answer_url was spoken, that the callee leg (no query
-   params) got the default greeting, and that the hangup webhook was received
+2. The server has no dial endpoint
+3. Full outbound call cycle, as a natural conversation between the agent and one callee:
+   plivo.RestClient().calls.create(answer_url=<tunnel>/outbound/answer?greeting=...,
+   hangup_url=<tunnel>/outbound/hangup), then
+     agent : the answer_url greeting, uninterrupted (the callee is silent)
+     callee: "Yes, now is a good time, what is this call about?"
+     agent : answers
+     callee: "... what is the capital city of France?"
+     agent : answers (Paris)
+     callee: "... thank you very much, goodbye."
+     agent : answers, then the callee hangs up
 
-The agent calls from PLIVO_PHONE_NUMBER to PLIVO_TEST_NUMBER. A call between two Plivo
-numbers creates a second, inbound call on PLIVO_TEST_NUMBER, answered by that number's
-app. A <Wait>-only answer never answers an inbound call, so PLIVO_TEST_NUMBER is
-temporarily assigned to an app that answers with /outbound/answer (no query params): the
-callee is a second agent instance with the default outbound greeting. The original app
-is restored afterwards.
+How the callee works. The agent calls from PLIVO_PHONE_NUMBER to PLIVO_TEST_NUMBER. A
+call between two Plivo numbers creates a second, inbound call on PLIVO_TEST_NUMBER,
+answered by that number's Plivo application. For the test the number is assigned to an
+application whose answer URL returns SILENT_LEG_XML (tests/helpers.py): a background
+session recording (it answers the call, makes no sound and records from the first
+instant) followed by
+<Wait>, so the line stays open and silent. That XML is served by ngrok itself, from a
+Traffic Policy on the one tunnel (tests/helpers.py: static_xml_policy), so the example's
+servers get no extra route and no second tunnel is needed. The callee's lines are spoken
+into its leg with Plivo's Speak API and reach the agent as real telephone audio. The
+callee never talks over the agent: before each line the test waits for the server log
+to show that the agent finished its turn (Pipecat's "Bot started/stopped speaking",
+LLM and TTS lines, then a short settle time). The number's original application is
+restored afterwards, also when the test fails.
+
+What is verified: the greeting's own words in the recordings' transcripts, no barge-in
+(interruption -> clearAudio) during the greeting or anywhere else, each callee line
+transcribed by Modulate, a spoken agent reply to each line (Paris for the question), the
+signed answer webhook, the stream start, the hangup webhook and the pipeline ending.
 
 Requirements:
     - PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN, PLIVO_PHONE_NUMBER, PLIVO_TEST_NUMBER,
       OPENAI_API_KEY, MODULATE_API_KEY and CARTESIA_API_KEY in .env
-    - ngrok binary available on PATH (or NGROK_BIN), with no other ngrok agent running
+    - ngrok v3 binary (Traffic Policy support) on PATH (or NGROK_BIN), with no other
+      ngrok agent running
     - faster-whisper installed (dev dependency), ffmpeg available
     - Port 18003 available
 
@@ -39,24 +60,36 @@ import pytest
 from dotenv import load_dotenv
 
 from tests.helpers import (
+    INTERRUPTION_LOG,
     LIVE_API_KEYS,
     PLIVO_CALL_VARS,
-    best_transcript,
+    SILENT_LEG_PATH,
+    SILENT_LEG_XML,
+    SpokenTurn,
+    assert_silent_leg_served,
+    check_spoken_turns,
     ensure_ffmpeg_on_path,
-    get_app_id_for_number,
+    final_transcripts,
     hangup_quietly,
+    leg_transcripts,
     list_live_call_ids,
+    log_offset,
     log_tail,
     missing_env,
+    missing_words,
+    number_on_app,
     read_log_text,
     server_log_path,
     signed_webhook,
+    speak_turns,
     start_ngrok,
     start_server,
+    static_xml_policy,
     stop_ngrok,
     stop_server,
     stream_body,
-    upsert_application,
+    tts_texts,
+    wait_for_bot_turn,
     wait_for_log,
 )
 from utils import normalize_phone_number
@@ -80,6 +113,23 @@ GREETING = (
 # Words of GREETING that the default greeting does not contain
 GREETING_ONLY_WORDS = ["courtesy", "demo", "appointment", "quick chat"]
 
+
+# Each line is one unbroken sentence, so the end-of-turn detector has no mid-line pause
+# to mistake for the end of the callee's turn.
+CALLEE_TURNS = (
+    SpokenTurn(
+        "Yes, now is a good time, what is this call about?",
+        heard=("good time", "call"),
+    ),
+    # Checkable whatever the wording, and answerable with or without the web-search tool
+    SpokenTurn(
+        "Okay, and one quick question, what is the capital city of France?",
+        heard=("capital", "france"),
+        answer=("paris",),
+    ),
+    SpokenTurn("Great, thank you very much, goodbye.", heard=("thank",)),
+)
+
 _MISSING = missing_env(*PLIVO_CALL_VARS, *LIVE_API_KEYS)
 pytestmark = pytest.mark.skipif(bool(_MISSING), reason=f"not configured: {', '.join(_MISSING)}")
 
@@ -92,7 +142,7 @@ pytestmark = pytest.mark.skipif(bool(_MISSING), reason=f"not configured: {', '.j
 @pytest.fixture(scope="module")
 def tunnel_url():
     """Start the tunnel before the server so PUBLIC_URL can be passed to it."""
-    proc, public_url = start_ngrok(TEST_PORT)
+    proc, public_url = start_ngrok(TEST_PORT, static_xml_policy({SILENT_LEG_PATH: SILENT_LEG_XML}))
     print(f"\n[tunnel] URL: {public_url}")
     yield public_url
     stop_ngrok(proc)
@@ -123,18 +173,11 @@ def plivo_client():
 
 @pytest.fixture(scope="module")
 def bleg_app_id(plivo_client, tunnel_url):
-    """Point PLIVO_TEST_NUMBER at /outbound/answer (it answers the call); restore afterwards."""
+    """Point PLIVO_TEST_NUMBER at the silent callee XML; always restore its application."""
+    callee_url = assert_silent_leg_served(tunnel_url)
     test_digits = normalize_phone_number(PLIVO_TEST_NUMBER)
-    original_app_id = get_app_id_for_number(plivo_client, test_digits)
-    app_id = upsert_application(plivo_client, BLEG_APP_NAME, f"{tunnel_url}/outbound/answer")
-    plivo_client.numbers.update(number=test_digits, app_id=app_id)
-    print(f"\n[Plivo] Configured {test_digits} with B-leg app {app_id}")
-
-    yield app_id
-
-    if original_app_id and original_app_id != app_id:
-        plivo_client.numbers.update(number=test_digits, app_id=original_app_id)
-        print(f"\n[Plivo] Restored {test_digits} to original app {original_app_id}")
+    with number_on_app(plivo_client, test_digits, BLEG_APP_NAME, callee_url, callee_url) as app_id:
+        yield app_id
 
 
 @pytest.fixture(autouse=True)
@@ -221,7 +264,8 @@ class TestOutboundCall:
         assert httpx.post(f"{tunnel_url}/outbound/call", timeout=10.0).status_code == 404
 
     def test_outbound_call_full_cycle(self, server_process, tunnel_url, plivo_client, bleg_app_id):
-        """Make Call API -> /outbound/answer?greeting=... -> the agent speaks it."""
+        """Make Call API -> greeting heard in full -> three callee turns, each answered."""
+        call_start = log_offset(LOG_PATH)
         baseline = set(list_live_call_ids(plivo_client))
         answer_url = f"{tunnel_url}/outbound/answer?" + urlencode(
             {"greeting": GREETING}, quote_via=quote
@@ -243,46 +287,73 @@ class TestOutboundCall:
         assert request_uuid
 
         a_leg, b_leg = _wait_for_legs(plivo_client, baseline)
-        if not a_leg:
-            pytest.skip("The outbound call did not connect")
-        call_uuids = [uid for uid in (a_leg, b_leg) if uid]
-
+        ended = f"Outbound call ended: CallUUID={a_leg}"
         try:
-            for uid in call_uuids:
-                try:
-                    plivo_client.calls.start_recording(uid, file_format="mp3")
-                except Exception as e:
-                    print(f"[Outbound] Recording failed on {uid}: {e}")
-            print("[Outbound] Letting the agent speak for 18s...")
-            time.sleep(18)
-        finally:
-            hangup_quietly(plivo_client, *call_uuids)
+            assert a_leg, f"The outbound call did not connect\n{log_tail(LOG_PATH)}"
+            assert b_leg, "The callee leg (inbound call on PLIVO_TEST_NUMBER) did not go live"
+            # The callee leg records itself from its answer XML; record the agent's leg too
+            try:
+                plivo_client.calls.start_recording(a_leg, file_format="mp3")
+            except Exception as e:
+                print(f"[Outbound] Recording failed on {a_leg}: {e}")
 
-        transcript = best_transcript(plivo_client, call_uuids)
-        assert len(transcript) > 5, (
-            f"No speech found in any recording of {call_uuids}\n{log_tail(LOG_PATH)}"
-        )
-        # Both legs run an agent, and both greet the moment the call connects, so each
-        # agent's speech interrupts the other's greeting (barge-in) and the recording is
-        # two voices talking over each other. The words heard are reported, but the proof
-        # that the answer_url greeting was spoken verbatim is the text handed to TTS.
-        spoken = [w for w in GREETING_ONLY_WORDS if w in transcript.lower()]
-        print(f"[Result] greeting words heard in the recording: {spoken}")
+            # 1. The callee stays silent until the agent has finished its greeting
+            assert wait_for_bot_turn(LOG_PATH, call_start, timeout=40), (
+                f"The agent never finished its greeting\n{log_tail(LOG_PATH)}"
+            )
+            # 2-4. The callee speaks, then waits for the agent to finish its answer
+            offsets = speak_turns(plivo_client, b_leg, CALLEE_TURNS, LOG_PATH, who="Callee")
+            # The callee hangs up; Plivo ends the agent's leg and closes its stream
+            hangup_quietly(plivo_client, b_leg)
+            hangup_received = wait_for_log(LOG_PATH, ended, timeout=20)
+        finally:
+            hangup_quietly(plivo_client, a_leg, b_leg)
 
         log = read_log_text(LOG_PATH)
-        assert f"Generating TTS [{GREETING}]" in log, (
-            f"The answer_url greeting never reached TTS\n{log_tail(LOG_PATH)}"
-        )
+        greeting_log = log[call_start : offsets[0]]
+        print(f"[Agent] greeting: {tts_texts(greeting_log)}")
+
+        # The answer webhook was signed and carried the greeting; the stream started
         assert f"Outbound call answered: CallUUID={a_leg}" in log
         a_line = next(line for line in log.splitlines() if f"answered: CallUUID={a_leg}" in line)
         assert "greeting: from answer_url" in a_line
         assert f"Plivo stream started: callId={a_leg}" in log
-        if b_leg:  # callee answered /outbound/answer without query params -> default greeting
-            b_lines = [line for line in log.splitlines() if f"answered: CallUUID={b_leg}" in line]
-            assert b_lines and "greeting: default" in b_lines[0], b_lines
+        # One agent only: the callee leg never reached the outbound server
+        assert b_leg not in log, "The callee leg was answered by the agent"
 
-        ended = f"Outbound call ended: CallUUID={a_leg}"
-        assert wait_for_log(LOG_PATH, ended, timeout=15), "hangup_url webhook not received"
+        # Nothing interrupted the greeting (the original problem: two agents greeting at
+        # once): no interruption, hence no clearAudio, before the callee's first line.
+        # The greeting went to TTS word for word.
+        assert INTERRUPTION_LOG not in greeting_log, (
+            f"Interruption during the greeting\n{greeting_log[-1500:]}"
+        )
+        assert final_transcripts(greeting_log) == [], (
+            f"The agent heard speech during its greeting: {final_transcripts(greeting_log)}"
+        )
+        assert tts_texts(greeting_log) == [GREETING], tts_texts(greeting_log)
+
+        # Each callee line was transcribed by Modulate and answered in speech; the callee
+        # never talked over the agent, so no turn has a barge-in either
+        check_spoken_turns(CALLEE_TURNS, log, offsets)
+
+        # What was really heard on the line: both legs' recordings, transcribed locally
+        transcripts = leg_transcripts(plivo_client, {"AGENT leg": a_leg, "CALLEE leg": b_leg})
+        assert transcripts, f"No recording of {a_leg} or {b_leg} could be transcribed"
+        heard_on_call = " ".join(transcripts.values()).lower().replace("-", " ")
+        assert not missing_words(GREETING_ONLY_WORDS, heard_on_call), (
+            f"The recordings lack {missing_words(GREETING_ONLY_WORDS, heard_on_call)} of the "
+            f"answer_url greeting: {transcripts}"
+        )
+        for turn in CALLEE_TURNS:
+            assert not missing_words(turn.answer, heard_on_call), (
+                f"The recordings lack the answer {turn.answer} to '{turn.text}': {transcripts}"
+            )
+
+        # Hangup webhook received, and the agent stopped its pipeline on the stream close
+        assert hangup_received, f"hangup_url webhook not received\n{log_tail(LOG_PATH)}"
+        assert wait_for_log(LOG_PATH, f"Pipeline ended for outbound call {a_leg}", timeout=15), (
+            f"The pipeline was still running after the hangup\n{log_tail(LOG_PATH)}"
+        )
 
 
 if __name__ == "__main__":
