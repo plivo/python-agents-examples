@@ -231,8 +231,10 @@ echo ""
 
 echo "--- Audio Pipeline ---"
 
-# PLIVO_CHUNK_SIZE = 160
-if grep -rq "PLIVO_CHUNK_SIZE.*=.*160\|PLIVO_CHUNK_SIZE = 160" "$EXAMPLE_DIR/inbound/agent.py" "$EXAMPLE_DIR/outbound/agent.py" 2>/dev/null; then
+# PLIVO_CHUNK_SIZE = 160 (consumed by _send_to_plivo; a framework's transport does its own chunking)
+if [[ "$ORCHESTRATION" == "framework" ]]; then
+    skip "PLIVO_CHUNK_SIZE = 160 (framework transport chunks the audio)"
+elif grep -rq "PLIVO_CHUNK_SIZE.*=.*160\|PLIVO_CHUNK_SIZE = 160" "$EXAMPLE_DIR/inbound/agent.py" "$EXAMPLE_DIR/outbound/agent.py" 2>/dev/null; then
     pass "PLIVO_CHUNK_SIZE = 160 found in agent.py"
 else
     fail "PLIVO_CHUNK_SIZE = 160 not found in agent.py"
@@ -328,11 +330,14 @@ elif [[ "$ORCHESTRATION" == "native" ]]; then
         fail "silero-vad not found in pyproject.toml"
     fi
 else
-    # Framework: check vad_enabled
-    if grep -rq "vad_enabled.*True\|vad_enabled=True" "$EXAMPLE_DIR/inbound/agent.py" 2>/dev/null; then
-        pass "vad_enabled=True found in framework config"
+    # Framework: a VAD analyzer must be configured. Current Pipecat takes it as vad_analyzer=...
+    # (on the user aggregator or transport params); Pipecat before 1.0 used vad_enabled=True.
+    if grep -Eq "vad_analyzer *=" "$EXAMPLE_DIR/inbound/agent.py" 2>/dev/null; then
+        pass "vad_analyzer configured in framework config"
+    elif grep -Eq "vad_enabled *= *True" "$EXAMPLE_DIR/inbound/agent.py" 2>/dev/null; then
+        pass "vad_enabled=True found in framework config (legacy Pipecat <1.0)"
     else
-        fail "vad_enabled=True not found in inbound/agent.py"
+        fail "no VAD configured in inbound/agent.py (expected vad_analyzer=...)"
     fi
     skip "SileroVADProcessor (framework uses built-in VAD)"
     skip "plivo_to_vad (framework uses built-in VAD)"

@@ -67,7 +67,7 @@ Include all tool functions from the scaffold (check_order_status, send_sms, sche
 
 **For framework orchestration**, implement `run_agent()`:
 - Configure framework transport with Plivo WebSocket
-- Set `vad_enabled=True` in transport params
+- Pass the framework's VAD analyzer (Pipecat: `vad_analyzer=SileroVADAnalyzer()` on `LLMUserAggregatorParams`; `vad_enabled=True` is Pipecat <1.0 only)
 - Assemble Pipeline with appropriate services
 - Start the pipeline
 

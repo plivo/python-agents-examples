@@ -124,7 +124,7 @@ Constants live where they are consumed:
 
 **`agent.py`** owns:
 - API keys, model names, voice names, API URLs
-- `PLIVO_CHUNK_SIZE = 160` (used in `_send_to_plivo`)
+- `PLIVO_CHUNK_SIZE = 160` (used in `_send_to_plivo`; not defined in framework examples, where the transport chunks the audio)
 - `SYSTEM_PROMPT` (loaded only from `system_prompt.md`; no env override, see "System Prompt")
 
 **`utils.py`** owns only what its functions consume:
@@ -168,11 +168,11 @@ For framework examples: no VAD in utils (framework handles it).
 - Speech end triggers turn commit (`input_audio_buffer.commit` + `response.create` or equivalent)
 - Reference: `grok3-voice-native/utils.py` (SileroVADProcessor), `grok3-voice-native/inbound/agent.py` (integration)
 
-**Framework examples** (Pipecat/LiveKit): use `vad_enabled=True` in transport params. No separate Silero.
+**Framework examples** (Pipecat/LiveKit): pass the framework's VAD analyzer, e.g. `vad_analyzer=SileroVADAnalyzer()` on Pipecat's `LLMUserAggregatorParams`. `vad_enabled=True` in transport params is the Pipecat <1.0 spelling and is ignored on 1.x. No separate Silero.
 
 ## Audio Pipeline Rules
 
-- `PLIVO_CHUNK_SIZE = 160` — exactly 20ms at 8kHz mono μ-law. Defined in `agent.py._send_to_plivo()`.
+- `PLIVO_CHUNK_SIZE = 160` — exactly 20ms at 8kHz mono μ-law. Defined in `agent.py._send_to_plivo()`. Native and managed-platform examples only: a framework's transport does the chunking, so framework examples do not define it.
 - Plivo WebSocket sends/receives base64 μ-law at 8kHz
 - playAudio JSON format: `{"event": "playAudio", "media": {"contentType": "audio/x-mulaw", "sampleRate": 8000, "payload": "<base64>"}}`
 - Answer webhook returns `<Stream>` XML: `bidirectional=True`, `keepCallAlive=True`, `contentType="audio/x-mulaw;rate=8000"`
