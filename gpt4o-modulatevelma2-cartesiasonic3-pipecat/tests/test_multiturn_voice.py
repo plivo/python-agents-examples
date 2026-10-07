@@ -1,243 +1,316 @@
 """
-Test multi-turn voice conversation with TTS-generated speech.
+Multi-turn voice conversation + barge-in tests against a local inbound server.
 
-This is a standalone test script that demonstrates the voice agent
-handling multiple conversation turns with real synthesized speech.
+The test plays Plivo's side of the bidirectional stream: it fetches the <Stream> URL from
+a Plivo-signed /answer webhook, sends the start event, then μ-law 8kHz audio in 20ms
+frames. User turns are real speech synthesised with gTTS, so they pass through Silero VAD
+and Modulate Velma-2 exactly as caller audio does. No phone call is placed and the server
+gets no Plivo account or number.
 
-Requirements:
-    - Server running: uv run python -m inbound.server
-    - ffmpeg/ffprobe in PATH (for audio conversion)
-    - gTTS and pydub installed (included in dev dependencies)
+Tests:
+1. Multi-turn: the opening line, then three spoken user turns; each must be answered
+   with speech (playAudio with energy above the silence floor).
+2. Barge-in: speak over an answer while it is still streaming. The server must send
+   Plivo a clearAudio event (CLAUDE.md "WebSocket Protocol" step 5) and then answer the
+   interrupting turn.
+
+Requirements (the tests skip, with the reason, when any is missing):
+    - OPENAI_API_KEY, MODULATE_API_KEY and CARTESIA_API_KEY in .env
+    - gTTS and pydub (not dev dependencies: `uv pip install gTTS pydub`; pydub also
+      needs `audioop-lts` on Python 3.13+), network access for gTTS
+    - ffmpeg binary available (PATH, FFMPEG_DIR, or a parent directory)
+    - Port 18004 available
 
 Usage:
-    # Add ffmpeg to PATH if needed
-    PATH="/path/to/ffmpeg:$PATH" uv run python tests/test_multiturn_voice.py
+    uv run pytest tests/test_multiturn_voice.py -v -s
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import os
+import shutil
+import struct
 import tempfile
 import time
 import uuid
 
+import pytest
 import websockets
+from dotenv import load_dotenv
 
-from utils import pcm_to_ulaw
+from tests.helpers import (
+    LIVE_API_KEYS,
+    TEST_AUTH_TOKEN,
+    ensure_ffmpeg_on_path,
+    local_server_env,
+    log_tail,
+    missing_env,
+    server_log_path,
+    signed_webhook,
+    start_server,
+    stop_server,
+    stream_url_from_xml,
+)
+from utils import pcm_to_ulaw, ulaw_to_pcm
+
+load_dotenv()
+ensure_ffmpeg_on_path()
+
+TEST_PORT = 18004
+TEST_HTTP_URL = f"http://localhost:{TEST_PORT}"
+LOG_PATH = server_log_path("modulate_multiturn_server")
+
+FRAME_BYTES = 160  # 20ms of μ-law at 8kHz
+FRAME_SECS = 0.02
+SILENCE_FRAME = base64.b64encode(b"\xff" * FRAME_BYTES).decode()
+
+pytestmark = pytest.mark.skipif(
+    bool(missing_env(*LIVE_API_KEYS)),
+    reason=f"not configured: {', '.join(missing_env(*LIVE_API_KEYS))}",
+)
 
 
-def generate_tts_audio(text: str) -> bytes | None:
-    """Generate speech audio using Google TTS and convert to μ-law."""
-    try:
-        from gtts import gTTS
-        from pydub import AudioSegment
-    except ImportError:
-        print("  gTTS or pydub not available")
-        return None
-
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-        mp3_path = f.name
-
-    try:
-        tts = gTTS(text=text, lang="en")
-        tts.save(mp3_path)
-
-        audio = AudioSegment.from_mp3(mp3_path)
-        audio = audio.set_frame_rate(8000).set_channels(1).set_sample_width(2)
-
-        return pcm_to_ulaw(audio.raw_data)
-    except Exception as e:
-        print(f"  TTS error: {e}")
-        return None
-    finally:
-        if os.path.exists(mp3_path):
-            os.remove(mp3_path)
+# =============================================================================
+# Helpers
+# =============================================================================
 
 
-async def send_audio_and_wait(ws, audio_bytes: bytes, timeout: float = 15.0) -> dict:
-    """Send audio and wait for response."""
-    result = {"sent_chunks": 0, "recv_chunks": 0, "recv_bytes": 0, "ttfr": None}
+def rms_of_ulaw(ulaw_audio: bytes) -> float:
+    pcm = ulaw_to_pcm(ulaw_audio)
+    samples = struct.unpack(f"{len(pcm) // 2}h", pcm)
+    return (sum(s * s for s in samples) / max(len(samples), 1)) ** 0.5
 
-    # Send in 20ms chunks (160 bytes at 8kHz μ-law)
-    chunk_size = 160
-    chunks = [audio_bytes[i : i + chunk_size] for i in range(0, len(audio_bytes), chunk_size)]
 
-    start_time = time.time()
+class SimulatedCaller:
+    """Plays Plivo's side of the stream: frames out every 20ms, events in."""
 
-    for chunk in chunks:
-        payload = base64.b64encode(chunk).decode()
-        await ws.send(json.dumps({"event": "media", "media": {"payload": payload}}))
-        result["sent_chunks"] += 1
-        await asyncio.sleep(0.02)
+    def __init__(self, ws) -> None:
+        self.ws = ws
+        self.audio = bytearray()  # every playAudio payload so far
+        self.clear_audio_at: list[float] = []  # arrival times of clearAudio events
+        self.last_audio_at = 0.0
+        self.closed = False
+        self._speech: list[str] = []  # queued user frames (base64), sent ahead of silence
+        self._tasks: list[asyncio.Task] = []
 
-    # Wait for response
-    last_received = time.time()
+    async def start(self) -> None:
+        start = {
+            "event": "start",
+            "start": {"callId": str(uuid.uuid4()), "streamId": str(uuid.uuid4())},
+        }
+        await self.ws.send(json.dumps(start))
+        self._tasks = [
+            asyncio.create_task(self._send_frames(), name="caller_tx"),
+            asyncio.create_task(self._receive(), name="caller_rx"),
+        ]
 
-    while time.time() - start_time < timeout:
-        silence = base64.b64encode(b"\xff" * 160).decode()
-        await ws.send(json.dumps({"event": "media", "media": {"payload": silence}}))
+    async def stop(self) -> None:
+        for task in self._tasks:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
 
+    async def _send_frames(self) -> None:
+        """One frame every 20ms, as Plivo sends them: queued speech, otherwise silence."""
+        next_send = time.monotonic()
+        while True:
+            payload = self._speech.pop(0) if self._speech else SILENCE_FRAME
+            await self.ws.send(json.dumps({"event": "media", "media": {"payload": payload}}))
+            next_send += FRAME_SECS
+            await asyncio.sleep(max(0.0, next_send - time.monotonic()))
+
+    async def _receive(self) -> None:
         try:
-            while True:
-                message = await asyncio.wait_for(ws.recv(), timeout=0.05)
+            async for message in self.ws:
                 data = json.loads(message)
                 if data.get("event") == "playAudio":
-                    result["recv_chunks"] += 1
-                    payload = data.get("media", {}).get("payload", "")
-                    if payload:
-                        result["recv_bytes"] += len(base64.b64decode(payload))
-                    last_received = time.time()
-                    if result["ttfr"] is None:
-                        result["ttfr"] = time.time() - start_time
-        except asyncio.TimeoutError:
-            pass
+                    self.audio.extend(base64.b64decode(data["media"]["payload"]))
+                    self.last_audio_at = time.monotonic()
+                elif data.get("event") == "clearAudio":
+                    self.clear_audio_at.append(time.monotonic())
         except websockets.exceptions.ConnectionClosed:
-            break
+            pass
+        finally:
+            self.closed = True
 
-        if result["recv_chunks"] > 0 and (time.time() - last_received) > 3:
-            break
+    def say(self, ulaw_audio: bytes) -> None:
+        """Queue a spoken user turn; it goes out in real time, 20ms per frame."""
+        for i in range(0, len(ulaw_audio), FRAME_BYTES):
+            frame = ulaw_audio[i : i + FRAME_BYTES].ljust(FRAME_BYTES, b"\xff")
+            self._speech.append(base64.b64encode(frame).decode())
 
-        await asyncio.sleep(0.02)
+    async def wait_until_said(self) -> None:
+        while self._speech and not self.closed:
+            await asyncio.sleep(FRAME_SECS)
 
-    return result
+    async def wait_for_audio(self, offset: int, min_bytes: int, timeout: float) -> bool:
+        """True once more than ``min_bytes`` of agent audio arrived after ``offset``."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not self.closed:
+            if len(self.audio) - offset >= min_bytes:
+                return True
+            await asyncio.sleep(0.05)
+        return len(self.audio) - offset >= min_bytes
+
+    async def wait_until_quiet(self, quiet_secs: float = 2.5, timeout: float = 40.0) -> None:
+        """Wait until no agent audio has arrived for ``quiet_secs``."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not self.closed:
+            if self.last_audio_at and time.monotonic() - self.last_audio_at >= quiet_secs:
+                return
+            await asyncio.sleep(0.05)
 
 
-async def wait_for_greeting(ws, timeout: float = 10.0) -> dict:
-    """Wait for agent greeting."""
-    result = {"recv_chunks": 0, "recv_bytes": 0}
-    start_time = time.time()
-    last_received = start_time
+def stream_url(call_uuid: str) -> str:
+    """The /ws URL from a Plivo-signed answer webhook."""
+    form = {"CallUUID": call_uuid, "From": "+15551234567", "To": "+16572338892"}
+    resp = signed_webhook("POST", f"{TEST_HTTP_URL}/answer", TEST_AUTH_TOKEN, form)
+    assert resp.status_code == 200, resp.text
+    return stream_url_from_xml(resp.text)
 
-    while time.time() - start_time < timeout:
-        silence = base64.b64encode(b"\xff" * 160).decode()
-        await ws.send(json.dumps({"event": "media", "media": {"payload": silence}}))
 
+# =============================================================================
+# Fixtures
+# =============================================================================
+
+
+@pytest.fixture(scope="module")
+def synthesize():
+    """text -> μ-law 8kHz speech via gTTS; skips the module when it cannot be produced."""
+    gtts = pytest.importorskip("gtts", reason="gTTS not installed (uv pip install gTTS pydub)")
+    pydub = pytest.importorskip(
+        "pydub", reason="pydub not importable (uv pip install pydub; audioop-lts on 3.13+)"
+    )
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not found (PATH, FFMPEG_DIR or a parent directory)")
+
+    def synth(text: str) -> bytes:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            mp3_path = f.name
         try:
-            while True:
-                message = await asyncio.wait_for(ws.recv(), timeout=0.05)
-                data = json.loads(message)
-                if data.get("event") == "playAudio":
-                    result["recv_chunks"] += 1
-                    payload = data.get("media", {}).get("payload", "")
-                    if payload:
-                        result["recv_bytes"] += len(base64.b64decode(payload))
-                    last_received = time.time()
-        except asyncio.TimeoutError:
-            pass
-        except websockets.exceptions.ConnectionClosed:
-            break
+            try:
+                gtts.gTTS(text=text, lang="en").save(mp3_path)
+            except Exception as e:  # gTTS needs network access to Google
+                pytest.skip(f"gTTS could not synthesise speech: {type(e).__name__}: {e}")
+            audio = pydub.AudioSegment.from_mp3(mp3_path)
+            audio = audio.set_frame_rate(8000).set_channels(1).set_sample_width(2)
+            ulaw = pcm_to_ulaw(audio.raw_data)
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(mp3_path)
+        assert len(ulaw) > 4000, f"Synthesised speech too short for '{text}'"
+        return ulaw
 
-        if result["recv_chunks"] > 0 and (time.time() - last_received) > 2:
-            break
-
-        await asyncio.sleep(0.02)
-
-    return result
+    return synth
 
 
-async def test_multiturn_voice():
-    """Test a complete multi-turn voice conversation."""
-    ws_url = "ws://localhost:8000/ws?body=eyJjYWxsX3V1aWQiOiAidGVzdCIsICJmcm9tIjogIisxNTU1MTIzNDU2NyIsICJ0byI6ICIrMTY1NzIzMzg4OTIifQ=="
+@pytest.fixture(scope="module")
+def server_process(synthesize):
+    """Inbound server on TEST_PORT (SIGTERM -> wait(5) -> SIGKILL on teardown).
 
-    print("=" * 70)
-    print("MULTI-TURN VOICE CONVERSATION TEST")
-    print("=" * 70)
+    Depends on ``synthesize`` so no server is started when the speech deps are missing.
+    """
+    proc = start_server("inbound.server", TEST_PORT, LOG_PATH, local_server_env(TEST_PORT))
+    print(f"\n[server] logs: {LOG_PATH}")
+    yield proc
+    stop_server(proc)
 
-    turns = [
-        "What are your business hours?",
-        "Do you have any specials today?",
-        "Thanks, goodbye!",
-    ]
 
-    print("\nGenerating TTS audio...")
-    turn_audio = []
-    for i, text in enumerate(turns):
-        print(f'  Turn {i + 1}: "{text}"')
-        audio = generate_tts_audio(text)
-        if audio is None:
-            print("  ERROR: Could not generate TTS audio")
-            print("  Make sure ffmpeg is in PATH and gTTS/pydub are installed")
-            return
-        turn_audio.append((text, audio))
-        print(f"    Generated {len(audio)} bytes ({len(audio) / 8000:.1f}s)")
+# =============================================================================
+# Tests
+# =============================================================================
 
-    print("\nConnecting to WebSocket...")
 
-    try:
-        async with websockets.connect(ws_url, close_timeout=5) as ws:
-            print("Connected\n")
+class TestMultiturnVoice:
+    """Multi-turn conversation and barge-in over the simulated Plivo stream."""
 
-            await ws.send(
-                json.dumps(
-                    {
-                        "event": "start",
-                        "start": {"callId": str(uuid.uuid4()), "streamId": str(uuid.uuid4())},
-                    }
+    async def test_multiturn_conversation(self, server_process, synthesize):
+        """Opening line, then three spoken turns, each answered with speech."""
+        turns = [
+            "What can you help me with?",
+            "What is the capital city of France?",
+            "Thank you, that is all. Goodbye.",
+        ]
+        speech = [synthesize(text) for text in turns]
+        responses: list[bytes] = []
+
+        async with websockets.connect(stream_url("multiturn"), close_timeout=3) as ws:
+            caller = SimulatedCaller(ws)
+            await caller.start()
+            try:
+                assert await caller.wait_for_audio(0, 1600, timeout=25), (
+                    f"No opening line\n{log_tail(LOG_PATH)}"
                 )
-            )
+                await caller.wait_until_quiet()
 
-            results = []
+                for text, audio in zip(turns, speech, strict=True):
+                    offset = len(caller.audio)
+                    print(f"[Turn] user: '{text}' ({len(audio) / 8000:.1f}s)")
+                    caller.say(audio)
+                    await caller.wait_until_said()
+                    answered = await caller.wait_for_audio(offset, 1600, timeout=30)
+                    assert answered, f"No answer to '{text}'\n{log_tail(LOG_PATH)}"
+                    await caller.wait_until_quiet()
+                    responses.append(bytes(caller.audio[offset:]))
+                    print(f"[Turn] agent: {len(responses[-1]) / 8000:.1f}s of audio")
+            finally:
+                await caller.stop()
 
-            # Wait for greeting
-            print("Turn 0: Agent Greeting")
-            print("-" * 50)
-            greeting = await wait_for_greeting(ws)
-            results.append(("Greeting", 0, greeting["recv_bytes"], None))
-            print(f"  Received {greeting['recv_chunks']} chunks ({greeting['recv_bytes']} bytes)\n")
+        assert len(responses) == len(turns)
+        for text, response in zip(turns, responses, strict=True):
+            assert rms_of_ulaw(response) > 500, f"Answer to '{text}' is silence"
 
-            # Execute conversation turns
-            for i, (text, audio) in enumerate(turn_audio):
-                print(f'Turn {i + 1}: "{text}"')
-                print("-" * 50)
+    async def test_barge_in(self, server_process, synthesize):
+        """Speaking over an answer makes the server send clearAudio, then answer again."""
+        question = synthesize("Can you explain, step by step, how a phone call gets connected?")
+        interruption = synthesize("Wait, stop. What is two plus two?")
 
-                result = await send_audio_and_wait(ws, audio, timeout=20.0)
-                results.append((text[:30], len(audio), result["recv_bytes"], result["ttfr"]))
+        async with websockets.connect(stream_url("barge-in"), close_timeout=3) as ws:
+            caller = SimulatedCaller(ws)
+            await caller.start()
+            try:
+                assert await caller.wait_for_audio(0, 1600, timeout=25), (
+                    f"No opening line\n{log_tail(LOG_PATH)}"
+                )
+                await caller.wait_until_quiet()
 
-                if result["recv_chunks"] > 0:
-                    print(f"  Sent {result['sent_chunks']} chunks")
-                    print(
-                        f"  Received {result['recv_chunks']} chunks ({result['recv_bytes']} bytes)"
-                    )
-                    if result["ttfr"]:
-                        print(f"  Time to first response: {result['ttfr']:.1f}s")
-                else:
-                    print("  No response received")
-                print()
+                offset = len(caller.audio)
+                caller.say(question)
+                await caller.wait_until_said()
+                assert await caller.wait_for_audio(offset, 1600, timeout=30), (
+                    f"The agent never started answering\n{log_tail(LOG_PATH)}"
+                )
 
-            # Summary
-            print("=" * 70)
-            print("SUMMARY")
-            print("=" * 70)
-            print(f"{'Turn':<5} {'Description':<32} {'Sent':>10} {'Recv':>10} {'TTFR':>8}")
-            print("-" * 70)
+                # Interrupt while the answer is still streaming
+                interrupted_at = time.monotonic()
+                assert interrupted_at - caller.last_audio_at < 1.0, (
+                    "The answer had already finished streaming; nothing left to interrupt"
+                )
+                cleared_before = len(caller.clear_audio_at)
+                caller.say(interruption)
+                await caller.wait_until_said()
 
-            total_recv = 0
-            for i, (desc, sent, recv, ttfr) in enumerate(results):
-                ttfr_str = f"{ttfr:.1f}s" if ttfr else "-"
-                print(f"{i:<5} {desc:<32} {sent:>9}B {recv:>9}B {ttfr_str:>8}")
-                total_recv += recv
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and len(caller.clear_audio_at) == cleared_before:
+                    await asyncio.sleep(0.05)
+                new_clears = caller.clear_audio_at[cleared_before:]
+                assert new_clears, (
+                    f"No clearAudio after speaking over the agent\n{log_tail(LOG_PATH)}"
+                )
+                print(f"[Barge-in] clearAudio {new_clears[0] - interrupted_at:.2f}s after speech")
 
-            print("-" * 70)
-            print(f"Total received: {total_recv} bytes")
-            print()
-
-            if all(r[2] > 0 for r in results):
-                print("SUCCESS: All turns completed!")
-            else:
-                print("PARTIAL: Some turns had no response")
-
-    except ConnectionRefusedError:
-        print("\nERROR: Could not connect to server")
-        print("Make sure the server is running: uv run python -m inbound.server")
-    except Exception as e:
-        print(f"\nERROR: {e}")
-        import traceback
-
-        traceback.print_exc()
+                # The interrupting turn gets its own answer
+                after_clear = len(caller.audio)
+                assert await caller.wait_for_audio(after_clear, 1600, timeout=30), (
+                    f"No answer to the interrupting turn\n{log_tail(LOG_PATH)}"
+                )
+            finally:
+                await caller.stop()
 
 
 if __name__ == "__main__":
-    asyncio.run(test_multiturn_voice())
+    pytest.main([__file__, "-v", "-s"])

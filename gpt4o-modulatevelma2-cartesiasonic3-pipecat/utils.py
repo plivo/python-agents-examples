@@ -1,40 +1,21 @@
-"""Shared utilities, audio processing, and the Modulate STT service.
+"""Shared utilities: phone number normalization and audio conversion.
 
-This module provides:
-- Phone number normalization
-- Audio format conversion (μ-law <-> PCM, resampling)
-- ModulateSTTService: Velma-2 streaming as a Pipecat STT service
+- Phone number normalization (E.164)
+- Audio format conversion (μ-law <-> PCM16, resampling, Plivo <-> Cartesia)
 
-Note: VAD is handled by Pipecat framework (vad_analyzer on the user aggregator).
-
-The STT service lives here rather than in inbound/ or outbound/ because both
-agents use it and the canonical structure has no services/ directory. It is
-transport-level audio code, which is what this module already owns.
+Only utility functions and the constants they consume live here. VAD is handled
+by Pipecat (Silero analyzer on the user aggregator), and the Modulate STT
+service lives in inbound/agent.py and outbound/agent.py.
 """
 
 from __future__ import annotations
 
-import json
 import os
-from collections.abc import AsyncGenerator
 
 import numpy as np
 import phonenumbers
-import websockets
 from dotenv import load_dotenv
 from loguru import logger
-from pipecat.frames.frames import (
-    CancelFrame,
-    EndFrame,
-    Frame,
-    InterimTranscriptionFrame,
-    StartFrame,
-    TranscriptionFrame,
-)
-from pipecat.services.settings import STTSettings
-from pipecat.services.stt_service import WebsocketSTTService
-from pipecat.transcriptions.language import Language
-from pipecat.utils.time import time_now_iso8601
 from scipy import signal as scipy_signal
 
 load_dotenv()
@@ -48,7 +29,6 @@ DEFAULT_COUNTRY_CODE = os.getenv("DEFAULT_COUNTRY_CODE", "US")
 # Audio format constants
 PLIVO_SAMPLE_RATE = 8000  # Plivo uses 8kHz μ-law
 CARTESIA_SAMPLE_RATE = 24000  # Cartesia Sonic default PCM output rate
-MODULATE_SAMPLE_RATE = 8000  # Velma-2 receives s16le at the pipeline rate
 
 # =============================================================================
 # Phone Number Utilities
@@ -65,7 +45,7 @@ def normalize_phone_number(phone: str, default_region: str = DEFAULT_COUNTRY_COD
         e164 = phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
         return e164.lstrip("+")
     except phonenumbers.NumberParseException as e:
-        logger.warning(f"Failed to parse phone number '{phone}': {e}")
+        logger.warning(f"Failed to parse phone number: {type(e).__name__}")
         return "".join(c for c in phone if c.isdigit())
 
 
@@ -385,203 +365,3 @@ def cartesia_to_plivo(pcm_24k: bytes) -> bytes:
     """Convert Cartesia audio (PCM16 24kHz) to Plivo format (μ-law 8kHz)."""
     pcm_8k = resample_audio(pcm_24k, CARTESIA_SAMPLE_RATE, PLIVO_SAMPLE_RATE)
     return pcm_to_ulaw(pcm_8k)
-
-
-# =============================================================================
-# Modulate Velma-2 STT
-# =============================================================================
-
-MODULATE_STT_URL = "wss://platform.modulate.ai/api/velma-2-streaming"
-MODULATE_STT_MODEL = "velma-2"
-
-
-class ModulateSTTService(WebsocketSTTService):
-    """Modulate Velma-2 streaming as a Pipecat STT service.
-
-    Velma returns more than a transcript on a single socket: each finalised clip
-    carries an optional emotion, accent and synthetic-voice score. The transcript
-    drives the pipeline; the extra signals are logged and exposed on the
-    TranscriptionFrame's ``result`` for anything downstream that wants them.
-
-    Protocol (https://docs.modulate.ai/api-reference/velma/streaming):
-      - API key goes in the query string, not a header. A bad key closes with 4001.
-      - Exactly one configuration text frame must precede any audio.
-      - Audio is raw binary; we send s16le at the pipeline's own sample rate.
-      - ``partial_clip`` -> interim transcript, ``clip`` -> final.
-
-    Note: ``behavior_detection`` events are documented for this endpoint but were
-    not observed on the streaming socket during testing (2026-10-05). Behaviours
-    come back reliably from the batch endpoint. The handler is kept because it is
-    correct per the docs and costs nothing.
-    """
-
-    def __init__(
-        self,
-        *,
-        api_key: str,
-        behaviors: list[str] | None = None,
-        produce_topics: bool = False,
-        produce_summary: bool = False,
-        sample_rate: int | None = None,
-        **kwargs,
-    ) -> None:
-        # Velma-2 auto-detects language and exposes no model selector, so
-        # language is explicitly None rather than left NOT_GIVEN; the base
-        # class asserts every settings field has a real value.
-        super().__init__(
-            sample_rate=sample_rate,
-            settings=STTSettings(model=MODULATE_STT_MODEL, language=None),
-            **kwargs,
-        )
-        self._api_key = api_key
-        self._config = json.dumps(
-            {
-                "behaviors": behaviors or [],
-                "produce_topics": produce_topics,
-                "produce_summary": produce_summary,
-            }
-        )
-        self._websocket = None
-        self._receive_task = None
-
-    def can_generate_metrics(self) -> bool:
-        return True
-
-    # -- lifecycle ------------------------------------------------------------
-
-    async def start(self, frame: StartFrame) -> None:
-        await super().start(frame)
-        await self._connect()
-
-    async def stop(self, frame: EndFrame) -> None:
-        await super().stop(frame)
-        await self._disconnect()
-
-    async def cancel(self, frame: CancelFrame) -> None:
-        await super().cancel(frame)
-        await self._disconnect()
-
-    async def _connect(self) -> None:
-        await self._connect_websocket()
-        await super()._connect()
-        if self._websocket and not self._receive_task:
-            self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
-
-    async def _disconnect(self) -> None:
-        await super()._disconnect()
-        if self._receive_task:
-            await self.cancel_task(self._receive_task)
-            self._receive_task = None
-        await self._disconnect_websocket()
-
-    async def _connect_websocket(self) -> None:
-        if self._websocket:
-            return
-        url = (
-            f"{MODULATE_STT_URL}?api_key={self._api_key}"
-            f"&audio_format=s16le&sample_rate={self.sample_rate}&num_channels=1"
-        )
-        try:
-            self._websocket = await websockets.connect(url, max_size=None)
-        except Exception as e:
-            logger.error(f"Modulate connect failed: {e}")
-            self._websocket = None
-            return
-        await self._websocket.send(self._config)
-        logger.info(f"Modulate Velma-2 connected at {self.sample_rate}Hz")
-
-    async def _disconnect_websocket(self) -> None:
-        if not self._websocket:
-            return
-        try:
-            await self._websocket.send("")  # end-of-stream signal
-            await self._websocket.close()
-        except Exception as e:
-            logger.debug(f"Modulate close: {e}")
-        finally:
-            self._websocket = None
-
-    # -- audio in / transcripts out -------------------------------------------
-
-    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
-        """Forward caller audio. Transcripts arrive on the receive task."""
-        if self._websocket is None:
-            await self._connect()
-        if self._websocket is None:
-            logger.warning("Modulate unavailable, dropping audio")
-            yield None
-            return
-        try:
-            await self._websocket.send(audio)
-        except Exception as e:
-            logger.warning(f"Modulate send failed: {e}")
-        yield None
-
-    async def _receive_messages(self) -> None:
-        async for message in self._websocket:
-            if isinstance(message, bytes):
-                continue
-            try:
-                await self._handle_event(json.loads(message))
-            except json.JSONDecodeError:
-                logger.warning(f"Non-JSON from Modulate: {message[:120]}")
-
-    @staticmethod
-    def _language(code: str | None) -> Language | None:
-        if not code:
-            return None
-        try:
-            return Language(code)
-        except (ValueError, KeyError):
-            return None
-
-    async def _handle_event(self, event: dict) -> None:
-        kind = event.get("type")
-
-        if kind == "partial_clip":
-            text = (event.get("partial_clip") or {}).get("text", "")
-            if text:
-                await self.push_frame(
-                    InterimTranscriptionFrame(text, self._user_id, time_now_iso8601())
-                )
-
-        elif kind == "clip":
-            clip = event.get("clip") or {}
-            text = clip.get("text", "")
-            if not text:
-                return
-            extras = {
-                k: clip.get(k)
-                for k in ("emotion", "accent", "deepfake_score", "speaker_label")
-                if clip.get(k) is not None
-            }
-            if extras:
-                logger.info(f"[Velma] {text[:48]!r} {extras}")
-            await self.push_frame(
-                TranscriptionFrame(
-                    text,
-                    self._user_id,
-                    time_now_iso8601(),
-                    self._language(clip.get("language")),
-                    result=clip,
-                )
-            )
-            await self.stop_processing_metrics()
-
-        elif kind == "clip_update":
-            # A refinement of a clip already transcribed. Log the better emotion
-            # and accent, but do not push another frame or the LLM sees the same
-            # words twice.
-            clip = event.get("clip_update") or {}
-            logger.debug(f"[Velma] refined: {clip.get('emotion')} {clip.get('accent')}")
-
-        elif kind == "behavior_detection":
-            detection = event.get("detection") or {}
-            if detection.get("detected"):
-                logger.warning(
-                    f"[Velma] behaviour {detection.get('behavior_name')} "
-                    f"@ {detection.get('confidence')}"
-                )
-
-        elif kind == "error":
-            logger.error(f"Modulate error: {event.get('error')}")

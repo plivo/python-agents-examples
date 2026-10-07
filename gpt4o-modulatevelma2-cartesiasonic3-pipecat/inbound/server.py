@@ -6,14 +6,17 @@ import base64
 import contextlib
 import json
 import os
+from typing import NoReturn
+from urllib.parse import quote
 
 import plivo
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from loguru import logger
 from plivo import plivoxml
+from plivo.utils import validate_v3_signature
 
 from inbound.agent import run_agent
 from utils import normalize_phone_number
@@ -27,14 +30,94 @@ PLIVO_AUTH_TOKEN = os.getenv("PLIVO_AUTH_TOKEN", "")
 PLIVO_PHONE_NUMBER = os.getenv("PLIVO_PHONE_NUMBER", "")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "")
 
+# Plivo application this server creates/updates and attaches PLIVO_PHONE_NUMBER to
+PLIVO_APP_NAME = "GPT4o_ModulateVelma2_CartesiaSonic3_Pipecat"
+
 app = FastAPI(
-    title="GPT-4o Modulate Velma-2 Cartesia Sonic Pipecat Voice Agent (Inbound)",
+    title="GPT-4o Modulate Velma-2 Cartesia Sonic 3 Pipecat Voice Agent (Inbound)",
     description=(
         "Inbound voice agent using GPT-4o LLM, Modulate Velma-2 STT, "
-        "Cartesia Sonic TTS and Tavily web search, with Pipecat and Plivo telephony"
+        "Cartesia Sonic 3 TTS and Tavily web search, with Pipecat and Plivo telephony"
     ),
     version="0.1.0",
 )
+
+
+# =============================================================================
+# Webhook authentication: Plivo V3 signatures (always on)
+# =============================================================================
+
+
+def check_webhook_auth_config() -> None:
+    """Startup: refuse to run without PLIVO_AUTH_TOKEN (the signature-check key)."""
+    if not PLIVO_AUTH_TOKEN:
+        logger.error(
+            "PLIVO_AUTH_TOKEN is empty: Plivo webhook signatures cannot be checked, so "
+            "every Plivo request would be rejected. Set PLIVO_AUTH_TOKEN (a "
+            "subaccount's token if the number belongs to a subaccount)."
+        )
+        raise SystemExit(1)
+    logger.info("Webhook auth: Plivo V3 signatures on webhooks")
+
+
+def public_request_url(request: Request) -> str:
+    """The URL Plivo called and signed: PUBLIC_URL + request path + raw query string.
+
+    ``request.url`` is what this process sees (``http://localhost:8000/...`` behind a
+    tunnel or proxy), not what Plivo signed. PUBLIC_URL is read at call time.
+    """
+    url = PUBLIC_URL.rstrip("/") + request.url.path
+    if request.url.query:
+        url += "?" + request.url.query
+    return url
+
+
+def _reject_webhook(request: Request, reason: str) -> NoReturn:
+    logger.warning(f"Rejected Plivo webhook {request.method} {request.url.path}: {reason}")
+    raise HTTPException(status_code=403, detail="Invalid Plivo signature")
+
+
+async def verify_plivo_signature(request: Request) -> None:
+    """FastAPI dependency: 403 unless the request carries a valid Plivo V3 signature.
+
+    POST: the form fields are the signed params (the URL's query string is part of the
+    signed URL). GET: Plivo's params are in the query string, so the URL carries them.
+    """
+    signature = request.headers.get("X-Plivo-Signature-V3", "")
+    nonce = request.headers.get("X-Plivo-Signature-V3-Nonce", "")
+    if not signature or not nonce:
+        _reject_webhook(request, "missing X-Plivo-Signature-V3 / -Nonce header")
+    if not (PLIVO_AUTH_TOKEN and PUBLIC_URL):
+        _reject_webhook(request, "PLIVO_AUTH_TOKEN or PUBLIC_URL not set")
+    params: dict = {}
+    if request.method == "POST":
+        form = await request.form()
+        for key in form:
+            values = [str(v) for v in form.getlist(key)]
+            params[key] = values if len(values) > 1 else values[0]
+    try:
+        valid = validate_v3_signature(
+            request.method, public_request_url(request), nonce, PLIVO_AUTH_TOKEN, signature, params
+        )
+    except Exception as e:  # malformed URL/headers fail the SDK's argument validation
+        _reject_webhook(request, f"signature check error ({type(e).__name__})")
+    if not valid:
+        _reject_webhook(request, "signature mismatch (does PUBLIC_URL match the URL Plivo calls?)")
+    signed_query = " + query string" if request.url.query else ""
+    logger.debug(f"Plivo signature verified: {request.method} {request.url.path}{signed_query}")
+
+
+PLIVO_SIGNED = [Depends(verify_plivo_signature)]
+
+
+def stream_url(body_data: dict) -> str:
+    """wss:// URL for <Stream> carrying the base64 call metadata.
+
+    ``body`` is percent-encoded: a raw ``+`` in base64 would reach /ws as a space.
+    """
+    body_b64 = base64.b64encode(json.dumps(body_data).encode()).decode()
+    ws_base = PUBLIC_URL.rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
+    return f"{ws_base}/ws?body={quote(body_b64, safe='')}"
 
 
 # =============================================================================
@@ -43,7 +126,10 @@ app = FastAPI(
 
 
 def configure_plivo_webhooks() -> bool:
-    """Configure Plivo phone number with webhook URLs."""
+    """Point PLIVO_PHONE_NUMBER at this server's /answer and /hangup.
+
+    Blocking Plivo REST calls: called from main() before the event loop starts.
+    """
     if not all([PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN, PLIVO_PHONE_NUMBER, PUBLIC_URL]):
         missing = []
         if not PLIVO_AUTH_ID:
@@ -57,21 +143,20 @@ def configure_plivo_webhooks() -> bool:
         logger.warning(f"Skipping Plivo auto-config. Missing: {', '.join(missing)}")
         return False
 
+    phone_number = normalize_phone_number(PLIVO_PHONE_NUMBER)
+    if not phone_number:
+        logger.error(f"Invalid phone number format: {PLIVO_PHONE_NUMBER}")
+        return False
+
+    answer_url = f"{PUBLIC_URL.rstrip('/')}/answer"
+    hangup_url = f"{PUBLIC_URL.rstrip('/')}/hangup"
+
     try:
         client = plivo.RestClient(auth_id=PLIVO_AUTH_ID, auth_token=PLIVO_AUTH_TOKEN)
 
-        app_name = "GPT4o_Pipecat_Voice_Agent"
-        answer_url = f"{PUBLIC_URL}/answer"
-        hangup_url = f"{PUBLIC_URL}/hangup"
-
-        # Check if application already exists
-        apps = client.applications.list()
-        existing_app = None
-        for app_obj in apps["objects"]:
-            if app_obj["app_name"] == app_name:
-                existing_app = app_obj
-                break
-
+        # app_name filters by prefix server-side, so pick the exact match
+        apps = client.applications.list(app_name=PLIVO_APP_NAME)
+        existing_app = next((a for a in apps["objects"] if a["app_name"] == PLIVO_APP_NAME), None)
         if existing_app:
             client.applications.update(
                 app_id=existing_app["app_id"],
@@ -81,29 +166,23 @@ def configure_plivo_webhooks() -> bool:
                 hangup_method="POST",
             )
             app_id = existing_app["app_id"]
-            logger.info(f"Updated Plivo application: {app_name}")
+            logger.info(f"Updated Plivo application: {PLIVO_APP_NAME}")
         else:
             response = client.applications.create(
-                app_name=app_name,
+                app_name=PLIVO_APP_NAME,
                 answer_url=answer_url,
                 answer_method="POST",
                 hangup_url=hangup_url,
                 hangup_method="POST",
             )
             app_id = response["app_id"]
-            logger.info(f"Created Plivo application: {app_name}")
-
-        phone_number = normalize_phone_number(PLIVO_PHONE_NUMBER)
-        if not phone_number:
-            logger.error(f"Invalid phone number format: {PLIVO_PHONE_NUMBER}")
-            return False
+            logger.info(f"Created Plivo application: {PLIVO_APP_NAME}")
 
         client.numbers.update(number=phone_number, app_id=app_id)
 
         logger.info(f"Plivo webhooks configured for +{phone_number}")
         logger.info(f"  Answer URL: {answer_url}")
         logger.info(f"  Hangup URL: {hangup_url}")
-
         return True
 
     except plivo.exceptions.ValidationError as e:
@@ -130,8 +209,8 @@ async def health_check() -> dict:
     }
 
 
-@app.get("/answer")
-@app.post("/answer")
+@app.get("/answer", dependencies=PLIVO_SIGNED)
+@app.post("/answer", dependencies=PLIVO_SIGNED)
 async def answer_webhook(
     request: Request,
     CallUUID: str = Query(default=""),
@@ -149,19 +228,15 @@ async def answer_webhook(
             call_uuid = call_uuid or str(form_data.get("CallUUID", ""))
             from_number = from_number or str(form_data.get("From", ""))
             to_number = to_number or str(form_data.get("To", ""))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Could not parse answer webhook form: {e}")
 
-    logger.info(f"Incoming call: CallUUID={call_uuid}, From={from_number}, To={to_number}")
+    logger.bind(call_id=call_uuid).info(
+        f"Incoming call: CallUUID={call_uuid}, From={from_number}, To={to_number}"
+    )
 
-    body_data = {"call_uuid": call_uuid, "from": from_number, "to": to_number}
-    body_b64 = base64.b64encode(json.dumps(body_data).encode()).decode()
-
-    # Build WebSocket URL from PUBLIC_URL
-    ws_base = PUBLIC_URL.rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
-    ws_url = f"{ws_base}/ws?body={body_b64}"
-
-    logger.info(f"WebSocket URL: {ws_url}")
+    ws_url = stream_url({"call_uuid": call_uuid, "from": from_number, "to": to_number})
+    logger.info(f"WebSocket URL: {ws_url.split('?')[0]}")
 
     response = plivoxml.ResponseElement()
     stream = plivoxml.StreamElement(
@@ -175,13 +250,14 @@ async def answer_webhook(
     return Response(content=response.to_string(), media_type="application/xml")
 
 
-@app.post("/hangup")
+@app.post("/hangup", dependencies=PLIVO_SIGNED)
 async def hangup_webhook(request: Request) -> Response:
     """Plivo hangup webhook - called when a call ends."""
     try:
         form_data = await request.form()
-        logger.info(
-            f"Call ended: CallUUID={form_data.get('CallUUID')}, "
+        call_uuid = str(form_data.get("CallUUID", ""))
+        logger.bind(call_id=call_uuid).info(
+            f"Call ended: CallUUID={call_uuid}, "
             f"Duration={form_data.get('Duration')}s, "
             f"HangupCause={form_data.get('HangupCause')}"
         )
@@ -191,8 +267,8 @@ async def hangup_webhook(request: Request) -> Response:
     return Response(content="OK", media_type="text/plain")
 
 
-@app.post("/fallback")
-async def fallback_webhook(request: Request) -> Response:
+@app.post("/fallback", dependencies=PLIVO_SIGNED)
+async def fallback_webhook() -> Response:
     """Fallback webhook if primary answer webhook fails."""
     logger.warning("Fallback webhook triggered")
 
@@ -208,8 +284,8 @@ async def fallback_webhook(request: Request) -> Response:
     return Response(content=response.to_string(), media_type="application/xml")
 
 
-@app.get("/hold")
-@app.post("/hold")
+@app.get("/hold", dependencies=PLIVO_SIGNED)
+@app.post("/hold", dependencies=PLIVO_SIGNED)
 async def hold_webhook() -> Response:
     """Hold endpoint - keeps call alive silently (used during testing)."""
     response = plivoxml.ResponseElement()
@@ -224,13 +300,14 @@ async def websocket_endpoint(
 ) -> None:
     """WebSocket endpoint for bidirectional audio streaming with Plivo."""
     await websocket.accept()
-    logger.info("WebSocket connection accepted")
 
     call_data = {}
+    call_id = "unknown"
     if body:
         try:
             call_data = json.loads(base64.b64decode(body).decode())
-            logger.info(f"Call metadata: {call_data}")
+            call_id = call_data.get("call_uuid", "unknown")
+            logger.bind(call_id=call_id).debug(f"Call metadata: {call_data}")
         except Exception as e:
             logger.warning(f"Failed to decode call metadata: {e}")
 
@@ -239,29 +316,31 @@ async def websocket_endpoint(
         start_message = json.loads(start_data)
 
         if start_message.get("event") != "start":
-            logger.error(f"Expected start event, got: {start_message.get('event')}")
+            logger.bind(call_id=call_id).error(
+                f"Expected start event, got: {start_message.get('event')}"
+            )
             await websocket.close()
             return
 
         start_info = start_message.get("start", {})
         call_id = start_info.get("callId", call_data.get("call_uuid", "unknown"))
         stream_id = start_info.get("streamId")
-        logger.info(f"Plivo stream started: callId={call_id}, streamId={stream_id}")
+        logger.bind(call_id=call_id).info(
+            f"Plivo stream started: callId={call_id}, streamId={stream_id}"
+        )
 
         await run_agent(
             websocket=websocket,
             call_id=call_id,
-            stream_id=stream_id,
+            stream_id=stream_id or "",
             from_number=call_data.get("from", ""),
             to_number=call_data.get("to", ""),
-            plivo_auth_id=PLIVO_AUTH_ID,
-            plivo_auth_token=PLIVO_AUTH_TOKEN,
         )
 
     except WebSocketDisconnect:
-        logger.info("WebSocket disconnected")
+        logger.bind(call_id=call_id).info("WebSocket disconnected")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.bind(call_id=call_id).error(f"WebSocket error: {e}")
     finally:
         with contextlib.suppress(Exception):
             await websocket.close()
@@ -274,13 +353,23 @@ async def websocket_endpoint(
 
 def main() -> None:
     """Run the inbound server."""
-    logger.info(f"Starting GPT-4o Pipecat Inbound Voice Agent on port {SERVER_PORT}")
+    logger.info(
+        f"Starting GPT-4o + Modulate Velma-2 + Cartesia Sonic 3 Pipecat inbound voice agent "
+        f"on port {SERVER_PORT}"
+    )
+    check_webhook_auth_config()
+
+    if not PUBLIC_URL:
+        logger.warning(
+            "PUBLIC_URL is not set: Plivo webhooks will be rejected (403) because their "
+            "signatures are checked against PUBLIC_URL"
+        )
 
     if PLIVO_PHONE_NUMBER and PUBLIC_URL:
         logger.info("Configuring Plivo webhooks...")
         phone = normalize_phone_number(PLIVO_PHONE_NUMBER)
         if configure_plivo_webhooks():
-            logger.info(f"Ready! Call +{phone} to test")
+            logger.info(f"Ready! Call +{phone} to talk to the agent")
         else:
             logger.warning("Plivo auto-configuration failed. Configure manually.")
     else:

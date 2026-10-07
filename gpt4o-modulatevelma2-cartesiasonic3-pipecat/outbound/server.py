@@ -1,4 +1,10 @@
-"""Standalone FastAPI server for outbound calls."""
+"""Standalone FastAPI server for outbound calls.
+
+Calls are placed with Plivo's Make Call API directly (see the README), with
+``answer_url`` pointing at this server's /outbound/answer. This server only answers
+Plivo's webhooks and bridges audio: /outbound/answer reads the optional greeting from
+its query string (``greeting``) and returns <Stream> XML; /ws runs the agent.
+"""
 
 from __future__ import annotations
 
@@ -6,38 +12,118 @@ import base64
 import contextlib
 import json
 import os
-from datetime import datetime
+from typing import NoReturn
+from urllib.parse import quote
 
-import plivo
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from loguru import logger
 from plivo import plivoxml
+from plivo.utils import validate_v3_signature
 
-from outbound.agent import CallManager, determine_outcome, run_agent
+from outbound.agent import run_agent
 from utils import normalize_phone_number
 
 load_dotenv()
 
-# Server configuration
-SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
+# Server configuration. Own port (not SERVER_PORT) so inbound and outbound can run side by side.
+SERVER_PORT = int(os.getenv("OUTBOUND_SERVER_PORT", "8001"))
 PLIVO_AUTH_ID = os.getenv("PLIVO_AUTH_ID", "")
 PLIVO_AUTH_TOKEN = os.getenv("PLIVO_AUTH_TOKEN", "")
 PLIVO_PHONE_NUMBER = os.getenv("PLIVO_PHONE_NUMBER", "")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "")
 
+# Optional answer_url query param: the greeting spoken verbatim when the callee answers.
+# Passed through as is; the agent module's default applies when absent.
+GREETING_PARAM = "greeting"
+
 app = FastAPI(
-    title="GPT-4o Modulate Velma-2 Cartesia Sonic Pipecat Voice Agent (Outbound)",
+    title="GPT-4o Modulate Velma-2 Cartesia Sonic 3 Pipecat Voice Agent (Outbound)",
     description=(
         "Outbound voice agent using GPT-4o LLM, Modulate Velma-2 STT, "
-        "Cartesia Sonic TTS and Tavily web search, with Pipecat and Plivo telephony"
+        "Cartesia Sonic 3 TTS and Tavily web search, with Pipecat and Plivo telephony"
     ),
     version="0.1.0",
 )
 
-call_manager = CallManager()
+
+# =============================================================================
+# Webhook authentication: Plivo V3 signatures (always on)
+# =============================================================================
+
+
+def check_webhook_auth_config() -> None:
+    """Startup: refuse to run without PLIVO_AUTH_TOKEN (the signature-check key)."""
+    if not PLIVO_AUTH_TOKEN:
+        logger.error(
+            "PLIVO_AUTH_TOKEN is empty: Plivo webhook signatures cannot be checked, so "
+            "every Plivo request would be rejected. Set PLIVO_AUTH_TOKEN (a "
+            "subaccount's token if the number belongs to a subaccount)."
+        )
+        raise SystemExit(1)
+    logger.info("Webhook auth: Plivo V3 signatures on webhooks")
+
+
+def public_request_url(request: Request) -> str:
+    """The URL Plivo called and signed: PUBLIC_URL + request path + raw query string.
+
+    ``request.url`` is what this process sees (``http://localhost:8001/...`` behind a
+    tunnel or proxy), not what Plivo signed. PUBLIC_URL is read at call time.
+    """
+    url = PUBLIC_URL.rstrip("/") + request.url.path
+    if request.url.query:
+        url += "?" + request.url.query
+    return url
+
+
+def _reject_webhook(request: Request, reason: str) -> NoReturn:
+    logger.warning(f"Rejected Plivo webhook {request.method} {request.url.path}: {reason}")
+    raise HTTPException(status_code=403, detail="Invalid Plivo signature")
+
+
+async def verify_plivo_signature(request: Request) -> None:
+    """FastAPI dependency: 403 unless the request carries a valid Plivo V3 signature.
+
+    POST: the form fields are the signed params (the URL's query string is part of the
+    signed URL). GET: Plivo's params are in the query string, so the URL carries them.
+    """
+    signature = request.headers.get("X-Plivo-Signature-V3", "")
+    nonce = request.headers.get("X-Plivo-Signature-V3-Nonce", "")
+    if not signature or not nonce:
+        _reject_webhook(request, "missing X-Plivo-Signature-V3 / -Nonce header")
+    if not (PLIVO_AUTH_TOKEN and PUBLIC_URL):
+        _reject_webhook(request, "PLIVO_AUTH_TOKEN or PUBLIC_URL not set")
+    params: dict = {}
+    if request.method == "POST":
+        form = await request.form()
+        for key in form:
+            values = [str(v) for v in form.getlist(key)]
+            params[key] = values if len(values) > 1 else values[0]
+    try:
+        valid = validate_v3_signature(
+            request.method, public_request_url(request), nonce, PLIVO_AUTH_TOKEN, signature, params
+        )
+    except Exception as e:  # malformed URL/headers fail the SDK's argument validation
+        _reject_webhook(request, f"signature check error ({type(e).__name__})")
+    if not valid:
+        _reject_webhook(request, "signature mismatch (does PUBLIC_URL match the URL Plivo calls?)")
+    signed_query = " + query string" if request.url.query else ""
+    logger.debug(f"Plivo signature verified: {request.method} {request.url.path}{signed_query}")
+
+
+PLIVO_SIGNED = [Depends(verify_plivo_signature)]
+
+
+def stream_url(body_data: dict) -> str:
+    """wss:// URL for <Stream> carrying the base64 call metadata.
+
+    ``body`` is percent-encoded: a raw ``+`` in base64 would reach /ws as a space.
+    """
+    body_b64 = base64.b64encode(json.dumps(body_data).encode()).decode()
+    ws_base = PUBLIC_URL.rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
+    return f"{ws_base}/ws?body={quote(body_b64, safe='')}"
 
 
 # =============================================================================
@@ -56,131 +142,46 @@ async def health_check() -> dict:
     }
 
 
-@app.post("/outbound/call")
-async def outbound_initiate(
-    request: Request,
-    phone_number: str = Query(default=""),
-    campaign_id: str = Query(default=""),
-    opening_reason: str = Query(default=""),
-    objective: str = Query(default=""),
-    context: str = Query(default=""),
-) -> dict:
-    """Initiate an outbound call.
-
-    Creates a call record, then uses the Plivo API to place a call.
-    When the callee answers, Plivo will hit /outbound/answer which starts
-    the voice agent on the A-leg.
-    """
-    if not phone_number:
-        return {"error": "phone_number is required"}
-
-    if not all([PLIVO_AUTH_ID, PLIVO_AUTH_TOKEN, PLIVO_PHONE_NUMBER]):
-        return {"error": "Plivo credentials or PLIVO_PHONE_NUMBER not configured"}
-
-    record = call_manager.create_call(
-        phone_number=phone_number,
-        campaign_id=campaign_id,
-        opening_reason=opening_reason,
-        objective=objective,
-        context=context,
-    )
-
-    try:
-        client = plivo.RestClient(auth_id=PLIVO_AUTH_ID, auth_token=PLIVO_AUTH_TOKEN)
-        from_number = normalize_phone_number(PLIVO_PHONE_NUMBER)
-        to_number = normalize_phone_number(phone_number)
-
-        answer_url = f"{PUBLIC_URL}/outbound/answer?call_id={record.call_id}"
-        hangup_url = f"{PUBLIC_URL}/outbound/hangup"
-
-        call_response = client.calls.create(
-            from_=from_number,
-            to_=to_number,
-            answer_url=answer_url,
-            answer_method="POST",
-            hangup_url=hangup_url,
-            hangup_method="POST",
-        )
-
-        if isinstance(call_response, dict):
-            request_uuid = call_response.get("request_uuid", "")
-        else:
-            request_uuid = getattr(call_response, "request_uuid", "")
-        call_manager.update_status(
-            record.call_id, "ringing",
-            plivo_request_uuid=request_uuid,
-        )
-        logger.info(
-            f"Outbound call initiated: call_id={record.call_id}, "
-            f"to={to_number}, request_uuid={request_uuid}"
-        )
-
-        return {
-            "call_id": record.call_id,
-            "status": "ringing",
-            "phone_number": phone_number,
-            "plivo_request_uuid": request_uuid,
-        }
-
-    except Exception as e:
-        logger.error(f"Failed to initiate outbound call: {e}")
-        call_manager.update_status(record.call_id, "failed", outcome="failed")
-        return {"error": str(e), "call_id": record.call_id}
-
-
-@app.get("/outbound/answer")
-@app.post("/outbound/answer")
+@app.get("/outbound/answer", dependencies=PLIVO_SIGNED)
+@app.post("/outbound/answer", dependencies=PLIVO_SIGNED)
 async def outbound_answer_webhook(
     request: Request,
-    call_id: str = Query(default=""),
     CallUUID: str = Query(default=""),
     From: str = Query(default=""),
     To: str = Query(default=""),
 ) -> Response:
-    """Plivo webhook when the callee answers an outbound call.
+    """Plivo answer webhook for a call placed with the Make Call API.
 
-    Returns <Stream> XML to start WebSocket audio streaming.
-    The /ws endpoint detects this is an outbound call and loads
-    the outbound prompt and initial message from CallManager.
+    The answer_url query string may carry the ``greeting``. It travels to /ws in the base64
+    ``body`` of the <Stream> URL together with the Plivo call fields.
     """
     call_uuid = CallUUID
     from_number = From
     to_number = To
+    greeting = request.query_params.get(GREETING_PARAM, "").strip()
 
     if request.method == "POST":
         try:
             form_data = await request.form()
-            call_id = call_id or str(form_data.get("call_id", ""))
             call_uuid = call_uuid or str(form_data.get("CallUUID", ""))
             from_number = from_number or str(form_data.get("From", ""))
             to_number = to_number or str(form_data.get("To", ""))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Could not parse answer webhook form: {e}")
 
-    logger.info(f"Outbound call answered: call_id={call_id}, CallUUID={call_uuid}, To={to_number}")
-
-    # Update call record
-    if call_id:
-        call_manager.update_status(
-            call_id, "connected",
-            plivo_call_uuid=call_uuid,
-            connected_at=datetime.utcnow(),
-        )
+    logger.bind(call_id=call_uuid).info(
+        f"Outbound call answered: CallUUID={call_uuid}, To={to_number}, "
+        f"greeting: {'from answer_url' if greeting else 'default'}"
+    )
 
     body_data = {
         "call_uuid": call_uuid,
         "from": from_number,
         "to": to_number,
-        "is_outbound": True,
-        "call_id": call_id,
+        GREETING_PARAM: greeting,
     }
-    body_b64 = base64.b64encode(json.dumps(body_data).encode()).decode()
-
-    # Build WebSocket URL from PUBLIC_URL
-    ws_base = PUBLIC_URL.rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
-    ws_url = f"{ws_base}/ws?body={body_b64}"
-
-    logger.info(f"Outbound WebSocket URL: {ws_url}")
+    ws_url = stream_url(body_data)
+    logger.info(f"Outbound WebSocket URL: {ws_url.split('?')[0]}")
 
     response = plivoxml.ResponseElement()
     stream = plivoxml.StreamElement(
@@ -194,116 +195,21 @@ async def outbound_answer_webhook(
     return Response(content=response.to_string(), media_type="application/xml")
 
 
-@app.post("/outbound/hangup")
+@app.post("/outbound/hangup", dependencies=PLIVO_SIGNED)
 async def outbound_hangup_webhook(request: Request) -> Response:
-    """Plivo webhook when an outbound call ends."""
+    """Plivo hangup webhook - called when an outbound call ends."""
     try:
         form_data = await request.form()
         call_uuid = str(form_data.get("CallUUID", ""))
-        duration = int(form_data.get("Duration", 0) or 0)
-        hangup_cause = str(form_data.get("HangupCause", ""))
-
-        logger.info(
+        logger.bind(call_id=call_uuid).info(
             f"Outbound call ended: CallUUID={call_uuid}, "
-            f"Duration={duration}s, HangupCause={hangup_cause}"
+            f"Duration={form_data.get('Duration')}s, "
+            f"HangupCause={form_data.get('HangupCause')}"
         )
-
-        # Find and update the call record by plivo_call_uuid
-        for record in call_manager.get_active_calls():
-            if record.plivo_call_uuid == call_uuid or record.plivo_request_uuid == call_uuid:
-                outcome = determine_outcome(hangup_cause, duration)
-                call_manager.update_status(
-                    record.call_id, "completed",
-                    ended_at=datetime.utcnow(),
-                    duration=duration,
-                    hangup_cause=hangup_cause,
-                    outcome=outcome,
-                )
-                logger.info(f"Outbound call {record.call_id} completed: outcome={outcome}")
-                break
     except Exception as e:
         logger.warning(f"Error parsing outbound hangup webhook: {e}")
 
     return Response(content="OK", media_type="text/plain")
-
-
-@app.get("/outbound/status/{call_id}")
-async def outbound_status(call_id: str) -> dict:
-    """Get status and details for an outbound call."""
-    record = call_manager.get_call(call_id)
-    if not record:
-        return {"error": "Call not found"}
-
-    return {
-        "call_id": record.call_id,
-        "phone_number": record.phone_number,
-        "status": record.status,
-        "campaign_id": record.campaign_id,
-        "opening_reason": record.opening_reason,
-        "objective": record.objective,
-        "outcome": record.outcome,
-        "duration": record.duration,
-        "created_at": record.created_at.isoformat(),
-        "connected_at": record.connected_at.isoformat() if record.connected_at else None,
-        "ended_at": record.ended_at.isoformat() if record.ended_at else None,
-    }
-
-
-@app.post("/outbound/hangup/{call_id}")
-async def outbound_hangup_call(call_id: str) -> dict:
-    """Programmatically end an active outbound call."""
-    record = call_manager.get_call(call_id)
-    if not record:
-        return {"error": "Call not found"}
-
-    if record.status not in ("ringing", "connected"):
-        return {"error": f"Call is not active (status: {record.status})"}
-
-    if not record.plivo_call_uuid:
-        return {"error": "No Plivo call UUID — call may not be connected yet"}
-
-    try:
-        client = plivo.RestClient(auth_id=PLIVO_AUTH_ID, auth_token=PLIVO_AUTH_TOKEN)
-        client.calls.delete(record.plivo_call_uuid)
-        call_manager.update_status(
-            call_id, "completed",
-            ended_at=datetime.utcnow(),
-            outcome="success",
-        )
-        logger.info(f"Programmatically ended outbound call {call_id}")
-        return {"call_id": call_id, "status": "completed"}
-    except Exception as e:
-        logger.error(f"Failed to end call {call_id}: {e}")
-        return {"error": str(e)}
-
-
-@app.get("/outbound/campaign/{campaign_id}")
-async def outbound_campaign(campaign_id: str) -> dict:
-    """Get all calls for a campaign."""
-    records = call_manager.get_calls_by_campaign(campaign_id)
-    return {
-        "campaign_id": campaign_id,
-        "total": len(records),
-        "calls": [
-            {
-                "call_id": r.call_id,
-                "phone_number": r.phone_number,
-                "status": r.status,
-                "outcome": r.outcome,
-                "duration": r.duration,
-            }
-            for r in records
-        ],
-    }
-
-
-@app.get("/hold")
-@app.post("/hold")
-async def hold_webhook() -> Response:
-    """Hold endpoint - keeps call alive silently (used for outbound A-leg)."""
-    response = plivoxml.ResponseElement()
-    response.add(plivoxml.WaitElement(length=120))
-    return Response(content=response.to_string(), media_type="application/xml")
 
 
 @app.websocket("/ws")
@@ -313,13 +219,14 @@ async def websocket_endpoint(
 ) -> None:
     """WebSocket endpoint for bidirectional audio streaming with Plivo."""
     await websocket.accept()
-    logger.info("WebSocket connection accepted")
 
     call_data = {}
+    call_id = "unknown"
     if body:
         try:
             call_data = json.loads(base64.b64decode(body).decode())
-            logger.info(f"Call metadata: {call_data}")
+            call_id = call_data.get("call_uuid", "unknown")
+            logger.bind(call_id=call_id).debug(f"Call metadata: {call_data}")
         except Exception as e:
             logger.warning(f"Failed to decode call metadata: {e}")
 
@@ -328,44 +235,32 @@ async def websocket_endpoint(
         start_message = json.loads(start_data)
 
         if start_message.get("event") != "start":
-            logger.error(f"Expected start event, got: {start_message.get('event')}")
+            logger.bind(call_id=call_id).error(
+                f"Expected start event, got: {start_message.get('event')}"
+            )
             await websocket.close()
             return
 
         start_info = start_message.get("start", {})
         call_id = start_info.get("callId", call_data.get("call_uuid", "unknown"))
         stream_id = start_info.get("streamId")
-        logger.info(f"Plivo stream started: callId={call_id}, streamId={stream_id}")
-
-        # Load outbound prompt and initial message from call record
-        system_prompt = None
-        initial_message = "Hello, I'm calling for help."
-        if call_data.get("is_outbound"):
-            outbound_call_id = call_data.get("call_id", "")
-            record = call_manager.get_call(outbound_call_id)
-            if record:
-                system_prompt = record.system_prompt
-                initial_message = record.initial_message
-                logger.info(f"Outbound call detected: call_id={outbound_call_id}")
-            else:
-                logger.warning(f"Outbound call record not found: {outbound_call_id}")
+        logger.bind(call_id=call_id).info(
+            f"Plivo stream started: callId={call_id}, streamId={stream_id}"
+        )
 
         await run_agent(
             websocket=websocket,
             call_id=call_id,
-            stream_id=stream_id,
+            stream_id=stream_id or "",
             from_number=call_data.get("from", ""),
             to_number=call_data.get("to", ""),
-            system_prompt=system_prompt,
-            initial_message=initial_message,
-            plivo_auth_id=PLIVO_AUTH_ID,
-            plivo_auth_token=PLIVO_AUTH_TOKEN,
+            greeting=str(call_data.get(GREETING_PARAM) or ""),
         )
 
     except WebSocketDisconnect:
-        logger.info("WebSocket disconnected")
+        logger.bind(call_id=call_id).info("WebSocket disconnected")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.bind(call_id=call_id).error(f"WebSocket error: {e}")
     finally:
         with contextlib.suppress(Exception):
             await websocket.close()
@@ -378,7 +273,25 @@ async def websocket_endpoint(
 
 def main() -> None:
     """Run the outbound server."""
-    logger.info(f"Starting GPT-4o Pipecat Outbound Voice Agent on port {SERVER_PORT}")
+    logger.info(
+        f"Starting GPT-4o + Modulate Velma-2 + Cartesia Sonic 3 Pipecat outbound voice agent "
+        f"on port {SERVER_PORT}"
+    )
+    check_webhook_auth_config()
+
+    if PUBLIC_URL:
+        base = PUBLIC_URL.rstrip("/")
+        logger.info(
+            "Place calls with Plivo's Make Call API: "
+            f"answer_url={base}/outbound/answer?{GREETING_PARAM}=<url-encoded greeting> "
+            f"(greeting optional), hangup_url={base}/outbound/hangup"
+        )
+    else:
+        logger.warning(
+            "PUBLIC_URL is not set: Plivo cannot reach /outbound/answer, and signed webhooks "
+            "are rejected (403) because signatures are checked against PUBLIC_URL"
+        )
+
     uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT, log_level="info")
 
 

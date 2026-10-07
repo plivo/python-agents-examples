@@ -17,15 +17,16 @@ ENV UV_LINK_MODE=copy
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --locked --no-install-project --no-dev
+    uv sync --locked --no-install-project --no-dev --extra streaming
 
 # Copy application code
 COPY utils.py utils.py
 COPY inbound/ inbound/
 COPY outbound/ outbound/
 
-# Expose port
-EXPOSE 8000
+# Expose ports: 8000 inbound (SERVER_PORT), 8001 outbound (OUTBOUND_SERVER_PORT)
+EXPOSE 8000 8001
 
-# Run the inbound server by default (override with outbound.server for outbound)
+# Run the server (default: inbound mode)
+# For outbound: CMD ["uv", "run", "python", "-m", "outbound.server"]
 CMD ["uv", "run", "python", "-m", "inbound.server"]
