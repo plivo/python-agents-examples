@@ -52,8 +52,17 @@ skip() {
 # Detect orchestration type
 # =============================================================================
 
+# Orchestration tokens from the naming convention. Anything other than "native" is a
+# framework: the framework (or hosted platform behind it) owns the audio transport and VAD.
+KNOWN_ORCH="native|pipecat|livekit|vapi"
+KNOWN_VARIANTS="no-vad|webrtcvad"
+
 ORCHESTRATION="native"
-if grep -q "pipecat\|livekit" "$EXAMPLE_DIR/inbound/agent.py" 2>/dev/null; then
+if [[ "$EXAMPLE" =~ -($KNOWN_ORCH)(-($KNOWN_VARIANTS))?$ ]]; then
+    if [[ "${BASH_REMATCH[1]}" != "native" ]]; then
+        ORCHESTRATION="framework"
+    fi
+elif grep -q "pipecat\|livekit" "$EXAMPLE_DIR/inbound/agent.py" 2>/dev/null; then
     ORCHESTRATION="framework"
 fi
 # Managed voice-agent platforms declare themselves in pyproject.toml:
@@ -79,9 +88,6 @@ echo "--- Naming ---"
 
 # Extract orchestration type and optional variant from directory name
 # Convention: {provider}-{optional-stt}-{optional-tts}-{orchestration}[-{variant}]
-KNOWN_ORCH="native|pipecat|livekit|vapi"
-KNOWN_VARIANTS="no-vad|webrtcvad"
-
 name_valid=false
 if [[ "$ORCHESTRATION" == "managed-platform" ]]; then
     # {provider}-{product}[-{variant}]: lowercase, hyphen-separated tokens.
@@ -240,56 +246,84 @@ else
     fail "PLIVO_CHUNK_SIZE = 160 not found in agent.py"
 fi
 
-# playAudio format. Parsed from the syntax tree, so a comment or docstring that merely
-# mentions the content type does not count:
-#   - an agent that writes playAudio itself must build a dict literal with
-#     "contentType": "audio/x-mulaw" and "sampleRate": 8000;
-#   - a framework agent may instead instantiate the framework's Plivo serializer
-#     (e.g. Pipecat's PlivoFrameSerializer), which emits that message for it.
-# Prints "dict", "serializer" or "missing".
-playaudio_source() {
-    python3 - "$1" <<'PY' 2>/dev/null || echo "missing"
+# playAudio format and VAD configuration are read from the syntax tree, so a comment or
+# docstring that merely mentions them does not count, and nothing here names a
+# framework's classes (Pipecat, LiveKit, Vapi and others spell their transports differently).
+#
+# agent_probe <file> prints "<playaudio> <vad>":
+#   playaudio  ok     the agent builds a playAudio dict with contentType "audio/x-mulaw"
+#                     and sampleRate 8000
+#              wrong  it builds one with a different (or unverifiable) format
+#              none   it builds none (the framework's transport emits the message)
+#   vad        the name of the VAD / turn-detection setting found, or "none"
+agent_probe() {
+    python3 - "$1" <<'PY' 2>/dev/null || echo "none none"
 import ast
+import re
 import sys
 
 tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
-found = "missing"
+
+# Module-level NAME = <constant>, so "contentType": MULAW_TYPE style code resolves.
+consts = {}
+for stmt in tree.body:
+    if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Constant):
+        for target in stmt.targets:
+            if isinstance(target, ast.Name):
+                consts[target.id] = stmt.value.value
+
+
+def value_of(node):
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name) and node.id in consts:
+        return consts[node.id]
+    return None
+
+
+VAD_KEYWORD = re.compile(r"^(vad|vad_analyzer|turn_detection|turn_detector|turn_analyzer)$")
+VAD_DICT_KEY = re.compile(r"vad|speakingplan|turn_?detection|endpointing", re.IGNORECASE)
+
+playaudio = "none"
+vad = "none"
 for node in ast.walk(tree):
     if isinstance(node, ast.Dict):
-        items = {
-            k.value: v
-            for k, v in zip(node.keys, node.values)
-            if isinstance(k, ast.Constant) and isinstance(v, ast.Constant)
-        }
-        content_type = items.get("contentType")
-        sample_rate = items.get("sampleRate")
-        if (
-            content_type is not None
-            and content_type.value == "audio/x-mulaw"
-            and sample_rate is not None
-            and sample_rate.value == 8000
-        ):
-            found = "dict"
-            break
+        items = {k.value: v for k, v in zip(node.keys, node.values) if isinstance(k, ast.Constant)}
+        if "contentType" in items and ("sampleRate" in items or "payload" in items):
+            good = (
+                value_of(items["contentType"]) == "audio/x-mulaw"
+                and value_of(items.get("sampleRate")) == 8000
+            )
+            if good:
+                playaudio = "ok"
+            elif playaudio != "ok":
+                playaudio = "wrong"
+        for key in items:
+            if isinstance(key, str) and VAD_DICT_KEY.search(key) and vad == "none":
+                vad = key
     elif isinstance(node, ast.Call):
-        func = node.func
-        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-        if "Plivo" in name and name.endswith("Serializer"):
-            found = "serializer"
-print(found)
+        for kw in node.keywords:
+            if kw.arg is None:
+                continue
+            is_none = isinstance(kw.value, ast.Constant) and kw.value.value is None
+            if VAD_KEYWORD.match(kw.arg) and not is_none:
+                vad = kw.arg
+            elif kw.arg == "vad_enabled" and value_of(kw.value) is True:
+                vad = "vad_enabled"
+print(playaudio, vad)
 PY
 }
 
 for side in inbound outbound; do
     agent_file="$EXAMPLE_DIR/$side/agent.py"
     [[ -f "$agent_file" ]] || continue
-    source_kind=$(playaudio_source "$agent_file")
-    if [[ "$source_kind" == "dict" ]]; then
+    read -r playaudio_kind _vad_kind <<< "$(agent_probe "$agent_file")"
+    if [[ "$playaudio_kind" == "ok" ]]; then
         pass "$side/agent.py builds playAudio as audio/x-mulaw at 8000 Hz"
-    elif [[ "$source_kind" == "serializer" && "$ORCHESTRATION" == "framework" ]]; then
-        pass "$side/agent.py uses the framework's Plivo serializer for playAudio"
+    elif [[ "$playaudio_kind" == "wrong" ]]; then
+        fail "$side/agent.py builds a playAudio message that is not contentType audio/x-mulaw with sampleRate 8000"
     elif [[ "$ORCHESTRATION" == "framework" ]]; then
-        fail "$side/agent.py neither uses a Plivo serializer nor builds an audio/x-mulaw playAudio message"
+        skip "$side/agent.py playAudio format (emitted by the framework's transport)"
     else
         fail "$side/agent.py does not build a playAudio message with contentType audio/x-mulaw and sampleRate 8000"
     fi
@@ -378,14 +412,14 @@ elif [[ "$ORCHESTRATION" == "native" ]]; then
         fail "silero-vad not found in pyproject.toml"
     fi
 else
-    # Framework: a VAD analyzer must be configured. Current Pipecat takes it as vad_analyzer=...
-    # (on the user aggregator or transport params); Pipecat before 1.0 used vad_enabled=True.
-    if grep -Eq "vad_analyzer *=" "$EXAMPLE_DIR/inbound/agent.py" 2>/dev/null; then
-        pass "vad_analyzer configured in framework config"
-    elif grep -Eq "vad_enabled *= *True" "$EXAMPLE_DIR/inbound/agent.py" 2>/dev/null; then
-        pass "vad_enabled=True found in framework config (legacy Pipecat <1.0)"
+    # Framework: VAD or turn detection must be configured in code. Frameworks spell it
+    # differently (a vad=/vad_analyzer=/turn_detection= argument, or a key in a hosted
+    # platform's assistant config), so the probe matches the concept, not a class name.
+    read -r _playaudio_kind vad_kind <<< "$(agent_probe "$EXAMPLE_DIR/inbound/agent.py")"
+    if [[ "$vad_kind" != "none" ]]; then
+        pass "VAD / turn detection configured in framework config ($vad_kind)"
     else
-        fail "no VAD configured in inbound/agent.py (expected vad_analyzer=...)"
+        fail "no VAD or turn detection configured in inbound/agent.py"
     fi
     skip "SileroVADProcessor (framework uses built-in VAD)"
     skip "plivo_to_vad (framework uses built-in VAD)"

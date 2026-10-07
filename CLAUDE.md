@@ -168,14 +168,14 @@ For framework examples: no VAD in utils (framework handles it).
 - Speech end triggers turn commit (`input_audio_buffer.commit` + `response.create` or equivalent)
 - Reference: `grok3-voice-native/utils.py` (SileroVADProcessor), `grok3-voice-native/inbound/agent.py` (integration)
 
-**Framework examples** (Pipecat/LiveKit): pass the framework's VAD analyzer, e.g. `vad_analyzer=SileroVADAnalyzer()` on Pipecat's `LLMUserAggregatorParams`. `vad_enabled=True` in transport params is the Pipecat <1.0 spelling and is ignored on 1.x. No separate Silero.
+**Framework examples** (Pipecat/LiveKit/Vapi): configure the framework's own VAD or turn detection in code, e.g. `vad_analyzer=SileroVADAnalyzer()` on Pipecat's `LLMUserAggregatorParams`, `vad=` on a LiveKit session, or the speaking-plan keys of a hosted assistant config. `vad_enabled=True` in transport params is the Pipecat <1.0 spelling and is ignored on 1.x. No separate Silero.
 
 ## Audio Pipeline Rules
 
 - `PLIVO_CHUNK_SIZE = 160` — exactly 20ms at 8kHz mono μ-law. Defined in `agent.py._send_to_plivo()`. Native and managed-platform examples only: a framework's transport does the chunking, so framework examples do not define it.
 - Plivo WebSocket sends/receives base64 μ-law at 8kHz
 - playAudio JSON format: `{"event": "playAudio", "media": {"contentType": "audio/x-mulaw", "sampleRate": 8000, "payload": "<base64>"}}`
-  - Framework examples do not build this message: the framework's Plivo serializer (Pipecat `PlivoFrameSerializer`) emits it. The validator checks for the dict literal in native and managed-platform agents and for the serializer in framework agents.
+  - Framework examples (Pipecat, LiveKit, Vapi, …) usually do not build this message: the framework's transport emits it. The validator requires the dict literal in native and managed-platform agents; in a framework agent it is checked only if the agent builds one itself.
 - Answer webhook returns `<Stream>` XML: `bidirectional=True`, `keepCallAlive=True`, `contentType="audio/x-mulaw;rate=8000"`
 
 ## Agent Structure

@@ -46,7 +46,7 @@ Run through EVERY item. Report PASS or FAIL with details for each.
 #### Audio Pipeline (4 checks)
 
 13. **PLIVO_CHUNK_SIZE = 160**: Defined in agent.py `_send_to_plivo()` method (skip for framework: the transport chunks the audio)
-14. **playAudio format correct**: `contentType: "audio/x-mulaw"`, `sampleRate: 8000`, base64 payload (framework: the framework's Plivo serializer, e.g. `PlivoFrameSerializer`, is instantiated instead; a comment mentioning the format does not count)
+14. **playAudio format correct**: `contentType: "audio/x-mulaw"`, `sampleRate: 8000`, base64 payload (framework: normally emitted by the framework's transport, so check it only if the agent builds the message itself; a comment mentioning the format does not count)
 15. **Stream XML correct**: `bidirectional=True`, `keepCallAlive=True`, `contentType="audio/x-mulaw;rate=8000"`
 16. **Sample rates correct**: Check `plivo_to_{api}()` and `{api}_to_plivo()` use correct rates
 
@@ -59,7 +59,7 @@ Run through EVERY item. Report PASS or FAIL with details for each.
 
 #### VAD (1 check — framework only)
 
-17f. **VAD analyzer configured**: `vad_analyzer=...` passed in the framework config (e.g. Pipecat `LLMUserAggregatorParams`); `vad_enabled=True` only on Pipecat <1.0
+17f. **VAD / turn detection configured**: set in code in the framework's own terms (Pipecat `vad_analyzer=...`, LiveKit `vad=...`, a hosted platform's speaking-plan config); `vad_enabled=True` only on Pipecat <1.0
 
 #### Agent Pattern (3 checks)
 
