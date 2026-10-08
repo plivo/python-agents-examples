@@ -659,6 +659,54 @@ fi
 echo ""
 
 # =============================================================================
+# 4b. Webhook Authentication (CLAUDE.md "Webhook Authentication")
+# =============================================================================
+# A server that verifies Plivo signatures (it references validate_v3_signature) must
+# declare a dependency on every route except the health check "/", /ws included.
+# Servers without the check are older examples and are skipped.
+
+echo "--- Webhook Authentication ---"
+
+for direction in inbound outbound; do
+    server_file="$EXAMPLE_DIR/$direction/server.py"
+    [[ -f "$server_file" ]] || continue
+    auth_result=$(python3 - "$server_file" <<'PY' 2>/dev/null || echo "error"
+import ast
+import sys
+
+source = open(sys.argv[1]).read()
+if "validate_v3_signature" not in source:
+    print("none")
+    raise SystemExit
+ROUTES = {"get", "post", "put", "delete", "patch", "api_route", "websocket"}
+unsigned = []
+for node in ast.walk(ast.parse(source)):
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        continue
+    for dec in node.decorator_list:
+        if not (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)):
+            continue
+        if dec.func.attr not in ROUTES or not dec.args:
+            continue
+        path = dec.args[0].value if isinstance(dec.args[0], ast.Constant) else "?"
+        if path == "/":
+            continue
+        if not any(kw.arg == "dependencies" for kw in dec.keywords):
+            unsigned.append(f"{dec.func.attr.upper()} {path}")
+print("unsigned: " + ", ".join(unsigned) if unsigned else "ok")
+PY
+)
+    case "$auth_result" in
+        ok) pass "$direction/server.py: every Plivo route (webhooks and /ws) checks the signature" ;;
+        none) skip "$direction/server.py: no Plivo signature check (older example)" ;;
+        error) fail "$direction/server.py: could not be parsed for the signature check" ;;
+        *) fail "$direction/server.py: routes without the signature dependency ($auth_result)" ;;
+    esac
+done
+
+echo ""
+
+# =============================================================================
 # 5. Code Quality Checks
 # =============================================================================
 

@@ -77,6 +77,8 @@ README.md
 Copy these files from `grok3-voice-native/` WITHOUT modification:
 - `tests/conftest.py`
 - `tests/helpers.py`
+
+Then add the Plivo signing helpers to `tests/helpers.py` from `deepgram-voiceagent/tests/helpers.py`: `plivo_signature_headers()`, `signed_webhook()`, `stream_signature_headers()`, `stream_url_from_xml()`.
 - `.gitignore`
 - `.pre-commit-config.yaml`
 
@@ -87,6 +89,11 @@ Copy `grok3-voice-native/inbound/server.py` → `{example-name}/inbound/server.p
 - Replace `grok-plivo-voice-agent` with the new service name
 - Replace Plivo app name (`Grok_Voice_Agent` → `{NewAgent}_Voice_Agent`)
 - Keep ALL routes, webhook logic, and WebSocket handling identical
+
+Then add Plivo signature checks to both `inbound/server.py` and `outbound/server.py` (CLAUDE.md "Webhook Authentication"; `grok3-voice-native` predates it). Copy from `deepgram-voiceagent/inbound/server.py`:
+- `check_webhook_auth_config()` (called at startup: refuse to run with an empty `PLIVO_AUTH_TOKEN`), `public_request_url()`, `_reject_unsigned()`, `verify_plivo_signature()` and `PLIVO_SIGNED`
+- `dependencies=PLIVO_SIGNED` on every Plivo webhook route (answer, hangup, fallback, …) and on `@app.websocket("/ws")`. Only the health check (`/`) stays open
+- No env switch to turn the check off
 
 For `outbound/server.py`, follow `deepgram-voiceagent/outbound/server.py` (the simple path in CLAUDE.md "Outbound Calls"): `/`, `/outbound/answer` (reads `opening_reason`/`objective`/`context` from the query string into the `<Stream>` body), `/outbound/hangup` (logs only), `/ws`. Do not copy `POST /outbound/call`, status/campaign routes or `CallManager` from `grok3-voice-native`.
 

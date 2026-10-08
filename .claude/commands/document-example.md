@@ -40,6 +40,7 @@ Create a comprehensive README following this section structure (from `grok3-voic
 12. **Testing**: commands for all test levels with descriptions
 13. **Deployment**: Docker build and run commands
 14. **Troubleshooting**: common issues and solutions specific to this API
+15. **Webhook authentication**: which routes need Plivo's signature (the webhooks and `/ws`), that `PUBLIC_URL` must match the URL Plivo calls, what a rejected request looks like in the log, and that the stream signature does not cover the stream URL's query string. Reference: `deepgram-voiceagent/README.md`
 
 #### Formatting Rules
 
