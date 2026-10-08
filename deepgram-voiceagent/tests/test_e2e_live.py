@@ -52,6 +52,7 @@ from tests.helpers import (
     signed_webhook,
     start_server,
     stop_server,
+    stream_signature_headers,
     stream_url_from_xml,
     ulaw_to_pcm,
 )
@@ -202,7 +203,7 @@ class SimulatedPlivo:
 
 @contextlib.asynccontextmanager
 async def plivo_call(call_uuid: str):
-    # Answer webhook signed as Plivo signs it; /ws is opened at its <Stream> URL
+    # Answer webhook and /ws connection signed as Plivo signs them; /ws is its <Stream> URL
     answer = await asyncio.to_thread(
         signed_webhook,
         "POST",
@@ -211,7 +212,12 @@ async def plivo_call(call_uuid: str):
         {"CallUUID": call_uuid, "From": "+15551234567", "To": "+16572338892"},
     )
     assert answer.status_code == 200, answer.text
-    async with websockets.connect(stream_url_from_xml(answer.text), close_timeout=3) as ws:
+    stream_url = stream_url_from_xml(answer.text)
+    async with websockets.connect(
+        stream_url,
+        additional_headers=stream_signature_headers(stream_url, TEST_AUTH_TOKEN),
+        close_timeout=3,
+    ) as ws:
         call = SimulatedPlivo(ws)
         await call.start()
         try:

@@ -15,13 +15,23 @@ import threading
 import time
 from collections.abc import AsyncIterator
 from typing import NoReturn
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import httpx
 import plivo
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    WebSocketException,
+)
+from fastapi.requests import HTTPConnection
 from fastapi.responses import Response
 from loguru import logger
 from plivo import plivoxml
@@ -248,55 +258,67 @@ def check_webhook_auth_config() -> None:
             "subaccount's token if the number belongs to a subaccount)."
         )
         raise SystemExit(1)
-    logger.info("Webhook auth: Plivo V3 signatures on webhooks")
+    logger.info("Webhook auth: Plivo V3 signatures on webhooks and the /ws stream")
 
 
-def public_request_url(request: Request) -> str:
-    """The URL Plivo called and signed: PUBLIC_URL + request path + raw query string.
+def public_request_url(conn: HTTPConnection) -> str:
+    """The URL Plivo signed, rebuilt from PUBLIC_URL (read at call time, so --tunnel works).
 
-    ``request.url`` is what this process sees (``http://localhost:8000/...`` behind a
-    tunnel or proxy), not what Plivo signed. PUBLIC_URL is read at call time, so the
-    value set by --tunnel is used.
+    ``conn.url`` is what this process sees (``http://localhost:8000/...`` behind a tunnel
+    or proxy), not what Plivo signed.
+    Webhook: PUBLIC_URL + request path + raw query string.
+    Stream (/ws): ``http://`` + PUBLIC_URL host + request path, no query string.
     """
-    url = PUBLIC_URL.rstrip("/") + request.url.path
-    if request.url.query:
-        url += "?" + request.url.query
+    if isinstance(conn, WebSocket):
+        return f"http://{urlsplit(PUBLIC_URL).netloc}{conn.url.path}"
+    url = PUBLIC_URL.rstrip("/") + conn.url.path
+    if conn.url.query:
+        url += "?" + conn.url.query
     return url
 
 
-def _reject_webhook(request: Request, reason: str) -> NoReturn:
-    logger.warning(f"Rejected Plivo webhook {request.method} {request.url.path}: {reason}")
+def _reject_unsigned(conn: HTTPConnection, reason: str) -> NoReturn:
+    """403 for a webhook; a stream is refused before accept (the client sees 403)."""
+    if isinstance(conn, WebSocket):
+        logger.warning(f"Rejected Plivo stream {conn.url.path}: {reason}")
+        raise WebSocketException(code=1008, reason="Invalid Plivo signature")
+    logger.warning(f"Rejected Plivo webhook {conn.scope['method']} {conn.url.path}: {reason}")
     raise HTTPException(status_code=403, detail="Invalid Plivo signature")
 
 
-async def verify_plivo_signature(request: Request) -> None:
-    """FastAPI dependency: 403 unless the request carries a valid Plivo V3 signature.
+async def verify_plivo_signature(conn: HTTPConnection) -> None:
+    """FastAPI dependency for webhooks and /ws: reject unless Plivo's V3 signature is valid.
 
     POST: the form fields are the signed params (the URL's query string is part of the
     signed URL). GET: Plivo's params are in the query string, so the URL carries them.
+    Stream (/ws): a GET with no signed params.
     """
-    signature = request.headers.get("X-Plivo-Signature-V3", "")
-    nonce = request.headers.get("X-Plivo-Signature-V3-Nonce", "")
+    signature = conn.headers.get("X-Plivo-Signature-V3", "")
+    nonce = conn.headers.get("X-Plivo-Signature-V3-Nonce", "")
     if not signature or not nonce:
-        _reject_webhook(request, "missing X-Plivo-Signature-V3 / -Nonce header")
+        _reject_unsigned(conn, "missing X-Plivo-Signature-V3 / -Nonce header")
     if not (PLIVO_AUTH_TOKEN and PUBLIC_URL):
-        _reject_webhook(request, "PLIVO_AUTH_TOKEN or PUBLIC_URL not set")
+        _reject_unsigned(conn, "PLIVO_AUTH_TOKEN or PUBLIC_URL not set")
+    method = conn.scope.get("method", "GET")  # a WebSocket connects with GET
     params: dict = {}
-    if request.method == "POST":
-        form = await request.form()
+    if isinstance(conn, Request) and method == "POST":
+        form = await conn.form()
         for key in form:
             values = [str(v) for v in form.getlist(key)]
             params[key] = values if len(values) > 1 else values[0]
     try:
         valid = validate_v3_signature(
-            request.method, public_request_url(request), nonce, PLIVO_AUTH_TOKEN, signature, params
+            method, public_request_url(conn), nonce, PLIVO_AUTH_TOKEN, signature, params
         )
     except Exception as e:  # malformed URL/headers fail the SDK's argument validation
-        _reject_webhook(request, f"signature check error ({type(e).__name__})")
+        _reject_unsigned(conn, f"signature check error ({type(e).__name__})")
     if not valid:
-        _reject_webhook(request, "signature mismatch (does PUBLIC_URL match the URL Plivo calls?)")
-    signed_query = " + query string" if request.url.query else ""
-    logger.debug(f"Plivo signature verified: {request.method} {request.url.path}{signed_query}")
+        _reject_unsigned(conn, "signature mismatch (does PUBLIC_URL match the URL Plivo calls?)")
+    if isinstance(conn, WebSocket):
+        logger.debug(f"Plivo signature verified: stream {conn.url.path}")
+        return
+    signed_query = " + query string" if conn.url.query else ""
+    logger.debug(f"Plivo signature verified: {method} {conn.url.path}{signed_query}")
 
 
 PLIVO_SIGNED = [Depends(verify_plivo_signature)]
@@ -532,7 +554,7 @@ async def hold_webhook() -> Response:
     return Response(content=response.to_string(), media_type="application/xml")
 
 
-@app.websocket("/ws")
+@app.websocket("/ws", dependencies=PLIVO_SIGNED)
 async def websocket_endpoint(
     websocket: WebSocket,
     body: str = Query(default=""),

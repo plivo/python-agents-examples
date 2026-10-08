@@ -227,10 +227,11 @@ Rules that follow from the principle:
 
 ## Webhook Authentication
 
-New examples authenticate Plivo's HTTP webhooks (reference: `deepgram-voiceagent/`, README "Webhook authentication"):
+New examples authenticate Plivo's HTTP webhooks and the `/ws` stream (reference: `deepgram-voiceagent/`, README "Webhook authentication"):
 - **Plivo HTTP webhooks** (answer, hangup, fallback, …): verify the V3 signature (`X-Plivo-Signature-V3` + `-Nonce`) with `plivo.utils.validate_v3_signature`, keyed with `PLIVO_AUTH_TOKEN`, via a FastAPI dependency in `server.py`. Rebuild the signed URL as `PUBLIC_URL` + request path + raw query string (never `request.url`: behind a tunnel it is `http://localhost…`), read at request time so `--tunnel` works. Signed params are the form fields for POST and the query string for GET. Failure: 403, plus a warning with the path and reason, never the signature.
 - **Always on**: no env switch disables the check. With an empty `PLIVO_AUTH_TOKEN`, refuse to start. Tests use a dummy `PLIVO_AUTH_TOKEN` and sign requests the way Plivo does.
-- **`/ws`** carries no token of its own (same as every other example); keep percent-encoding the base64 `body` in the stream URL so a `+` doesn't arrive as a space.
+- **`/ws` stream**: Plivo sends the same two signature headers when it connects. Verify them with the same dependency as the webhooks (`@app.websocket("/ws", dependencies=…)`), method `GET`, no params. The signed URL is `http://` + `PUBLIC_URL` host + request path: always the `http` scheme, and without the query string. On failure raise `WebSocketException(code=1008)` before `accept()` (the client sees HTTP 403) and log a warning with the path and reason. The signature does not cover `?body=`. Tests sign the connection the way Plivo does (`stream_signature_headers()` in `tests/helpers.py`).
+- Keep percent-encoding the base64 `body` in the stream URL so a `+` doesn't arrive as a space.
 
 ## Asyncio Patterns (Native)
 
