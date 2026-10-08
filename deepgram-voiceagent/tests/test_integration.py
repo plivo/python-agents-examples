@@ -1771,28 +1771,28 @@ SAVED_UUID = "11111111-2222-3333-4444-555555555555"
 # sha256 of the exact inline Settings wire JSON (json.dumps(_build_settings())) with
 # default models, a frozen clock and CALL_ID; any change to the Settings bytes fails these
 INLINE_SETTINGS_SHA256 = {
-    "inbound|caller=": "f8c554713f9ed7fd13d6745344557f93b9ce0261809e4c5637a3dea69185b87f",
+    "inbound|caller=": "eba2dcc6e04f3d00edae85bfef3ea62120acb48c6b01ba2f661af7f09a3dd815",
     "inbound|caller=+15551234567": (
-        "f33419bbdb46b83b93f02570d6cb153723a0af1230479186fff4f82955fb9c8d"
+        "6a24e38f881b6e6f6c7591f101f11d5e546f7ad63027bbb3406119ca384715aa"
     ),
     "outbound|greeting=False|numbers=False": (
-        "ca17537e2016015790de0d3e5bf9f5bab7bb1279a97ccf095f8cee17524a516d"
+        "b3346e542bb3a19f1931cb645cf930a6fb0dd3adc57c83f7711aeadf37b76f31"
     ),
     "outbound|greeting=False|numbers=True": (
-        "bf78d89cb529cf423c5645efba7374b4cb8b5a354a8ec6349199d8b5c43c1b5d"
+        "355a3fe4c74f56b299349eadbedc859428521035189aecc821d9e5ca6778365c"
     ),
     "outbound|greeting=True|numbers=False": (
-        "b5bd59bc2cc1c7396042236ba27d4288bb8807d90d459367394fa60a46e5d47d"
+        "8f65c8f4291d2a13920cec313fc44a914877bf73da3c9be9bebc8082895998c2"
     ),
     "outbound|greeting=True|numbers=True": (
-        "f0c32e2e09e28a729bc78762c9ca4ad44096baf4060f1dc6036a75bd1edebff1"
+        "ff1952b57472e62803764e76fbbb91bed6fc87585c6fa64f2eb1a832855c828a"
     ),
 }
 
 # sha256 of the config string in the README create body (default env)
 CREATE_BODY_CONFIG_SHA256 = {
-    "inbound": "61191cfbf2c69e83f3f270e55eefb187972a2956f76c56112ff623ba7e005c47",
-    "outbound": "16fa1cee1657131afa5f35138bea23b137bd80a0c202d064e08e90154e78e29b",
+    "inbound": "5811c1bca462bc34836ab5f66a92a5a2bd0b4e3367095cabfa308acc658a467d",
+    "outbound": "0a7ed4a042572cb4543cb156538268378acf61577dda3b22578479304c77e502",
 }
 
 _DEFAULT_INBOUND_GREETING = (
