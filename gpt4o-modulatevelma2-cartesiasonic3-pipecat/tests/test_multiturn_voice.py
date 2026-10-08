@@ -55,6 +55,7 @@ from tests.helpers import (
     signed_webhook,
     start_server,
     stop_server,
+    stream_signature_headers,
     stream_url_from_xml,
     synthesize_caller_speech,
 )
@@ -168,6 +169,14 @@ def stream_url(call_uuid: str) -> str:
     return stream_url_from_xml(resp.text)
 
 
+def plivo_stream(call_uuid: str) -> websockets.connect:
+    """Open /ws the way Plivo does: the issued stream URL, with Plivo's signature headers."""
+    url = stream_url(call_uuid)
+    return websockets.connect(
+        url, additional_headers=stream_signature_headers(url, TEST_AUTH_TOKEN), close_timeout=3
+    )
+
+
 # =============================================================================
 # Fixtures
 # =============================================================================
@@ -222,7 +231,7 @@ class TestMultiturnVoice:
         speech = [synthesize(text) for text in turns]
         responses: list[bytes] = []
 
-        async with websockets.connect(stream_url("multiturn"), close_timeout=3) as ws:
+        async with plivo_stream("multiturn") as ws:
             caller = SimulatedCaller(ws)
             await caller.start()
             try:
@@ -253,7 +262,7 @@ class TestMultiturnVoice:
         question = synthesize("Can you explain, step by step, how a phone call gets connected?")
         interruption = synthesize("Wait, stop. What is two plus two?")
 
-        async with websockets.connect(stream_url("barge-in"), close_timeout=3) as ws:
+        async with plivo_stream("barge-in") as ws:
             caller = SimulatedCaller(ws)
             await caller.start()
             try:

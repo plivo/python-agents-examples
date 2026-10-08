@@ -61,6 +61,7 @@ from tests.helpers import (
     start_server,
     stop_server,
     stream_body,
+    stream_signature_headers,
     stream_url_from_xml,
     ulaw_to_pcm,
 )
@@ -90,7 +91,7 @@ FORM = {"CallUUID": "c-1", "From": "+15551230000", "To": "+15557654321"}
 
 @pytest.fixture(autouse=True)
 def plivo_test_auth_token(monkeypatch):
-    """Both servers check webhook signatures with TEST_AUTH_TOKEN (never a real credential).
+    """Both servers check webhook and /ws stream signatures with TEST_AUTH_TOKEN.
 
     PLIVO_AUTH_ID is blanked so no test reaches the Plivo REST API with whatever is in
     the developer's .env; the hangup tests set a fake one and stub the client.
@@ -125,6 +126,16 @@ def ws_path(xml: str) -> str:
     """Path + query of the <Stream> URL (what Plivo opens on this server)."""
     url = stream_url_from_xml(xml)
     return url[url.index("/ws") :]
+
+
+def ws_signed(xml: str) -> dict[str, str]:
+    """Headers Plivo sends when it opens the <Stream> URL of an answer response."""
+    return stream_signature_headers(stream_url_from_xml(xml), TEST_AUTH_TOKEN)
+
+
+def ws_signed_path(path: str = "/ws", public_url: str = PUBLIC) -> dict[str, str]:
+    """Headers Plivo sends when it opens ``path`` on a server reachable at ``public_url``."""
+    return stream_signature_headers(public_url.rstrip("/") + path, TEST_AUTH_TOKEN)
 
 
 def _server(module: str, monkeypatch, public_url: str = PUBLIC):
@@ -1262,7 +1273,7 @@ class TestUnitServerRoutes:
         client = TestClient(server.app)
         path = _answer_path(module)
         answer = client.post(path, data=FORM, headers=signed("POST", PUBLIC, path, FORM))
-        with client.websocket_connect(ws_path(answer.text)) as ws:
+        with client.websocket_connect(ws_path(answer.text), headers=ws_signed(answer.text)) as ws:
             ws.send_text(
                 json.dumps({"event": "start", "start": {"callId": "c-1", "streamId": "s-1"}})
             )
@@ -1288,7 +1299,7 @@ class TestUnitServerRoutes:
         client = TestClient(server.app)
         path = "/outbound/answer"
         answer = client.post(path, data=FORM, headers=signed("POST", PUBLIC, path, FORM))
-        with client.websocket_connect(ws_path(answer.text)) as ws:
+        with client.websocket_connect(ws_path(answer.text), headers=ws_signed(answer.text)) as ws:
             ws.send_text(json.dumps({"event": "start", "start": {"callId": "c-1"}}))
         assert recorder.calls[0]["greeting"] == ""
         assert recorder.calls[0]["stream_id"] == ""
@@ -1300,7 +1311,7 @@ class TestUnitServerRoutes:
         server = _server(module, monkeypatch)
         recorder = _RunAgentRecorder()
         monkeypatch.setattr(server, "run_agent", recorder)
-        with TestClient(server.app).websocket_connect("/ws") as ws:
+        with TestClient(server.app).websocket_connect("/ws", headers=ws_signed_path()) as ws:
             ws.send_text(json.dumps({"event": "media", "media": {"payload": ""}}))
         assert recorder.calls == []
 
@@ -1404,7 +1415,7 @@ def _run_ws(server: Any, path: str = "/ws", start: dict | None = None) -> None:
     from fastapi.testclient import TestClient
 
     first = {"event": "start", "start": {"callId": "c-1", "streamId": "s-1"}}
-    with TestClient(server.app).websocket_connect(path) as ws:
+    with TestClient(server.app).websocket_connect(path, headers=ws_signed_path(path)) as ws:
         ws.send_text(json.dumps(first if start is None else start))
         with pytest.raises(Exception):  # noqa: B017 - the server closing the socket
             ws.receive_text()
@@ -1461,10 +1472,10 @@ class TestUnitServerHangup:
     def test_no_hangup_without_credentials(
         self, monkeypatch, plivo_calls, captured_records, module, missing
     ):
+        """Called directly: without PLIVO_AUTH_TOKEN no /ws connection gets that far."""
         server = _server(module, monkeypatch)
         monkeypatch.setattr(server, missing, "")
-        monkeypatch.setattr(server, "run_agent", _RunAgentRecorder())
-        _run_ws(server)
+        asyncio.run(server._hangup_call("c-1"))
         assert plivo_calls.built == [] and plivo_calls.deleted == []
         assert ("INFO", "Skipping REST hangup (no Plivo credentials)") in captured_records
 
@@ -1526,19 +1537,78 @@ WEBHOOK_ROUTES = [
 
 
 class TestUnitWebhookAuth:
-    """Plivo V3 signature checks on every HTTP webhook of both servers."""
+    """Plivo V3 signature checks on every webhook and the /ws stream of both servers."""
 
-    def test_every_route_but_health_and_ws_is_signature_checked(self):
-        """A new webhook route cannot be added without the dependency."""
+    def test_every_route_but_health_is_signature_checked(self):
+        """A new webhook or WebSocket route cannot be added without the dependency."""
         for module in SERVER_MODULES:
             server = importlib.import_module(module)
+            checked = set()
             for route in server.app.routes:
-                if not hasattr(route, "methods") or route.path in ("/", "/ws"):
+                if not hasattr(route, "dependant") or route.path == "/":
                     continue
                 if route.path in ("/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc"):
                     continue
                 calls = [d.call for d in route.dependant.dependencies]
                 assert server.verify_plivo_signature in calls, f"{module} {route.path}"
+                checked.add(route.path)
+            assert "/ws" in checked, module
+
+    @pytest.mark.parametrize("module", SERVER_MODULES)
+    def test_ws_rejects_unsigned_and_wrongly_signed(self, monkeypatch, captured_messages, module):
+        """No headers, a bad signature, or one made over the full wss URL: closed with 1008.
+
+        The refusal happens before the socket is accepted, so no pipeline starts.
+        """
+        from fastapi import WebSocketDisconnect
+        from fastapi.testclient import TestClient
+
+        server = _server(module, monkeypatch)
+        recorder = _RunAgentRecorder()
+        monkeypatch.setattr(server, "run_agent", recorder)
+        client = TestClient(server.app)
+        path = _answer_path(module)
+        answer = client.post(path, data=FORM, headers=signed("POST", PUBLIC, path, FORM))
+        stream_url = stream_url_from_xml(answer.text)
+        good = ws_signed(answer.text)
+        attempts = [
+            {},
+            {**good, "X-Plivo-Signature-V3": "AAAA"},
+            # signed over the https URL with its query string: not what Plivo signs
+            plivo_signature_headers(
+                "GET", stream_url.replace("wss://", "https://"), TEST_AUTH_TOKEN
+            ),
+        ]
+        for headers in attempts:
+            with (
+                pytest.raises(WebSocketDisconnect) as exc,
+                client.websocket_connect(ws_path(answer.text), headers=headers),
+            ):
+                pass
+            assert exc.value.code == 1008
+        assert not recorder.calls
+        rejected = [m for m in captured_messages if "Rejected Plivo stream /ws" in m]
+        assert len(rejected) == len(attempts)
+        assert "missing" in rejected[0]
+        assert all("signature mismatch" in m for m in rejected[1:])
+        assert not any("AAAA" in m or good["X-Plivo-Signature-V3"] in m for m in rejected)
+
+    @pytest.mark.parametrize("module", SERVER_MODULES)
+    def test_ws_signed_url_is_http_host_and_path(self, monkeypatch, module):
+        """The stream's signed URL: http scheme, PUBLIC_URL host, request path, no query."""
+        from fastapi import WebSocket
+
+        server = _server(module, monkeypatch, "https://agent.example.com")
+        scope = {
+            "type": "websocket",
+            "path": "/ws",
+            "query_string": b"body=abc%3D",
+            "headers": [(b"host", b"localhost:8000")],
+            "server": ("localhost", 8000),
+            "scheme": "ws",
+        }
+        ws = WebSocket(scope, receive=None, send=None)
+        assert server.public_request_url(ws) == "http://agent.example.com/ws"
 
     @pytest.mark.parametrize(("module", "method", "path"), WEBHOOK_ROUTES)
     def test_every_webhook_accepts_signed_and_rejects_unsigned(
@@ -1751,7 +1821,9 @@ class TestUnitWebhookAuth:
         monkeypatch.setattr(server.uvicorn, "run", lambda *a, **k: started.append(k))
         server.main()
         assert [k["port"] for k in started] == [server.SERVER_PORT]
-        assert "Webhook auth: Plivo V3 signatures on webhooks" in captured_messages
+        assert (
+            "Webhook auth: Plivo V3 signatures on webhooks and the /ws stream" in captured_messages
+        )
         if module == "outbound.server":
             hint = [m for m in captured_messages if m.startswith("Place calls with Plivo's Make")]
             assert hint and f"answer_url={PUBLIC}/outbound/answer?greeting=" in hint[0]
@@ -1799,6 +1871,19 @@ class TestLocalIntegration:
         """The /ws URL from a Plivo-signed answer webhook."""
         return stream_url_from_xml((await self._answer(call_uuid)).text)
 
+    @staticmethod
+    def _ws_headers(stream_url: str) -> dict[str, str]:
+        """Signature headers Plivo sends when it connects to /ws."""
+        return stream_signature_headers(stream_url, TEST_AUTH_TOKEN)
+
+    async def test_local_unsigned_stream_rejected(self, server_process):
+        """An unsigned /ws connection is refused with HTTP 403."""
+        stream_url = await self._stream_url("test-unsigned-ws")
+        with pytest.raises(websockets.exceptions.InvalidStatus) as exc:
+            async with websockets.connect(stream_url, close_timeout=2):
+                pass
+        assert exc.value.response.status_code == 403
+
     async def test_local_unsigned_answer_rejected(self, server_process):
         assert (await self._answer("test-unsigned", signed_request=False)).status_code == 403
 
@@ -1812,7 +1897,10 @@ class TestLocalIntegration:
 
     async def test_local_websocket_connection(self, server_process):
         """A Plivo start event produces playAudio (the LLM's opening line) within 20s."""
-        async with websockets.connect(await self._stream_url("test123"), close_timeout=2) as ws:
+        stream_url = await self._stream_url("test123")
+        async with websockets.connect(
+            stream_url, additional_headers=self._ws_headers(stream_url), close_timeout=2
+        ) as ws:
             await ws.send(
                 json.dumps(
                     {
@@ -1841,7 +1929,9 @@ class TestLocalIntegration:
         audio_chunks: list[bytes] = []
         silence = base64.b64encode(b"\xff" * 160).decode()
 
-        async with websockets.connect(stream_url, close_timeout=2) as ws:
+        async with websockets.connect(
+            stream_url, additional_headers=self._ws_headers(stream_url), close_timeout=2
+        ) as ws:
             await ws.send(
                 json.dumps(
                     {

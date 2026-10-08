@@ -124,7 +124,7 @@ Plivo (μ-law 8kHz)
 ### Call flow
 
 1. Plivo calls the answer webhook (`/answer` or `/outbound/answer`). The server verifies the signature and returns `<Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">` with a `wss://…/ws?body=…` URL. `body` is percent-encoded base64 JSON holding `call_uuid`, `from`, `to` (and `greeting` for outbound).
-2. Plivo opens `/ws` and sends `start`, then `media` events. The server reads the `start` event and calls `run_agent()`, which assembles the pipeline above.
+2. Plivo opens `/ws` and sends `start`, then `media` events. The server checks Plivo's signature when Plivo connects, then reads the `start` event and calls `run_agent()`, which assembles the pipeline above.
 3. Opening line. Inbound: the LLM is prompted with a stand-in caller turn ("Hello, I'm calling for help.") that is not kept in the conversation context, so the opening line is LLM-generated. Outbound: the greeting goes straight to TTS and is recorded in the context as an assistant turn, so the LLM does not introduce itself again.
 4. Turn taking. `SileroVADAnalyzer` (`confidence` 0.7, `start_secs` 0.2, `stop_secs` 0.2, `min_volume` 0.6: Pipecat's defaults) on the user aggregator reports speech start and stop. The end of the user's turn is decided by `SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=USER_SPEECH_TIMEOUT_SECS)` (0.6 s), set explicitly through `UserTurnStrategies(stop=[...])`: the turn is handed to the LLM once that window after speech stop has passed and a transcript is in. Modulate's `clip` events are pushed as `TranscriptionFrame(..., finalized=True)`, so the strategy does not wait for a further transcript.
 5. Barge-in. Speech start while the agent is talking interrupts it: Pipecat cancels the in-flight LLM response and TTS audio and the serializer sends `{"event": "clearAudio"}` so Plivo drops what it has buffered.
@@ -141,20 +141,20 @@ Plivo (μ-law 8kHz)
 | inbound | `/hangup` | POST | Yes | Hangup webhook: logs `CallUUID`, `Duration`, `HangupCause` |
 | inbound | `/fallback` | POST | Yes | Fallback webhook: speaks an apology and hangs up. Not set by auto-configuration; add it to the Plivo application as the fallback URL yourself |
 | inbound | `/hold` | GET/POST | Yes | Returns `<Wait length="120">`, which holds a call open without audio. Not part of the agent's call flow and not set by auto-configuration; the tests only check that it answers signed requests |
-| inbound | `/ws` | WebSocket | No | Plivo audio stream; runs the agent, then hangs the call up |
+| inbound | `/ws` | WebSocket | Yes | Plivo audio stream; runs the agent, then hangs the call up |
 | outbound | `/` | GET | No | Health check |
 | outbound | `/outbound/answer` | GET/POST | Yes | Answer webhook (your `answer_url`): reads the optional `greeting` query param and returns `<Stream>` XML |
 | outbound | `/outbound/hangup` | POST | Yes | Hangup webhook (your optional `hangup_url`): logs only |
-| outbound | `/ws` | WebSocket | No | Plivo audio stream; runs the agent, then hangs the call up |
+| outbound | `/ws` | WebSocket | Yes | Plivo audio stream; runs the agent, then hangs the call up |
 
 ## Webhook authentication
 
-Both servers are exposed on a public URL, so they accept only webhook requests that come from Plivo. The check always runs; there is no setting to turn it off.
+Both servers are exposed on a public URL, so they accept only webhook requests and audio streams that come from Plivo. The checks always run; there is no setting to turn them off.
 
 - **Plivo webhooks** (`/answer`, `/hangup`, `/fallback`, `/hold`, `/outbound/answer`, `/outbound/hangup`) must carry a valid [Plivo V3 signature](https://www.plivo.com/docs/voice/concepts/signature-validation): the `X-Plivo-Signature-V3` and `X-Plivo-Signature-V3-Nonce` headers, keyed with `PLIVO_AUTH_TOKEN`. `verify_plivo_signature()`, a FastAPI dependency in each `server.py`, checks them with the Plivo SDK's `validate_v3_signature()`. The signed params are the form fields for POST and the query string for GET. Anything else gets **403** and a warning with the path and reason (`missing …`, `signature mismatch`, `PLIVO_AUTH_TOKEN or PUBLIC_URL not set`). Signatures are never logged.
-- **`/ws`** is not a Plivo webhook, so its handshake is not signed and it has no check of its own, like the other examples in this repo. The stream URL is only handed to Plivo in the signed answer webhook's `<Stream>` XML.
+- **`/ws`** (the audio stream): Plivo sends the same two headers when it connects, and the same `verify_plivo_signature()` checks them before the WebSocket is accepted. Plivo signs the stream URL as `http://<host>/ws`: the `http` scheme, and no query string. A connection without a valid signature gets **403**, a warning is logged (`Rejected Plivo stream /ws: …`), and no pipeline is started. The signature does not cover `?body=`.
 
-**`PUBLIC_URL` must be exactly the URL Plivo is configured to call.** Plivo signs the URL it requested. Behind a tunnel or reverse proxy the server sees `http://localhost:8000/...` instead, so the signed URL is rebuilt as `PUBLIC_URL` (trailing `/` stripped) + request path + raw query string; `request.url` is not used. The scheme, host and any path prefix must match the answer and hangup URLs in the Plivo application or Make Call request. With `PUBLIC_URL` unset every webhook is rejected. The outbound `answer_url` query string (`greeting`) is part of what Plivo signs, so editing it invalidates the signature.
+**`PUBLIC_URL` must be exactly the URL Plivo is configured to call.** Plivo signs the URL it requested. Behind a tunnel or reverse proxy the server sees `http://localhost:8000/...` instead, so the signed URL is rebuilt as `PUBLIC_URL` (trailing `/` stripped) + request path + raw query string; `request.url` is not used. For `/ws` the signed URL is rebuilt as `http://` + the host of `PUBLIC_URL` + request path. The scheme, host and any path prefix must match the answer and hangup URLs in the Plivo application or Make Call request. With `PUBLIC_URL` unset every webhook and stream is rejected. The outbound `answer_url` query string (`greeting`) is part of what Plivo signs, so editing it invalidates the signature.
 
 **`PLIVO_AUTH_TOKEN` is required.** With it empty, both servers log the reason and exit with status 1 before listening. Use a subaccount's auth token if the number and calls belong to a subaccount, because Plivo signs with the token of the account that owns the call. The tests use a dummy token and sign their requests the way Plivo does.
 
@@ -284,7 +284,7 @@ Make the same edit in both agent files; `tests/test_integration.py` asserts the 
 | `TTS_VOICE` | Cartesia voice ID, from the Cartesia voice library or its List Voices API | `71a7ad14-091c-4e8e-a314-022ece01c121` (a Cartesia library voice) |
 | `TAVILY_SEARCH_DEPTH` | Passed to Tavily as `search_depth`: `ultra-fast`, `fast`, `basic` or `advanced` | `fast` |
 | `PLIVO_AUTH_ID` | Plivo auth ID. Used by both servers for the REST hangup when the pipeline ends, by the inbound server for auto-configuration, and by your own Make Call requests | Required |
-| `PLIVO_AUTH_TOKEN` | Plivo auth token: key for webhook signature checks (both servers refuse to start without it), REST hangup and auto-configuration | Required |
+| `PLIVO_AUTH_TOKEN` | Plivo auth token: key for webhook and stream signature checks (both servers refuse to start without it), REST hangup and auto-configuration | Required |
 | `PLIVO_PHONE_NUMBER` | Inbound: the number auto-configured at startup. Outbound: not used by the server beyond the health check; use it as `from` in your Make Call request | Empty |
 | `PUBLIC_URL` | Public HTTPS URL of the server. Signatures are checked against it and the `wss://` stream URL is built from it | Required |
 | `SERVER_PORT` | Inbound server port | `8000` |
@@ -303,7 +303,7 @@ Each direction has one prompt source: `inbound/system_prompt.md` and `outbound/s
 
 ## Testing
 
-The tests keep webhook authentication on. They sign webhook requests the way Plivo does (`plivo_signature_headers()` / `signed_webhook()` in `tests/helpers.py`, built on the Plivo SDK) and open `/ws` with the stream URL returned by a signed answer webhook. Servers started for local tests get a dummy auth token, `PUBLIC_URL` set to their own `http://localhost:<port>` URL, and no Plivo auth ID or phone number, so they cannot reconfigure a real Plivo number. Every test that needs a live service skips, with the missing names in the reason, unless all the keys it needs are set.
+The tests keep webhook authentication on. They sign webhook requests the way Plivo does (`plivo_signature_headers()` / `signed_webhook()` in `tests/helpers.py`, built on the Plivo SDK) and open `/ws` with the stream URL returned by a signed answer webhook, signing that connection the way Plivo does (`stream_signature_headers()`). Servers started for local tests get a dummy auth token, `PUBLIC_URL` set to their own `http://localhost:<port>` URL, and no Plivo auth ID or phone number, so they cannot reconfigure a real Plivo number. Every test that needs a live service skips, with the missing names in the reason, unless all the keys it needs are set.
 
 Run from this directory:
 
@@ -335,8 +335,8 @@ uv run pytest tests/test_outbound_call.py -v -s
 
 | Test file | Port | What it covers |
 |---|---|---|
-| `test_integration.py` (`-k unit`) | none | Phone normalization, `ModulateSTTService` event handling, the Tavily tool with a stubbed client, prompts and the outbound greeting, pipeline wiring (turn strategies, unusable-service policy), server routes, REST hangup, webhook authentication for both servers |
-| `test_integration.py` (`-k local`) | 18001 | Health, signed and unsigned `/answer`, `playAudio` with speech from the opening line |
+| `test_integration.py` (`-k unit`) | none | Phone normalization, `ModulateSTTService` event handling, the Tavily tool with a stubbed client, prompts and the outbound greeting, pipeline wiring (turn strategies, unusable-service policy), server routes, REST hangup, webhook and `/ws` stream authentication for both servers |
+| `test_integration.py` (`-k local`) | 18001 | Health, signed and unsigned `/answer`, unsigned `/ws` (403), `playAudio` with speech from the opening line |
 | `test_e2e_live.py` | 18005 | Opening line over a simulated Plivo stream, transcribed with faster-whisper |
 | `test_multiturn_voice.py` | 18004 | Three spoken user turns, each answered; speaking over an answer produces `clearAudio`. Simulated Plivo stream, no phone call |
 | `test_live_call.py` | 18002 | Real inbound call: signed `/answer` and `/hold` through the tunnel (unsigned: 403), then a three-turn conversation including a question that must call `search_the_web`; `/hangup` received and pipeline ended |
@@ -393,6 +393,8 @@ Webhook signatures cannot be checked without it. Set `PLIVO_AUTH_TOKEN`.
 ### 403 on `/answer` or `/outbound/answer`, or the call drops at once
 
 The signature did not verify. The log line `Rejected Plivo webhook …` gives the reason. Check that `PUBLIC_URL` is exactly the scheme and host Plivo calls (the running tunnel, `https`), and that `PLIVO_AUTH_TOKEN` belongs to the account or subaccount that owns the number.
+
+`Rejected Plivo stream /ws: signature mismatch …` means the answer webhook was accepted but the audio stream was refused, so the call connects and then drops. Check that the host in `PUBLIC_URL` is the host Plivo connects to for the stream, and that nothing in between rewrites the path. To open `/ws` by hand, send the headers from `stream_signature_headers()` in `tests/helpers.py`.
 
 ### No audio in either direction
 

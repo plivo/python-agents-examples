@@ -49,6 +49,7 @@ from tests.helpers import (
     signed_webhook,
     start_server,
     stop_server,
+    stream_signature_headers,
     stream_url_from_xml,
     ulaw_to_pcm,
 )
@@ -144,7 +145,10 @@ def stream_url(call_uuid: str) -> str:
 
 
 async def opening_line_audio(call_uuid: str) -> bytes:
-    async with websockets.connect(stream_url(call_uuid), close_timeout=3) as ws:
+    url = stream_url(call_uuid)
+    async with websockets.connect(
+        url, additional_headers=stream_signature_headers(url, TEST_AUTH_TOKEN), close_timeout=3
+    ) as ws:
         start_event = {
             "event": "start",
             "start": {"callId": str(uuid.uuid4()), "streamId": str(uuid.uuid4())},
