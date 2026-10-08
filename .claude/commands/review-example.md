@@ -32,23 +32,24 @@ Run through EVERY item. Report PASS or FAIL with details for each.
 3. **No stale `env.example`**: File `env.example` (without dot) must NOT exist
 4. **`__init__.py` files**: Must exist in `inbound/`, `outbound/`, `tests/`
 5. **`system_prompt.md`**: Must exist in both `inbound/` and `outbound/`
-6. **`pyproject.toml` fields**: Has `name`, `version`, `description`, `requires-python`, `dependencies`
+6. **`pyproject.toml` fields**: Has `name`, `version`, `description`, `requires-python`, `dependencies`. `requires-python` is `>=3.10` unless a dependency needs more; a raised floor matches ruff `target-version`, the Dockerfile base image and the README Prerequisites
 7. **Test files complete**: All 7 test files exist in `tests/`
 8. **Dockerfile exists**: And COPY paths match actual structure
 
 #### Config Placement (4 checks)
 
 9. **Server constants in server.py**: `SERVER_PORT`, `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN`, `PLIVO_PHONE_NUMBER`, `PUBLIC_URL` are imported from utils or defined in server.py — NOT in agent.py
-10. **Agent constants in agent.py**: API keys, model names, voice names, `PLIVO_CHUNK_SIZE`, `SYSTEM_PROMPT` — NOT in utils.py. `SYSTEM_PROMPT` is read only from `system_prompt.md`: flag any `os.getenv("SYSTEM_PROMPT")` (or similar) override. New examples use the simple outbound path (no `CallManager`, `OutboundCallRecord` or `POST /outbound/call`; see CLAUDE.md "Outbound Calls")
-11. **Utils only has utility constants**: No `SERVER_PORT`, `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN`, `PLIVO_PHONE_NUMBER`, `PUBLIC_URL`, API keys, or model names in utils.py
+10. **Agent constants in agent.py**: API keys, model names, voice names, `PLIVO_CHUNK_SIZE` (native and managed platform only; a framework example does not define it), `SYSTEM_PROMPT` — NOT in utils.py. `SYSTEM_PROMPT` is read only from `system_prompt.md`: flag any `os.getenv("SYSTEM_PROMPT")` (or similar) override. New examples use the simple outbound path (no `CallManager`, `OutboundCallRecord` or `POST /outbound/call`; see CLAUDE.md "Outbound Calls")
+11. **Utils only has utility constants**: No `SERVER_PORT`, `PLIVO_AUTH_ID`, `PLIVO_AUTH_TOKEN`, `PLIVO_PHONE_NUMBER`, `PUBLIC_URL`, API keys, or model names in utils.py. Sample-rate constants only when utils.py has conversion functions
 12. **No config leakage**: grep for common config constants to verify placement
 
-#### Audio Pipeline (4 checks)
+#### Audio Pipeline (5 checks)
 
-13. **PLIVO_CHUNK_SIZE = 160**: Defined in agent.py `_send_to_plivo()` method (skip for framework: the transport chunks the audio)
+13. **PLIVO_CHUNK_SIZE = 160**: Defined in agent.py `_send_to_plivo()` method (native and managed platform; skip for framework: the transport chunks the audio)
 14. **playAudio format correct**: `contentType: "audio/x-mulaw"`, `sampleRate: 8000`, base64 payload (framework: normally emitted by the framework's transport, so check it only if the agent builds the message itself; a comment mentioning the format does not count)
 15. **Stream XML correct**: `bidirectional=True`, `keepCallAlive=True`, `contentType="audio/x-mulaw;rate=8000"`
-16. **Sample rates correct**: Check `plivo_to_{api}()` and `{api}_to_plivo()` use correct rates
+16. **Sample rates correct**: Check `plivo_to_{api}()` and `{api}_to_plivo()` use correct rates (native and managed platform; documented pass-throughs when the API is μ-law 8kHz end to end, reference `deepgram-voiceagent/utils.py`). Framework or hosted: skip unless the example's own code converts audio, then check the helpers it calls
+16b. **utils.py helpers match who converts audio** (CLAUDE.md "utils.py Requirements" table): native has the codec set, both direction wrappers and (unless `-no-vad` / `-webrtcvad`) `plivo_to_vad` + `SileroVADProcessor`; a framework example whose serializer/transport converts, or a hosted one whose audio never reaches this server, has only `normalize_phone_number` and no unused helpers or `numpy`/`scipy` deps for them; no example imports `audioop`, calls a resampler or defines its own μ-law/resample function in `agent.py` / `server.py`
 
 #### VAD (4 checks — native only, skip for framework)
 
@@ -59,11 +60,12 @@ Run through EVERY item. Report PASS or FAIL with details for each.
 
 #### VAD (1 check — framework only)
 
-17f. **VAD / turn detection configured**: set in code in the framework's own terms (Pipecat `vad_analyzer=...`, LiveKit `vad=...`, a hosted platform's speaking-plan config); `vad_enabled=True` only on Pipecat <1.0
+17f. **VAD / turn detection configured**: set in code in the framework's own terms (Pipecat 1.x `vad_analyzer=SileroVADAnalyzer()` on `LLMUserAggregatorParams`, LiveKit `vad=...`, a hosted platform's speaking-plan config); `vad_enabled=True` only on Pipecat <1.0
 
 #### Agent Pattern (3 checks)
 
 21. **3-task pattern** (native): plivo_rx, {api}_rx, plivo_tx tasks created and managed
+21f. **Pipecat runner** (Pipecat only): Pipecat 1.x uses `PipelineWorker` + `WorkerRunner(handle_sigint=False)`, not the deprecated `PipelineTask` / `PipelineRunner` (legacy 0.0.x examples only); no runner is ever given `handle_sigterm=True` inside uvicorn
 22. **`_pending` pattern**: Uses `done, _pending = await asyncio.wait(...)` (not `done, pending =`)
 23. **Task cleanup in finally**: All tasks cancelled with `contextlib.suppress(asyncio.CancelledError)`
 

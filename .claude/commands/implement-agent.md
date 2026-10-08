@@ -23,12 +23,15 @@ Also read the reference implementations:
 - `grok3-voice-native/inbound/agent.py` — native pattern with Silero VAD, barge-in, turn management
 - `deepgram-voiceagent/outbound/` — outbound pattern: Plivo Make Call API → `answer_url` query params → `<Stream>` → agent (`grok3-voice-native/outbound/` uses the legacy `CallManager`; don't copy it)
 - `gemini2.5-live-native/inbound/agent.py` — alternative native pattern (SDK-based)
+- `gpt4o-modulatevelma2-cartesiasonic3-pipecat/inbound/agent.py`: framework pattern for Pipecat 1.x (`gemini2.5-live-pipecat` is the legacy Pipecat 0.0.x one)
 
 ### 2. Update utils.py
 
-Set correct audio sample rates for the API:
-- `{API}_SAMPLE_RATE` (or `{API}_INPUT_RATE` / `{API}_OUTPUT_RATE` if they differ)
-- Update `plivo_to_{api}()` and `{api}_to_plivo()` with correct rates
+What goes here depends on who converts audio on the call path (CLAUDE.md "utils.py Requirements"):
+- **Native / managed platform, API needs PCM or another rate**: set `{API}_SAMPLE_RATE` (or `{API}_INPUT_RATE` / `{API}_OUTPUT_RATE` if they differ) and update `plivo_to_{api}()` and `{api}_to_plivo()` with the correct rates
+- **Native / managed platform, API takes and emits μ-law 8kHz**: make both wrappers documented pass-throughs and delete the codec set, decode table, sample-rate constants and the `numpy`/`scipy` deps (reference: `deepgram-voiceagent/utils.py`)
+- **Framework whose serializer/transport converts** (e.g. Pipecat `PlivoFrameSerializer`), or hosted orchestration: no audio helpers; leave only `normalize_phone_number`
+- **Framework whose own code touches raw audio** (custom processor or service): put the helpers it calls here and import them; never convert inline in `agent.py`
 - Only modify utility-owned constants — do NOT add server or agent config here
 
 ### 3. Implement inbound/agent.py
@@ -69,7 +72,7 @@ Include all tool functions from the scaffold (check_order_status, send_sms, sche
 - Configure framework transport with Plivo WebSocket
 - Pass the framework's VAD analyzer (Pipecat: `vad_analyzer=SileroVADAnalyzer()` on `LLMUserAggregatorParams`; `vad_enabled=True` is Pipecat <1.0 only)
 - Assemble Pipeline with appropriate services
-- Start the pipeline
+- Start the pipeline. Pipecat 1.x: wrap it in `PipelineWorker`, then `runner = WorkerRunner(handle_sigint=False)`, `await runner.add_workers(worker)`, `await runner.run()`. Never pass `handle_sigterm=True` inside uvicorn; `PipelineTask` / `PipelineRunner` are deprecated aliases (CLAUDE.md "Pipecat runner signal handling")
 
 ### 4. Implement outbound/agent.py
 

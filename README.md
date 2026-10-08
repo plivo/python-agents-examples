@@ -56,7 +56,7 @@ These examples wire up separate providers for speech-to-text, language model, an
 
 ## Prerequisites
 
-- Python 3.10+ (3.12 recommended)
+- Python 3.10+ (3.12 recommended; a few examples need 3.11+, as stated in their README)
 - [uv](https://docs.astral.sh/uv/) package manager (recommended) or pip
 - [ngrok](https://ngrok.com/) for local development
 - A [Plivo](https://www.plivo.com/) account with a phone number
