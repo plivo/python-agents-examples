@@ -163,7 +163,7 @@ Three concurrent asyncio tasks, following the canonical `FIRST_COMPLETED` patter
 ### Call sequence
 
 1. `/answer` (inbound) or `/outbound/answer` (outbound) returns `<Stream bidirectional keepCallAlive contentType="audio/x-mulaw;rate=8000">` pointing at `/ws`. Call metadata (`call_uuid`, `from`, `to`, `parent_call_uuid`, `sip_headers`, plus the `answer_url`'s `greeting` for outbound) travels as base64 JSON in `?body=`.
-2. `/ws` waits for Plivo `start` (`callId`, `streamId`), then calls `run_agent(...)` with `hangup_callback=functools.partial(_hangup_call, callId)`. Outbound `run_agent()` passes the `greeting` through unchanged (`DEFAULT_OUTBOUND_GREETING` when absent).
+2. `/ws` checks Plivo's signature when Plivo connects, then waits for Plivo `start` (`callId`, `streamId`), then calls `run_agent(...)` with `hangup_callback=functools.partial(_hangup_call, callId)`. Outbound `run_agent()` passes the `greeting` through unchanged (`DEFAULT_OUTBOUND_GREETING` when absent).
 3. **Handshake** (`_handshake()`): `Welcome{request_id}` → send `Settings` exactly once → `SettingsApplied`, all within 10s. No audio or text goes upstream before `SettingsApplied`; buffered input is flushed right after.
 4. **Greeting**: Deepgram speaks `agent.greeting`. Binary μ-law audio may arrive before `ConversationText{assistant}` (→ `agent_text`, turn 1). `AgentAudioDone` → a `_Checkpoint` is queued behind the last chunk → Plivo `playedStream` → `turn_complete`.
 5. **User turn**: Flux detects end-of-turn → `ConversationText{user}` (→ `user_text`, TTFS clock starts) and `EndOfTurn` → `ConversationText{assistant}` (→ `agent_text`) and binary audio, interleaved with single-key `LatencyReport` messages → `AgentAudioDone` → checkpoint → `playedStream` → `turn_complete`.
@@ -180,19 +180,19 @@ Three concurrent asyncio tasks, following the canonical `FIRST_COMPLETED` patter
 | Server start: `uv run python -m outbound.server` | `outbound/server.py` → `main()` | Same agent-path log line, reusable-config ID check and webhook-auth check, then uvicorn on `OUTBOUND_SERVER_PORT` (default 8001). Once the server accepts connections it logs `Ready!` with a cURL for Plivo's Make Call API and this server's answer URL, ending with `(Ctrl+C to stop)`. There is no number auto-config, because you pass the answer and hangup URLs with each call. |
 | You place a call (Plivo Make Call API) | your shell / backend → Plivo | `POST https://api.plivo.com/v1/Account/{auth_id}/Call/` with `from`, `to`, `answer_url=<PUBLIC_URL>/outbound/answer?greeting=…` and optional `hangup_url`. The server has no dial endpoint and keeps no call records. |
 | Plivo answers (`/answer` or `/outbound/answer`) | `server.py` | `verify_plivo_signature()` checks Plivo's V3 signature (403 if invalid). Then returns `<Stream bidirectional keepCallAlive>` XML that points Plivo at `/ws`. Call metadata (and, outbound, the `answer_url` call details) travels as base64 JSON in `?body=`, percent-encoded so a `+` in the base64 isn't read as a space. |
-| Each call (`/ws`) | `server.py` → `run_agent()` in `agent.py` | Accepts the WebSocket, reads Plivo's `start` event, then runs `DeepgramVoiceAgent.run()`. That opens a **new** Deepgram WebSocket for the call, sends Settings (inline block or reusable config UUID), sends `UpdatePrompt` + `InjectAgentMessage` on the reusable path, and runs the `plivo_rx` / `deepgram_rx` / `plivo_tx` tasks until the call ends. There is no Deepgram connection before a call arrives. |
+| Each call (`/ws`) | `server.py` → `run_agent()` in `agent.py` | `verify_plivo_signature()` checks Plivo's V3 signature when Plivo connects (403 if invalid). Then accepts the WebSocket, reads Plivo's `start` event, then runs `DeepgramVoiceAgent.run()`. That opens a **new** Deepgram WebSocket for the call, sends Settings (inline block or reusable config UUID), sends `UpdatePrompt` + `InjectAgentMessage` on the reusable path, and runs the `plivo_rx` / `deepgram_rx` / `plivo_tx` tasks until the call ends. There is no Deepgram connection before a call arrives. |
 | `end_call` tool | `agent.py` → `hangup_callback` | After the goodbye has played, the agent calls `_hangup_call()` from `server.py`, which hangs up via the Plivo REST API. Plivo credentials never leave `server.py`. |
 | One-off setup (optional): create a reusable config | your shell → Deepgram REST API | The `curl` commands in [Creating a reusable config](#creating-a-reusable-config) post this example's agent definition once. The example contains no code for it; servers only read the UUID from the env var and check at startup that it exists. |
 | Shared helpers | `utils.py` | `plivo_to_deepgram` / `deepgram_to_plivo` (pass-through), phone normalization, `--tunnel` helpers. |
 
 ## Webhook authentication
 
-Both servers are exposed on a public URL, so they accept only requests that come from Plivo. The check below always runs; there is no setting to turn it off:
+Both servers are exposed on a public URL, so they accept only requests and audio streams that come from Plivo. The checks below always run; there is no setting to turn them off:
 
 - **Plivo webhooks** (`/answer`, `/hangup`, `/fallback`, `/hold`, `/outbound/answer`, `/outbound/hangup`) must carry a valid [Plivo V3 signature](https://www.plivo.com/docs/voice/concepts/signature-validation) (`X-Plivo-Signature-V3` + `X-Plivo-Signature-V3-Nonce`, an HMAC-SHA256 signature keyed with `PLIVO_AUTH_TOKEN`). `verify_plivo_signature()`, a FastAPI dependency in each `server.py`, checks them with the Plivo SDK's `validate_v3_signature()`. The signed params are the form fields for POST and the query string for GET. Otherwise the request gets **403** and a warning is logged with the path and reason (`missing …` or `signature mismatch`). Signatures are never logged.
-- **`/ws`** is not a Plivo webhook, so its handshake is not signed, and it has no extra check of its own, like the other examples in this repo. The stream URL (`wss://…/ws?body=<metadata>`) is only handed to Plivo in the signed answer webhook's `<Stream>` XML.
+- **`/ws`** (the audio stream): Plivo sends the same two headers when it connects, and the same `verify_plivo_signature()` checks them before the WebSocket is accepted. Plivo signs the stream URL as `http://<host>/ws`: the `http` scheme, and no query string. A connection without a valid signature gets **403**, a warning is logged (`Rejected Plivo stream /ws: …`), and no agent is started. The signature does not cover `?body=`.
 
-**`PUBLIC_URL` must be exactly the URL Plivo is configured to call.** Plivo signs the URL it requested. Behind a tunnel or reverse proxy, this server sees `http://localhost:8000/...` instead, so the signed URL is rebuilt as `PUBLIC_URL` (trailing `/` stripped) + request path + raw query string. `request.url` is not used. The scheme (`https` vs `http`), the host and any path prefix must match the answer and hangup URLs in the Plivo application or Make Call request. `PUBLIC_URL=https://agent.example.com` and `https://agent.example.com/` are equivalent. `http://agent.example.com` or another hostname for the same server is not. The outbound `answer_url` query string (`greeting`) is part of what Plivo signs: for a POST, the Plivo SDK's base string is `<url>?<query params sorted, URL-decoded>.<form params sorted, name+value concatenated>`. Editing the query string therefore invalidates the signature. This was verified live against Plivo's own signatures (`Plivo signature verified: POST /outbound/answer + query string` in the log).
+**`PUBLIC_URL` must be exactly the URL Plivo is configured to call.** Plivo signs the URL it requested. Behind a tunnel or reverse proxy, this server sees `http://localhost:8000/...` instead, so the signed URL is rebuilt as `PUBLIC_URL` (trailing `/` stripped) + request path + raw query string. `request.url` is not used. For `/ws` the signed URL is rebuilt as `http://` + the host of `PUBLIC_URL` + request path. The scheme (`https` vs `http`), the host and any path prefix must match the answer and hangup URLs in the Plivo application or Make Call request. `PUBLIC_URL=https://agent.example.com` and `https://agent.example.com/` are equivalent. `http://agent.example.com` or another hostname for the same server is not. The outbound `answer_url` query string (`greeting`) is part of what Plivo signs: for a POST, the Plivo SDK's base string is `<url>?<query params sorted, URL-decoded>.<form params sorted, name+value concatenated>`. Editing the query string therefore invalidates the signature.
 
 **`--tunnel`**: the quick-tunnel URL becomes `PUBLIC_URL` at startup, and the verifier reads it on each request, so signatures are checked against the tunnel URL. The inbound server points the number at that same URL. For outbound, use the tunnel URL from the `Ready!` line in your `answer_url`.
 
@@ -360,7 +360,7 @@ your shell / backend ──POST /v1/Account/{auth_id}/Call/──► Plivo ─�
 |----------|--------|-------------|
 | `/outbound/answer` | GET/POST | Plivo answer webhook (your `answer_url`). Reads the optional query param `greeting`, plus Plivo's `CallUUID`/`From`/`To`/`ParentCallUUID`/`SIP-*` fields, and returns `<Stream>` to `/ws` with them in the base64 `body` |
 | `/outbound/hangup` | POST | Plivo hangup webhook (your optional `hangup_url`); logs `CallUUID`, `Duration`, `HangupCause` |
-| `/ws` | WebSocket | Plivo audio stream; runs the agent |
+| `/ws` | WebSocket | Plivo audio stream (Plivo signature required); runs the agent |
 | `/` | GET | Health check |
 
 Once it accepts connections, the server logs a `Ready!` line with the cURL below, its own `PUBLIC_URL` and `PLIVO_PHONE_NUMBER` filled in. Credentials stay shell references (`set -a && source .env && set +a` exports them):
@@ -515,7 +515,7 @@ session                  +    0ms  21983ms  gpt-4.1-mini, flux-general-en, aura-
 | `DEEPGRAM_INBOUND_AGENT_ID` | Reusable agent config UUID for inbound calls (see [Creating a reusable config](#creating-a-reusable-config)); empty = inline Settings | — |
 | `DEEPGRAM_OUTBOUND_AGENT_ID` | Reusable agent config UUID for outbound calls; empty = inline Settings | — |
 | `PLIVO_AUTH_ID` | Plivo Auth ID | Required |
-| `PLIVO_AUTH_TOKEN` | Plivo Auth Token. Also the key for webhook signature checks | Required |
+| `PLIVO_AUTH_TOKEN` | Plivo Auth Token. Also the key for webhook and stream signature checks | Required |
 | `PLIVO_PHONE_NUMBER` | Plivo number (inbound auto-config; outbound: the `from` shown in the startup cURL) | Required |
 | `PLIVO_TEST_NUMBER` | Second Plivo number for live call tests | — |
 | `PUBLIC_URL` | Public HTTPS URL for webhooks; `https://` → `wss://` for the stream URL. Must match the URL Plivo calls: signatures are checked against it | Required |
@@ -589,7 +589,7 @@ Observed latency (from `turn_complete` / `session_end` in the live call and mult
 | Deepgram `tts_latency` | — | 93–127 ms | Aura-2 |
 | `end_call` → REST hangup | ~4.4 s | — | goodbye spoken + `playedStream`, then `calls.delete` (`NORMAL_CLEARING`) |
 
-The tests keep webhook authentication on. They sign webhook requests the way Plivo does (`plivo_signature_headers()` / `signed_webhook()` in `tests/helpers.py`, built on the Plivo SDK). They open `/ws` with the stream URL returned by a signed answer webhook. Local servers use a test auth token, with `PUBLIC_URL` set to their `http://localhost:<port>` URL.
+The tests keep webhook authentication on. They sign webhook requests the way Plivo does (`plivo_signature_headers()` / `signed_webhook()` in `tests/helpers.py`, built on the Plivo SDK). They open `/ws` with the stream URL returned by a signed answer webhook, and sign that connection the way Plivo does (`stream_signature_headers()`). Local servers use a test auth token, with `PUBLIC_URL` set to their `http://localhost:<port>` URL.
 
 Run from this directory:
 
@@ -665,6 +665,8 @@ The log shows `Rejected Plivo webhook POST /answer: signature mismatch …`. The
 - Nothing between Plivo and the server rewrites the path or query string.
 
 `missing X-Plivo-Signature-V3` means the request did not come from Plivo, for example a hand-made `curl`. To call the server by hand, sign the request with your `PLIVO_AUTH_TOKEN` the way Plivo does (see `plivo_signature_headers()` in `tests/helpers.py`).
+
+`Rejected Plivo stream /ws: signature mismatch …` means `/answer` was accepted but the audio stream was refused, so the call connects and then drops. Check that the host in `PUBLIC_URL` is the host Plivo connects to for the stream, and that nothing in between rewrites the path. To open `/ws` by hand, send the headers from `stream_signature_headers()` in `tests/helpers.py`.
 
 ### 401 / handshake rejected
 

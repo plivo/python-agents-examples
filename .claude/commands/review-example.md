@@ -77,11 +77,18 @@ Run through EVERY item. Report PASS or FAIL with details for each.
 27. **python-dotenv**: `load_dotenv()` called in utils.py
 28. **Lint clean**: `uv run ruff check .` returns 0 errors
 
-#### Testing (3 checks)
+#### Webhook Authentication (3 checks; CLAUDE.md "Webhook Authentication", reference `deepgram-voiceagent/`)
+
+28a. **Every Plivo route is signed**: each webhook route and `@app.websocket("/ws")` in both `server.py` files declares the signature dependency (`dependencies=PLIVO_SIGNED`); only the health check (`/`) is open. The check uses the Plivo SDK's `validate_v3_signature`
+28b. **Signed URL rebuilt from `PUBLIC_URL`**: never from `request.url`. Webhook: `PUBLIC_URL` + path + query string. Stream: `http://` + `PUBLIC_URL` host + path, no query string
+28c. **Always on**: no env switch disables the check; the server refuses to start with an empty `PLIVO_AUTH_TOKEN`; rejections log the path and reason, never the signature
+
+#### Testing (4 checks)
 
 29. **Unit tests pass**: `uv run pytest tests/test_integration.py -v -k "unit"` — all pass
 30. **E2E test structure**: test_live_call.py has fixtures for server_process, ngrok_tunnel, plivo_configured
 31. **Outbound test exists**: test_outbound_call.py tests the outbound flow
+32. **Tests sign their requests**: webhooks and `/ws` connections are signed with the helpers in `tests/helpers.py`, and there are tests that unsigned webhooks and unsigned `/ws` connections are refused
 
 ## Output Format
 

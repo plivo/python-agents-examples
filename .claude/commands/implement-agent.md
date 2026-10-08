@@ -77,12 +77,11 @@ Include all tool functions from the scaffold (check_order_status, send_sms, sche
 ### 4. Implement outbound/agent.py
 
 Copy the inbound agent logic, then add (reference: `deepgram-voiceagent/outbound/agent.py`):
-- `build_outbound_prompt()` for template variable substitution, with neutral fallbacks so no `{{...}}` placeholder is ever sent
-- A greeting builder from `opening_reason` (default greeting when it is empty)
+- `DEFAULT_OUTBOUND_GREETING`, used when no greeting is passed
 - An outbound call context that labels `To` as the customer's number and `From` as our caller ID
-- `run_agent()` that accepts `opening_reason`, `objective`, `context` (from the `answer_url` query string) and renders the prompt and greeting
+- `run_agent()` that accepts an optional `greeting` (the `answer_url` query param of the same name) and speaks it verbatim. The prompt is `outbound/system_prompt.md` as is, with no per-call templating
 
-Do not add `CallManager`, `OutboundCallRecord` or `determine_outcome()` (legacy), and do not read the prompt from a `SYSTEM_PROMPT` env var; `system_prompt.md` is the only source.
+Do not add `CallManager`, `OutboundCallRecord` or `determine_outcome()`, and do not read the prompt from a `SYSTEM_PROMPT` env var; `system_prompt.md` is the only source.
 
 ### 5. Update pyproject.toml
 

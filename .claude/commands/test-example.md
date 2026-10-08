@@ -12,6 +12,12 @@ Read `CLAUDE.md` for testing requirements. Read the existing test files in `{exa
 
 Use `grok3-voice-native/tests/` as the primary reference for test patterns.
 
+**Signed requests.** The servers check Plivo's signature on every webhook and on `/ws` (CLAUDE.md "Webhook Authentication"), so tests must sign what they send. Reference: `deepgram-voiceagent/tests/`.
+- Test servers run with a dummy `PLIVO_AUTH_TOKEN` and `PUBLIC_URL` set to their own `http://localhost:<port>` URL
+- Webhooks: `signed_webhook()` / `plivo_signature_headers()` from `tests/helpers.py`
+- `/ws`: take the stream URL from a signed answer webhook's XML and connect with `stream_signature_headers(stream_url, token)`
+- Never add a switch that turns the check off for tests
+
 ### 1. Write test_integration.py
 
 Create 4 test classes following `grok3-voice-native/tests/test_integration.py`:
@@ -26,11 +32,16 @@ Create 4 test classes following `grok3-voice-native/tests/test_integration.py`:
 - `test_normalize_with_spaces` — "+1 657-233-8892" → E.164
 - `test_normalize_local_format` — "(657) 233-8892" → E.164
 
+**TestUnitWebhookAuth** (offline, `-k "unit"`, FastAPI `TestClient`; reference: `deepgram-voiceagent/tests/test_integration.py`):
+- every webhook route accepts a signed request and returns 403 to an unsigned one
+- `/ws` runs the agent when signed; unsigned or wrongly signed is refused (close code 1008) and no agent starts
+- the server refuses to start with an empty `PLIVO_AUTH_TOKEN`
+
 **TestLocalIntegration** (starts server, needs API key):
 - `server_process` fixture: starts `inbound.server` on TEST_PORT
 - `test_local_health_check` — GET / returns 200
-- `test_local_answer_webhook` — POST /answer returns XML with `<Stream>`
-- `test_local_websocket_connection` — connect, send start event, receive playAudio
+- `test_local_answer_webhook` — signed POST /answer returns XML with `<Stream>`; unsigned returns 403
+- `test_local_websocket_connection` — connect with signed headers, send start event, receive playAudio; an unsigned connection gets HTTP 403
 - `test_local_audio_quality` — receive audio chunks, verify RMS > 500
 
 **Test{API}Integration** (needs API key):
@@ -70,7 +81,7 @@ Skip if credentials not configured: `pytestmark = pytest.mark.skipif(...)`
 Similar to test_live_call.py but for outbound:
 1. Start outbound server subprocess
 2. Start ngrok tunnel
-3. Place the call with Plivo's Make Call API (`client.calls.create(from_=PLIVO_PHONE_NUMBER, to_=PLIVO_TEST_NUMBER, answer_url=<tunnel>/outbound/answer?opening_reason=..., ...)`)
+3. Place the call with Plivo's Make Call API (`client.calls.create(from_=PLIVO_PHONE_NUMBER, to_=PLIVO_TEST_NUMBER, answer_url=<tunnel>/outbound/answer?greeting=..., ...)`)
 4. Wait for call to connect
 5. Record, transcribe, verify greeting
 

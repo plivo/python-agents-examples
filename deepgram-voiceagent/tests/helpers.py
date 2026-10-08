@@ -148,7 +148,7 @@ def log_messages(log_path: Path) -> list[str]:
 
 
 # =============================================================================
-# Plivo webhook signing (V3) and /ws stream URLs — what Plivo itself sends
+# Plivo webhook and /ws stream signing (V3), /ws stream URLs — what Plivo itself sends
 # =============================================================================
 
 
@@ -180,6 +180,19 @@ def signed_webhook(
     """Send a Plivo-signed webhook request (form ``data`` for POST) to ``url``."""
     headers = plivo_signature_headers(method, url, auth_token, data)
     return httpx.request(method, url, data=data, headers=headers, timeout=timeout)
+
+
+def stream_signature_headers(
+    stream_url: str, auth_token: str, nonce: str | None = None
+) -> dict[str, str]:
+    """``X-Plivo-Signature-V3`` headers Plivo sends when it connects to ``stream_url``.
+
+    Plivo signs the stream URL as ``http://`` + host + path, without the query string.
+    """
+    parts = urlsplit(stream_url)
+    return plivo_signature_headers(
+        "GET", f"http://{parts.netloc}{parts.path}", auth_token, None, nonce
+    )
 
 
 def stream_url_from_xml(xml: str) -> str:
