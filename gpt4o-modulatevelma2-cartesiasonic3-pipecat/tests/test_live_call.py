@@ -265,7 +265,7 @@ class TestLiveCall:
         # caller's leg was answered by ngrok, never by the server
         assert f"Incoming call: CallUUID={agent_leg}" in log, log_tail(LOG_PATH)
         assert f"Plivo stream started: callId={agent_leg}" in log
-        assert "Rejected Plivo webhook" not in log, "A webhook of this call was rejected"
+        assert "Rejected Plivo" not in log, "A webhook or the stream of this call was rejected"
         assert caller_leg not in log, "The caller's leg reached the server"
 
         # The opening line was spoken and nothing interrupted it: no interruption (hence

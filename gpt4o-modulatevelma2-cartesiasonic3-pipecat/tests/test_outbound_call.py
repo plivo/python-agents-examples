@@ -318,6 +318,7 @@ class TestOutboundCall:
         a_line = next(line for line in log.splitlines() if f"answered: CallUUID={a_leg}" in line)
         assert "greeting: from answer_url" in a_line
         assert f"Plivo stream started: callId={a_leg}" in log
+        assert "Rejected Plivo" not in log, "A webhook or the stream of this call was rejected"
         # One agent only: the callee leg never reached the outbound server
         assert b_leg not in log, "The callee leg was answered by the agent"
 
