@@ -24,10 +24,10 @@ Before creating any files, verify `{example-name}` follows the naming convention
 - S2S/multimodal: `gemini2.5-live`, `gemini3.1-live`, `gptrealtime1.5`, `grok3-voice`
 
 **STT:** `{provider}{model-name}{version}`
-- `deepgramnova2`, `deepgramnova3`, `deepgramflux`, `assemblyaiu3`, `sarvam`
+- `deepgramnova2`, `deepgramnova3`, `deepgramflux`, `assemblyaiu3`, `modulatevelma2`, `sarvam`
 
 **TTS:** `{provider}{model-name}{version}`
-- `elevenflashv2.5`, `cartesiasonic2`, `cartesiasonic3`, `openaitts4o`, `groktts3`
+- `elevenflashv2.5`, `cartesiasonic2`, `cartesiasonic3` (covers `sonic-3.x` point releases), `openaitts4o`, `groktts3`
 
 Examples: `gpt5.4-assemblyaiu3-cartesiasonic3-native`, `gemini2.5-live-pipecat`, `gpt4.1-deepgramnova3-elevenflashv2.5-native`
 
@@ -122,15 +122,22 @@ Copy `grok3-voice-native/inbound/system_prompt.md` and `outbound/system_prompt.m
 - Keep only utility-owned constants (sample rates, VAD params, DEFAULT_COUNTRY_CODE)
 - Do NOT include server constants (SERVER_PORT, PLIVO_AUTH_ID, etc.) or agent constants (API keys, model names)
 
-**For framework**:
-- Same audio conversion functions but NO SileroVADProcessor, NO plivo_to_vad()
-- No VAD constants
+**For framework** (the serializer/transport converts audio) and hosted orchestration:
+- Only `normalize_phone_number()` and `DEFAULT_COUNTRY_CODE` (reference: `gpt4o-modulatevelma2-cartesiasonic3-pipecat/utils.py`)
+- No audio conversion functions, no sample-rate constants, no SileroVADProcessor, no plivo_to_vad(), no VAD constants
+- If the example's own code later has to decode, encode or resample audio (custom processor or service), those helpers go in utils.py, not inline in agent.py
+
+**For managed platform**: both direction wrappers, no VAD code. Pass-throughs with no codec set when the platform is configured for μ-law 8kHz (reference: `deepgram-voiceagent/utils.py`); the full codec set when it needs PCM or another rate.
+
+See CLAUDE.md "utils.py Requirements" for the full table.
 
 ### 7. Create pyproject.toml
 
 Based on `grok3-voice-native/pyproject.toml`:
 - Update project name and description
-- Keep common deps: fastapi, uvicorn, websockets, plivo, python-dotenv, python-multipart, loguru, numpy, scipy, phonenumbers
+- Keep common deps: fastapi, uvicorn, websockets, plivo, python-dotenv, python-multipart, loguru, phonenumbers
+- `numpy`, `scipy`: only when utils.py has the codec set (native, or a platform that needs conversion)
+- `requires-python = ">=3.10"` and ruff `target-version = "py310"` unless a dependency needs a higher floor (e.g. `pipecat-ai>=1.0` needs 3.11); then raise both together and keep the Dockerfile base image at or above it
 - For native: add `silero-vad>=5.1`, `torch>=2.0.0`
 - Add `# TODO: Add {api}-specific dependencies` comment
 - Keep dev deps and ruff/pytest config identical

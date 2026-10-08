@@ -33,6 +33,7 @@ Drop the size class (mini/nano/pro/flash) — it's `.env` config. Only include s
 | Deepgram `nova-3` | `deepgramnova3` |
 | Deepgram `flux` | `deepgramflux` |
 | AssemblyAI `u3-rt-pro` | `assemblyaiu3` |
+| Modulate `velma-2` | `modulatevelma2` |
 | Sarvam STT | `sarvam` (no named model series) |
 
 ### Voice AI (TTS) component: `{provider}{model-name}{version}`
@@ -41,7 +42,7 @@ Drop the size class (mini/nano/pro/flash) — it's `.env` config. Only include s
 |---|---|
 | ElevenLabs `eleven_flash_v2_5` | `elevenflashv2.5` |
 | Cartesia `sonic-2` | `cartesiasonic2` |
-| Cartesia `sonic-3` | `cartesiasonic3` |
+| Cartesia `sonic-3` and its `sonic-3.x` point releases (e.g. `sonic-3.6`) | `cartesiasonic3` |
 | OpenAI `gpt-4o-mini-tts` | `openaitts4o` |
 | Grok `grok-3-fast-voice` (TTS only) | `groktts3` |
 
@@ -95,11 +96,11 @@ Legacy: `gpt4.1-deepgramnova3-elevenflashv2.5-vapi` predates this rule and is st
 │   ├── agent.py              # Same agent class + outbound prompt/greeting rendered from per-call context
 │   ├── server.py             # FastAPI: /outbound/answer (answer_url context → <Stream>), /outbound/hangup, /ws
 │   └── system_prompt.md      # System prompt for outbound calls
-├── utils.py                  # Audio conversion, VAD (if native), phone utils
+├── utils.py                  # Phone utils; audio conversion + VAD only where this example converts audio (see "utils.py Requirements")
 ├── tests/
 │   ├── __init__.py
 │   ├── conftest.py           # sys.path setup (copy from grok3-voice-native)
-│   ├── helpers.py            # ngrok, recording, transcription (copy from grok3-voice-native)
+│   ├── helpers.py            # ngrok, recording, transcription (copy from grok3-voice-native); test-only decoder when utils.py has no codec
 │   ├── test_integration.py   # Unit + local integration tests
 │   ├── test_e2e_live.py      # E2E with real API (no phone call)
 │   ├── test_live_call.py     # Real inbound call test
@@ -124,11 +125,11 @@ Constants live where they are consumed:
 
 **`agent.py`** owns:
 - API keys, model names, voice names, API URLs
-- `PLIVO_CHUNK_SIZE = 160` (used in `_send_to_plivo`)
+- `PLIVO_CHUNK_SIZE = 160` (used in `_send_to_plivo`; not defined in framework examples, where the transport chunks the audio)
 - `SYSTEM_PROMPT` (loaded only from `system_prompt.md`; no env override, see "System Prompt")
 
 **`utils.py`** owns only what its functions consume:
-- Audio sample rates: `PLIVO_SAMPLE_RATE`, `{API}_SAMPLE_RATE`, `VAD_SAMPLE_RATE`
+- Audio sample rates: `PLIVO_SAMPLE_RATE`, `{API}_SAMPLE_RATE`, `VAD_SAMPLE_RATE` (only when `utils.py` has conversion functions; an example with none, e.g. `gpt4o-modulatevelma2-cartesiasonic3-pipecat`, defines no sample-rate constants there)
 - VAD params (native only): `VAD_START_THRESHOLD`, `VAD_END_THRESHOLD`, `VAD_MIN_SILENCE_MS`, `VAD_CHUNK_SAMPLES`
 - `DEFAULT_COUNTRY_CODE`
 
@@ -144,21 +145,34 @@ New examples use the simple outbound path: Plivo Make Call API → `answer_url` 
 
 Only utility functions and their internal constants. No server or agent config.
 
-Required functions:
-- `ulaw_to_pcm(ulaw_data: bytes) -> bytes` — G.711 decode table
-- `pcm_to_ulaw(pcm_data: bytes) -> bytes` — G.711 encode
-- `resample_audio(audio_data: bytes, input_rate: int, output_rate: int) -> bytes`
-- `plivo_to_{api}(mulaw_8k: bytes) -> bytes` — Plivo audio to API format
-- `{api}_to_plivo(pcm: bytes) -> bytes` — API audio to Plivo format
-- `normalize_phone_number(phone: str, default_region: str) -> str`
+**Principle.** An audio helper is required in `utils.py` exactly when this example's own code converts audio on the call path. Whoever converts owns the code: when a framework's serializer/transport or a hosted platform does it, no helper is required here and none is carried unused. Conversion code never lives inline in `agent.py` / `server.py`.
 
-For native examples, also:
-- `plivo_to_vad(mulaw_8k: bytes) -> np.ndarray` — float32 16kHz for Silero
-- `SileroVADProcessor` class (reference: `grok3-voice-native/utils.py`)
+Always required: `normalize_phone_number(phone: str, default_region: str) -> str`.
 
-For framework examples: no VAD in utils (framework handles it).
+Audio helpers, by name:
+- Codec set: `ulaw_to_pcm(ulaw_data: bytes) -> bytes` (G.711 decode table), `pcm_to_ulaw(pcm_data: bytes) -> bytes` (G.711 encode), `resample_audio(audio_data: bytes, input_rate: int, output_rate: int) -> bytes`
+- Direction wrappers: `plivo_to_{api}(mulaw_8k: bytes) -> bytes` (Plivo audio to API format), `{api}_to_plivo(pcm: bytes) -> bytes` (API audio to Plivo format). In a cascaded pipeline `{api}` is the service on that side: the STT for input, the TTS for output.
+- Silero set: `plivo_to_vad(mulaw_8k: bytes) -> np.ndarray` (float32 16kHz), `SileroVADProcessor` class (reference: `grok3-voice-native/utils.py`)
 
-**Exception — pipelines with no conversion or transcoding.** When the API accepts and emits Plivo's own format (μ-law 8kHz) end to end, the agent never decodes, encodes or resamples audio. Such an example omits `ulaw_to_pcm`, `pcm_to_ulaw`, `resample_audio`, the decode table and the sample-rate constants, and does not carry `numpy`/`scipy` as runtime dependencies for them. `plivo_to_{api}` / `{api}_to_plivo` stay as documented pass-throughs, and `normalize_phone_number` stays. Tests that need to decode recordings (RMS, transcription) keep a small decoder in `tests/helpers.py` instead. Reference: `deepgram-voiceagent/` (Deepgram Voice Agent configured for `mulaw` 8000 in and out). Unused code that exists only to satisfy this list is not required.
+| Who converts audio on the call path | Required in `utils.py` besides `normalize_phone_number` | Reference |
+|---|---|---|
+| **Native**, API needs PCM or another rate | Codec set, both wrappers, Silero set | `grok3-voice-native/` |
+| **Native `-no-vad`** | Codec set, both wrappers. No VAD code | `gemini2.5-live-native-no-vad/` |
+| **Native `-webrtcvad`** | Codec set, both wrappers. No Silero set: the `webrtcvad.Vad` instance lives in `agent.py` and is fed `ulaw_to_pcm` output at 8kHz | `gemini2.5-live-native-webrtcvad/` |
+| **Native or managed platform, μ-law 8kHz end to end** (API accepts and emits Plivo's own format, no client-side VAD) | Both wrappers as documented pass-throughs (the body returns its argument). Codec set, decode table and sample-rate constants omitted | `deepgram-voiceagent/` (Deepgram Voice Agent configured for `mulaw` 8000 in and out) |
+| **Managed platform** configured for PCM or another rate | Codec set, both wrappers. No VAD code | none yet |
+| **Framework** (pipecat / livekit), serializer or transport converts | Nothing | `gpt4o-modulatevelma2-cartesiasonic3-pipecat/` (`PlivoFrameSerializer`) |
+| **Framework** whose own code touches raw audio (a custom processor or service that decodes, encodes or resamples) | The helpers that code calls, defined in `utils.py` and imported from there | none yet |
+| **Hosted orchestration**, call audio never reaches this server | Nothing | `gpt4.1-deepgramnova3-elevenflashv2.5-vapi/` (Plivo SIP trunk to Vapi; the server only handles webhooks) |
+
+Rules that follow from the principle:
+- A native example with Silero or WebRTC VAD decodes for the VAD, so it always carries the codec set, even when the API itself takes μ-law.
+- A direction with no conversion still has its wrapper, as a pass-through, so the audio path is readable from `utils.py`.
+- An example with no codec set does not carry `numpy`/`scipy` as runtime dependencies for it. Tests that decode recordings (RMS, transcription) or build caller audio keep a small decoder in `tests/helpers.py` instead.
+- Unused code that exists only to satisfy this list is not required.
+- Legacy: `gemini2.5-live-pipecat/` and `gpt4o-deepgramnova3-openaitts4o-pipecat/` still carry codec helpers that only their tests call. Tolerated, not a model.
+
+`scripts/validate-example.sh` enforces this from the syntax tree: native and managed-platform examples must define the helpers above (the pass-through row is granted only when both wrappers return their argument, no codec function is defined or referenced, and no non-test code imports a conversion library); framework and hosted examples skip the helper checks; every example fails if non-test code outside `utils.py` imports `audioop`, calls a library resampler, or defines its own μ-law/resample function.
 
 ## VAD Strategy
 
@@ -168,13 +182,17 @@ For framework examples: no VAD in utils (framework handles it).
 - Speech end triggers turn commit (`input_audio_buffer.commit` + `response.create` or equivalent)
 - Reference: `grok3-voice-native/utils.py` (SileroVADProcessor), `grok3-voice-native/inbound/agent.py` (integration)
 
-**Framework examples** (Pipecat/LiveKit): use `vad_enabled=True` in transport params. No separate Silero.
+**Framework examples** (Pipecat/LiveKit/Vapi): configure the framework's own VAD or turn detection in code. No separate Silero, no VAD code in `utils.py`.
+- Pipecat 1.x: `vad_analyzer=SileroVADAnalyzer()` on `LLMUserAggregatorParams` (the params of the user side of `LLMContextAggregatorPair`). Reference: `gpt4o-modulatevelma2-cartesiasonic3-pipecat/inbound/agent.py`
+- Pipecat below 1.0 (legacy): `vad_enabled=True` in transport params. Pipecat 1.x `TransportParams` has no such field and ignores it. Reference: `gemini2.5-live-pipecat/inbound/agent.py`
+- LiveKit: `vad=` on the session. Hosted assistant config (Vapi): its speaking-plan keys.
 
 ## Audio Pipeline Rules
 
-- `PLIVO_CHUNK_SIZE = 160` — exactly 20ms at 8kHz mono μ-law. Defined in `agent.py._send_to_plivo()`.
+- `PLIVO_CHUNK_SIZE = 160` — exactly 20ms at 8kHz mono μ-law. Defined in `agent.py._send_to_plivo()`. Native and managed-platform examples only: a framework's transport does the chunking, so framework examples do not define it.
 - Plivo WebSocket sends/receives base64 μ-law at 8kHz
 - playAudio JSON format: `{"event": "playAudio", "media": {"contentType": "audio/x-mulaw", "sampleRate": 8000, "payload": "<base64>"}}`
+  - Framework examples (Pipecat, LiveKit, Vapi, …) usually do not build this message: the framework's transport emits it. The validator requires the dict literal in native and managed-platform agents; in a framework agent it is checked only if the agent builds one itself.
 - Answer webhook returns `<Stream>` XML: `bidirectional=True`, `keepCallAlive=True`, `contentType="audio/x-mulaw;rate=8000"`
 
 ## Agent Structure
@@ -186,13 +204,18 @@ For framework examples: no VAD in utils (framework handles it).
 - `_send_to_plivo()` — plivo_tx: chunk audio to 160 bytes, send playAudio
 - Public `run_agent()` function wraps class instantiation
 
-**Framework orchestration**: `run_agent()` function assembles Pipeline. No custom class needed.
+**Framework orchestration**: `run_agent()` function assembles the framework's pipeline and runs it to completion. No custom agent class needed.
 
-**Pipecat PipelineRunner signal handling**:
-- Use `PipelineRunner()` (default `handle_sigterm=False`) when running inside uvicorn.
-- Do NOT use `PipelineRunner(handle_sigterm=True)` — it calls `loop.add_signal_handler(signal.SIGTERM, ...)` in `__init__`, which **replaces** uvicorn's SIGTERM handler. After the pipeline finishes, uvicorn's handler is never restored, so uvicorn never receives a shutdown signal and the process hangs indefinitely.
-- `handle_sigterm=True` is only appropriate for standalone scripts where PipelineRunner owns the process lifecycle.
-- PipelineRunner idle timeout is 300s, cancel timeout is 20s — relevant for shutdown timing.
+**Pipecat 1.x** (reference: `gpt4o-modulatevelma2-cartesiasonic3-pipecat/inbound/agent.py`):
+- New examples build a `PipelineWorker` (`pipecat.pipeline.worker`) around the `Pipeline` and run it with `WorkerRunner` (`pipecat.workers.runner`): `await runner.add_workers(worker)`, then `await runner.run()`.
+- `PipelineTask` / `PipelineRunner` are deprecated aliases of those two classes (deprecated in Pipecat 1.3.0, removed in 2.0.0). Only the legacy examples locked to Pipecat 0.0.x use them (`gemini2.5-live-pipecat`, `gpt4o-deepgramnova3-openaitts4o-pipecat`); do not use them in new code.
+
+**Pipecat runner signal handling**:
+- `WorkerRunner` installs its handlers with `loop.add_signal_handler(...)` when `run()` starts. A loop-level handler **replaces** uvicorn's handler for that signal and Pipecat never removes it, so after the first call uvicorn never receives that signal again and the process hangs instead of shutting down.
+- Defaults are `handle_sigint=True`, `handle_sigterm=False`. Inside uvicorn construct `WorkerRunner(handle_sigint=False)` and never pass `handle_sigterm=True`.
+- `handle_sigint=True` / `handle_sigterm=True` are only appropriate for standalone scripts where the runner owns the process lifecycle.
+- Legacy `PipelineRunner` (Pipecat 0.0.x) has the same two arguments and defaults and installs the handlers in `__init__`; never pass it `handle_sigterm=True`.
+- `PipelineWorker` defaults: idle timeout 300s (`idle_timeout_secs`), cancel timeout 20s (`cancel_timeout_secs`), relevant for shutdown timing.
 
 ## WebSocket Protocol
 
@@ -241,6 +264,7 @@ Note: `_pending` with underscore prefix avoids RUF059 lint warning.
 - `uv sync` to install deps, `uv add {pkg}` to add new deps, `uv run` to execute commands
 - All commands run through `uv run`: `uv run pytest`, `uv run ruff check .`, `uv run python -m inbound.server`
 - `uv.lock` is committed to git for reproducible builds
+- **Python floor**: 3.10+ is the repo-wide default (`requires-python = ">=3.10"`, ruff `target-version = "py310"`). An example raises the floor only when a dependency requires it, and then `requires-python` and ruff `target-version` name the same floor, the Dockerfile base image runs a Python at or above it, and the README Prerequisites state it. Reference: `gpt4o-modulatevelma2-cartesiasonic3-pipecat/` (`pipecat-ai>=1.0` requires Python 3.11+: `>=3.11`, `py311`, `python:3.12-slim`)
 
 ### Dockerfile `uv sync` and optional dependencies
 
@@ -264,14 +288,14 @@ Every example must include `[project.optional-dependencies]` with `observability
 
 ## Lint
 
-Ruff with: `select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF"]`, `line-length = 100`, `target-version = "py310"`
+Ruff with: `select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF"]`, `line-length = 100`, `target-version = "py310"` (or the example's raised Python floor, see "Package Management")
 
 Run: `uv run ruff check .`
 
 ## Testing
 
 **Unit tests** (`-k "unit"`): offline, no API keys needed
-- `TestUnitAudioConversion`: ulaw↔pcm roundtrip, silence detection
+- `TestUnitAudioConversion`: ulaw↔pcm roundtrip, silence detection. Tests the `utils.py` codec when `utils.py` has one; otherwise the test-only decoder in `tests/helpers.py` (reference: `gpt4o-modulatevelma2-cartesiasonic3-pipecat/tests/`)
 - `TestUnitPhoneNormalization`: E.164 formatting
 
 **Local integration** (`-k "local"`): starts server subprocess, tests WebSocket flow with real API
@@ -282,7 +306,7 @@ Run: `uv run ruff check .`
 - `test_outbound_call.py`: outbound call → greeting verification
 - `test_multiturn_voice.py`: multi-turn + barge-in verification
 
-Test infra: `conftest.py` sets `sys.path`, `helpers.py` has ngrok/recording/transcription utils.
+Test infra: `conftest.py` sets `sys.path`, `helpers.py` has ngrok/recording/transcription utils, plus the test-only decoder when `utils.py` has no codec.
 
 **Server subprocess teardown** in `server_process` fixture — always use SIGTERM with SIGKILL fallback:
 ```python
@@ -293,7 +317,7 @@ except subprocess.TimeoutExpired:
     proc.kill()
     proc.wait()
 ```
-Pipecat servers may not exit on SIGTERM alone when a PipelineRunner has been active (see "Pipecat PipelineRunner signal handling" above). Native servers typically exit cleanly on SIGTERM, but the fallback pattern is safe for all examples.
+Pipecat servers may not exit on SIGTERM alone once a runner (`WorkerRunner`, or legacy `PipelineRunner`) that was allowed to install signal handlers has been active (see "Pipecat runner signal handling" above). Native servers typically exit cleanly on SIGTERM, but the fallback pattern is safe for all examples.
 
 Run: `uv run pytest tests/test_integration.py -v -k "unit"` (offline)
 
@@ -305,7 +329,8 @@ Run: `uv run pytest tests/test_integration.py -v -k "unit"` (offline)
 - `grok3-voice-native/outbound/agent.py` — legacy `CallManager` outbound pattern; do not copy it into new examples (see "Outbound Calls")
 - `grok3-voice-native/tests/` — full test suite to replicate
 - `gemini2.5-live-native-no-vad/` — alternative native pattern (SDK-based, server-side VAD, no client-side VAD)
-- `gemini2.5-live-pipecat/inbound/agent.py` — framework Pipeline reference
+- `gpt4o-modulatevelma2-cartesiasonic3-pipecat/inbound/agent.py`: framework reference for Pipecat 1.x (`PipelineWorker` + `WorkerRunner`, `vad_analyzer` on the user aggregator, `PlivoFrameSerializer`, no audio helpers in `utils.py`)
+- `gemini2.5-live-pipecat/inbound/agent.py`: legacy framework reference (Pipecat 0.0.x: `PipelineTask` + `PipelineRunner`, `vad_enabled=True`)
 - `deepgram-voiceagent/` — managed voice-agent platform reference (raw WebSocket bridge, platform-side turn detection, checkpoint-based playback tracking)
 - `deepgram-voiceagent/outbound/` — outbound reference: Plivo Make Call API → `answer_url` query params → `<Stream>` → agent
 
@@ -348,4 +373,4 @@ Each phase gets a fresh context window. Run sequentially.
 ./scripts/validate-example.sh {example-name}
 ```
 
-Exit 0 = pass, exit 1 = fail. Checks structure, lint, unit tests, config placement.
+Exit 0 = pass, exit 1 = fail. Checks structure, lint, unit tests, config placement, `utils.py` helpers.

@@ -16,7 +16,7 @@ Use `grok3-voice-native/tests/` as the primary reference for test patterns.
 
 Create 4 test classes following `grok3-voice-native/tests/test_integration.py`:
 
-**TestUnitAudioConversion** (offline, `-k "unit"`):
+**TestUnitAudioConversion** (offline, `-k "unit"`). Tests the `utils.py` codec when utils.py has one. When it has none (μ-law pass-through, or a framework that converts), put a small test-only decoder in `tests/helpers.py` and test that instead (reference: `gpt4o-modulatevelma2-cartesiasonic3-pipecat/tests/`); never add a codec to utils.py just for tests:
 - `test_ulaw_to_pcm_conversion` — silence bytes → PCM, check size and amplitude
 - `test_pcm_to_ulaw_conversion` — PCM silence → μ-law, check size
 - `test_audio_roundtrip` — 440Hz sine wave, PCM→ulaw→PCM, check correlation > 0.9
