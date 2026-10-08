@@ -252,13 +252,8 @@ class TestOutboundCall:
 
         transcript = best_transcript(plivo_client, call_uuids)
         assert len(transcript) > 5, f"No speech found in any recording of {call_uuids}"
-        lower = transcript.lower()
-        identity = [w for w in ("alex", "techflow", "tech flow") if w in lower]
-        reason = [w for w in ("demo", "teams", "reaching out", "request") if w in lower]
-        # Both legs run an agent, so the recording can mix two greetings; the reason is
-        # checked deterministically on each agent's own agent_text below.
-        print(f"[Result] identity={identity} reason={reason}")
-        assert identity, f"Greeting lacks the agent identity: '{transcript}'"
+        # Both legs run an agent and their greetings overlap, so the recording only proves
+        # that speech was audible; the words are checked on each agent's own agent_text.
 
         time.sleep(1)
         a_leg_texts = _agent_texts(a_leg)
