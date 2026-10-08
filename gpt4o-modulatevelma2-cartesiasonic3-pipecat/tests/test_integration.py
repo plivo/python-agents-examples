@@ -1078,6 +1078,14 @@ class TestUnitSystemPromptSource:
         assert "search_the_web" in prompt
         assert "{{" not in prompt and "}}" not in prompt
 
+    @pytest.mark.parametrize("module", AGENT_MODULES)
+    def test_prompt_names_the_tech_stack(self, module):
+        """The agent can say what it is built with: every component is in the prompt."""
+        prompt = importlib.import_module(module).SYSTEM_PROMPT
+        for component in ("GPT-4o", "Modulate", "Cartesia", "Tavily", "Pipecat", "Plivo"):
+            assert component in prompt, component
+        assert "built with" in prompt
+
     def test_outbound_prompt_does_not_reintroduce(self):
         from outbound.agent import SYSTEM_PROMPT
 
