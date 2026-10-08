@@ -125,7 +125,7 @@ async def collect_audio_from_ws(ws, timeout: float = 25.0, min_bytes: int = 3000
                 audio_chunks.append(chunk)
                 total_bytes += len(chunk)
                 last_audio = time.time()
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
         except websockets.exceptions.ConnectionClosed:
             break

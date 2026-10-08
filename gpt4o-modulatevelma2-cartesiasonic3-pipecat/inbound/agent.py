@@ -33,7 +33,7 @@ from pipecat.observers.loggers.llm_log_observer import LLMLogObserver
 from pipecat.observers.loggers.transcription_log_observer import TranscriptionLogObserver
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
 from pipecat.pipeline.pipeline import Pipeline
-from pipecat.pipeline.worker import PipelineParams, PipelineWorker
+from pipecat.pipeline.worker import PipelineParams, PipelineWorker, ProcessorUnusablePolicy
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
@@ -43,16 +43,18 @@ from pipecat.serializers.plivo import PlivoFrameSerializer
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.settings import STTSettings
+from pipecat.services.stt_latency import DEFAULT_TTFS_P99
 from pipecat.services.stt_service import WebsocketSTTService
 from pipecat.transcriptions.language import Language
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
 )
+from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.utils.time import time_now_iso8601
 from pipecat.workers.runner import WorkerRunner
 from websockets.asyncio.client import connect as websocket_connect
-from websockets.exceptions import ConnectionClosed
 from websockets.protocol import State
 
 if TYPE_CHECKING:
@@ -77,6 +79,11 @@ TAVILY_SEARCH_DEPTH = os.getenv("TAVILY_SEARCH_DEPTH", "fast")
 # the answer up, rather than leaving the caller in silence.
 TAVILY_TIMEOUT_SECS = 5.0
 
+# End of the caller's turn: how long after Silero VAD reports the end of speech
+# the caller may still resume before the turn is handed to the LLM. Pipecat's
+# own default for SpeechTimeoutUserTurnStopStrategy.
+USER_SPEECH_TIMEOUT_SECS = 0.6
+
 # =============================================================================
 # Prompts
 # =============================================================================
@@ -94,7 +101,6 @@ OPENING_USER_MESSAGE = "Hello, I'm calling for help."
 
 MODULATE_STT_URL = "wss://platform.modulate.ai/api/velma-2-streaming"
 MODULATE_STT_MODEL = "velma-2"
-MODULATE_AUTH_CLOSE_CODE = 4001  # the server closes with this code on a bad API key
 MODULATE_CLOSE_TIMEOUT_SECS = 2.0  # cap on the closing handshake at call teardown
 
 
@@ -112,10 +118,21 @@ class ModulateSTTService(WebsocketSTTService):
       - Audio is raw binary; we send s16le at the pipeline's own sample rate.
       - ``partial_clip`` -> interim transcript, ``clip`` -> final.
 
+    Turn taking: a ``clip`` is Velma's own endpointed final for an utterance,
+    so its TranscriptionFrame is marked ``finalized=True``. The turn stop
+    strategy then releases the turn as soon as the clip is in instead of
+    waiting out the STT latency allowance. ``ttfs_p99_latency`` is that
+    allowance (speech end to final transcript) for the cases with no finalized
+    clip yet; it defaults to Pipecat's unmeasured fallback, DEFAULT_TTFS_P99,
+    because no P99 has been measured for Velma-2. Pass a measured value to
+    override it.
+
     Connection ownership: the socket is opened in ``start()`` and from then on
-    only the base class's receive task reconnects it (bounded retries with
-    backoff, then a terminal ErrorFrame). ``run_stt`` never connects; it drops
-    audio while the socket is down, so there is exactly one connector.
+    only the base class's receive task reconnects it. Every kind of drop is
+    handled the same way: bounded retries with backoff, giving up early when
+    the connection keeps closing right after it opens, then an ErrorFrame that
+    marks the service unusable. ``run_stt`` never connects; it drops audio
+    while the socket is down, so there is exactly one connector.
 
     Note: ``behavior_detection`` events are documented for this endpoint but were
     not observed on the streaming socket during testing (2026-10-05). Behaviours
@@ -131,6 +148,7 @@ class ModulateSTTService(WebsocketSTTService):
         produce_topics: bool = False,
         produce_summary: bool = False,
         sample_rate: int | None = None,
+        ttfs_p99_latency: float | None = DEFAULT_TTFS_P99,
         **kwargs,
     ) -> None:
         # Velma-2 auto-detects language and exposes no model selector, so
@@ -138,6 +156,7 @@ class ModulateSTTService(WebsocketSTTService):
         # class asserts every settings field has a real value.
         super().__init__(
             sample_rate=sample_rate,
+            ttfs_p99_latency=ttfs_p99_latency,
             settings=STTSettings(model=MODULATE_STT_MODEL, language=None),
             **kwargs,
         )
@@ -169,7 +188,8 @@ class ModulateSTTService(WebsocketSTTService):
             await self._connect_websocket()
         except Exception as e:
             # Surface the failure instead of swallowing it. The receive task
-            # below then finds no socket and runs the base reconnect loop.
+            # below then finds no socket and runs the base reconnect loop, which
+            # ends in a permanent error if the retries fail too.
             await self.push_error(error_msg=str(e), exception=e)
         if not self._receive_task:
             self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
@@ -250,23 +270,17 @@ class ModulateSTTService(WebsocketSTTService):
         ws = self._websocket
         if ws is None:
             raise ConnectionError("Modulate Velma-2 is not connected")
-        try:
-            async for message in ws:
-                if isinstance(message, bytes):
-                    continue
-                try:
-                    event = json.loads(message)
-                except json.JSONDecodeError:
-                    logger.warning(f"Non-JSON message from Modulate ({len(message)} chars)")
-                    continue
-                await self._handle_event(event)
-        except ConnectionClosed as e:
-            if e.rcvd is not None and e.rcvd.code == MODULATE_AUTH_CLOSE_CODE:
-                # Retrying cannot fix a rejected key; let the base class report
-                # the close as an error instead of reconnecting.
-                logger.error("Modulate rejected MODULATE_API_KEY (close 4001); not reconnecting")
-                self._reconnect_on_error = False
-            raise
+        # A dropped connection raises out of this loop (or ends it); the base
+        # class's receive task decides whether to reconnect or give up.
+        async for message in ws:
+            if isinstance(message, bytes):
+                continue
+            try:
+                event = json.loads(message)
+            except json.JSONDecodeError:
+                logger.warning(f"Non-JSON message from Modulate ({len(message)} chars)")
+                continue
+            await self._handle_event(event)
 
     @staticmethod
     def _language(code: str | None) -> Language | None:
@@ -300,6 +314,8 @@ class ModulateSTTService(WebsocketSTTService):
                 if clip.get(k) is not None
             }
             logger.debug(f"[Velma] clip, {len(text)} chars, {extras}")
+            # Velma endpointed this utterance itself: nothing more is coming
+            # for it, so the turn need not wait for a later transcript.
             await self.push_frame(
                 TranscriptionFrame(
                     text,
@@ -307,6 +323,7 @@ class ModulateSTTService(WebsocketSTTService):
                     time_now_iso8601(),
                     self._language(clip.get("language")),
                     result=clip,
+                    finalized=True,
                 )
             )
 
@@ -369,20 +386,21 @@ async def search_the_web(params: FunctionCallParams) -> None:
     try:
         from tavily import AsyncTavilyClient
 
-        client = AsyncTavilyClient(api_key=TAVILY_API_KEY)
-        # The SDK's own timeout bounds the HTTP request; wait_for bounds the
-        # whole call so a caller never sits in silence past the limit.
-        response = await asyncio.wait_for(
-            client.search(
-                query=query,
-                search_depth=TAVILY_SEARCH_DEPTH,
-                include_answer="advanced",
-                max_results=5,
+        # async with closes the client's HTTP connection pool on every path.
+        async with AsyncTavilyClient(api_key=TAVILY_API_KEY) as client:
+            # The SDK's own timeout bounds the HTTP request; wait_for bounds the
+            # whole call so a caller never sits in silence past the limit.
+            response = await asyncio.wait_for(
+                client.search(
+                    query=query,
+                    search_depth=TAVILY_SEARCH_DEPTH,
+                    include_answer="advanced",
+                    max_results=5,
+                    timeout=TAVILY_TIMEOUT_SECS,
+                ),
                 timeout=TAVILY_TIMEOUT_SECS,
-            ),
-            timeout=TAVILY_TIMEOUT_SECS,
-        )
-    except asyncio.TimeoutError:
+            )
+    except TimeoutError:
         logger.warning(f"Tavily search timed out after {TAVILY_TIMEOUT_SECS}s")
         await params.result_callback(
             {"result": "The search took too long. Tell the caller you could not look that up."}
@@ -425,9 +443,8 @@ async def run_agent(
 
     # PlivoFrameSerializer wraps outgoing audio in Plivo playAudio events
     # (contentType audio/x-mulaw, 8kHz) and turns interruptions into clearAudio.
-    # auto_hang_up needs Plivo REST credentials, which belong to server.py; the
-    # pipeline only ends when Plivo closes the stream, so there is no call left
-    # to hang up.
+    # auto_hang_up stays off: it needs Plivo REST credentials, which belong to
+    # server.py. The server hangs the call up in /ws once run_agent returns.
     serializer = PlivoFrameSerializer(
         stream_id=stream_id,
         call_id=call_id,
@@ -464,12 +481,21 @@ async def run_agent(
         tools=tools,
     )
 
-    # VAD is Pipecat's Silero analyzer on the user aggregator; it drives turn
-    # taking and barge-in (interruptions are on by default).
+    # VAD is Pipecat's Silero analyzer on the user aggregator. The default start
+    # strategies (VAD, then transcription) open the turn and drive barge-in
+    # (interruptions are on by default). The turn ends USER_SPEECH_TIMEOUT_SECS
+    # after VAD reports the end of speech, once a transcript is in; without
+    # this, Pipecat's default smart-turn analyzer can hold a turn open for its
+    # 3s silence fallback.
     context_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
             vad_analyzer=SileroVADAnalyzer(),
+            user_turn_strategies=UserTurnStrategies(
+                stop=[
+                    SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=USER_SPEECH_TIMEOUT_SECS)
+                ],
+            ),
         ),
     )
 
@@ -492,8 +518,12 @@ async def run_agent(
         logger.info(f"[Latency] user stopped -> bot started: {latency:.2f}s")
 
     # The two log observers print transcripts and LLM text at DEBUG only.
+    # END: when the STT, LLM or TTS service reports that it can no longer do its
+    # job (reconnects exhausted, rejected credentials), the pipeline ends and
+    # run_agent returns, instead of leaving a deaf or silent call up.
     worker = PipelineWorker(
         pipeline,
+        processor_unusable_policy=ProcessorUnusablePolicy.END,
         params=PipelineParams(
             enable_metrics=True,
             enable_usage_metrics=True,
@@ -521,9 +551,10 @@ async def run_agent(
         logger.info(f"Plivo stream closed for call {call_id}; stopping the pipeline")
         await worker.cancel()
 
-    # WorkerRunner's default is handle_sigterm=False, which is what running
-    # inside uvicorn needs: uvicorn keeps its own SIGTERM handler.
-    runner = WorkerRunner()
+    # Inside uvicorn the runner must not install signal handlers: a loop-level
+    # handler replaces uvicorn's and is never removed. handle_sigint defaults
+    # to True, so it is turned off; handle_sigterm already defaults to False.
+    runner = WorkerRunner(handle_sigint=False)
 
     try:
         await runner.add_workers(worker)

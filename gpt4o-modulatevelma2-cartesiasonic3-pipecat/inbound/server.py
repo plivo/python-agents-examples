@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import json
@@ -118,6 +119,33 @@ def stream_url(body_data: dict) -> str:
     body_b64 = base64.b64encode(json.dumps(body_data).encode()).decode()
     ws_base = PUBLIC_URL.rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
     return f"{ws_base}/ws?body={quote(body_b64, safe='')}"
+
+
+# =============================================================================
+# Call control
+# =============================================================================
+
+
+async def _hangup_call(call_uuid: str) -> None:
+    """Hang up a live call via the Plivo REST API. Never raises.
+
+    /ws calls this when the agent is done with a call, whatever the reason, so a
+    pipeline that ended on its own does not leave the caller on a silent line
+    (the <Stream> has keepCallAlive). Usually the caller hung up first and Plivo
+    answers "not found", which is not an error.
+    """
+    log = logger.bind(call_id=call_uuid)
+    if not (PLIVO_AUTH_ID and PLIVO_AUTH_TOKEN and call_uuid):
+        log.info("Skipping REST hangup (no Plivo credentials)")
+        return
+    try:
+        client = plivo.RestClient(auth_id=PLIVO_AUTH_ID, auth_token=PLIVO_AUTH_TOKEN)
+        await asyncio.to_thread(client.calls.delete, call_uuid)
+        log.info(f"Hung up call via REST: {call_uuid}")
+    except plivo.exceptions.ResourceNotFoundError:
+        log.debug(f"Call {call_uuid} already ended; nothing to hang up")
+    except Exception as e:
+        log.warning(f"REST hangup failed for call {call_uuid}: {type(e).__name__}")
 
 
 # =============================================================================
@@ -342,6 +370,11 @@ async def websocket_endpoint(
     except Exception as e:
         logger.bind(call_id=call_id).error(f"WebSocket error: {e}")
     finally:
+        # The agent is done (it returned or raised) but keepCallAlive keeps the
+        # call up after the stream closes, so hang it up here. "unknown" means
+        # Plivo never told us which call this is.
+        if call_id != "unknown":
+            await _hangup_call(call_id)
         with contextlib.suppress(Exception):
             await websocket.close()
 

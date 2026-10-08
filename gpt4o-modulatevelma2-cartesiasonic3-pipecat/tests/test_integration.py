@@ -5,7 +5,8 @@ Test Levels:
 1. Unit Tests (offline) - the test-only audio codec in tests/helpers.py, phone
    normalization, ModulateSTTService event handling, the Tavily search tool with a
    stubbed client, prompts and the outbound greeting, the Pipecat worker/runner wiring
-   (no deprecated API), server routes and Plivo webhook authentication via FastAPI
+   (no deprecated API, turn-end strategy, ending on an unusable service), server routes,
+   the REST hangup when the agent finishes and Plivo webhook authentication via FastAPI
    TestClient
 2. Local Integration - start the inbound server, drive the Plivo WebSocket protocol
    (needs OPENAI_API_KEY, MODULATE_API_KEY and CARTESIA_API_KEY)
@@ -29,6 +30,7 @@ import inspect
 import json
 import math
 import os
+import signal
 import struct
 import time
 import uuid
@@ -36,7 +38,7 @@ import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import httpx
 import plivo
@@ -88,9 +90,14 @@ FORM = {"CallUUID": "c-1", "From": "+15551230000", "To": "+15557654321"}
 
 @pytest.fixture(autouse=True)
 def plivo_test_auth_token(monkeypatch):
-    """Both servers check webhook signatures with TEST_AUTH_TOKEN (never a real credential)."""
+    """Both servers check webhook signatures with TEST_AUTH_TOKEN (never a real credential).
+
+    PLIVO_AUTH_ID is blanked so no test reaches the Plivo REST API with whatever is in
+    the developer's .env; the hangup tests set a fake one and stub the client.
+    """
     for module in SERVER_MODULES:
         monkeypatch.setattr(importlib.import_module(module), "PLIVO_AUTH_TOKEN", TEST_AUTH_TOKEN)
+        monkeypatch.setattr(importlib.import_module(module), "PLIVO_AUTH_ID", "")
 
 
 @pytest.fixture(params=AGENT_MODULES)
@@ -430,7 +437,8 @@ class TestUnitInboundOutboundParity:
         [
             "MODULATE_STT_URL",
             "MODULATE_STT_MODEL",
-            "MODULATE_AUTH_CLOSE_CODE",
+            "MODULATE_CLOSE_TIMEOUT_SECS",
+            "USER_SPEECH_TIMEOUT_SECS",
             "TAVILY_TIMEOUT_SECS",
             "TAVILY_SEARCH_DEPTH",
             "LLM_MODEL",
@@ -457,7 +465,10 @@ class TestUnitInboundOutboundParity:
 
 
 class FakeTavily:
-    """Stands in for tavily.AsyncTavilyClient; ``behaviour`` decides what search() does."""
+    """Stands in for tavily.AsyncTavilyClient; ``behaviour`` decides what search() does.
+
+    Like the real client it is an async context manager whose exit calls close().
+    """
 
     instances: list[FakeTavily]
     behaviour: Any = None
@@ -465,7 +476,17 @@ class FakeTavily:
     def __init__(self, api_key: str | None = None, **kwargs: Any) -> None:
         self.api_key = api_key
         self.searches: list[dict[str, Any]] = []
+        self.closed = 0
         type(self).instances.append(self)
+
+    async def close(self) -> None:
+        self.closed += 1
+
+    async def __aenter__(self) -> FakeTavily:
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        await self.close()
 
     async def search(self, **kwargs: Any) -> dict:
         self.searches.append(kwargs)
@@ -525,6 +546,7 @@ class TestUnitTavilySearchTool:
         # only the exception type is logged, never its text
         assert "Tavily search failed: RuntimeError" in captured_messages
         assert "tvly-test" not in "\n".join(captured_messages)
+        assert [c.closed for c in tavily_stub.instances] == [1]
 
     async def test_client_hangs_past_the_timeout(self, monkeypatch, agent_mod, tavily_stub):
         monkeypatch.setattr(agent_mod, "TAVILY_TIMEOUT_SECS", 0.05)
@@ -535,6 +557,8 @@ class TestUnitTavilySearchTool:
         assert results == [
             {"result": "The search took too long. Tell the caller you could not look that up."}
         ]
+        # the cancelled search still releases the client's connections
+        assert [c.closed for c in tavily_stub.instances] == [1]
 
     @pytest.mark.parametrize(
         "response",
@@ -558,6 +582,14 @@ class TestUnitTavilySearchTool:
         results = await call_tool(agent_mod, {"query": "  plivo pricing  "})
         # the first two result titles are named; the third is not
         assert results == [{"result": "Plivo charges per minute.\nSources: Plivo Pricing, Docs."}]
+        assert [c.closed for c in tavily_stub.instances] == [1]
+
+    def test_real_client_closes_on_context_exit(self):
+        """The SDK contract search_the_web relies on: ``async with`` ends in close()."""
+        from tavily import AsyncTavilyClient
+
+        assert inspect.iscoroutinefunction(AsyncTavilyClient.__aenter__)
+        assert "self.close()" in inspect.getsource(AsyncTavilyClient.__aexit__)
 
     @pytest.mark.parametrize("results_field", [[], None, [{"title": ""}, {"url": "x"}]])
     async def test_answer_without_named_sources(self, agent_mod, tavily_stub, results_field):
@@ -601,6 +633,7 @@ class _FakeWorker:
 
     def __init__(self, pipeline: Any, **kwargs: Any) -> None:
         self.pipeline = pipeline
+        self.init_kwargs = kwargs
         self.queued: list[Any] = []
         type(self).created.append(self)
 
@@ -636,6 +669,10 @@ class _FakeWebSocket:
     application_state = None
 
 
+# The LLMUserAggregatorParams run_agent_offline's last run built the aggregators with.
+USER_PARAMS: list[Any] = []
+
+
 async def run_agent_offline(monkeypatch, module_name: str, **kwargs: Any) -> tuple[Any, list]:
     """Assemble the real pipeline but never run it: no socket is opened to any service.
 
@@ -646,11 +683,13 @@ async def run_agent_offline(monkeypatch, module_name: str, **kwargs: Any) -> tup
         monkeypatch.setattr(mod, key, "test-key")
     _FakeWorker.created = []
     _FakeRunner.created = []
+    USER_PARAMS.clear()
     contexts: list[Any] = []
     real_pair = mod.LLMContextAggregatorPair
 
     def recording_pair(context: Any, *args: Any, **kw: Any):
         contexts.append(context)
+        USER_PARAMS.append(kw.get("user_params"))
         return real_pair(context, *args, **kw)
 
     monkeypatch.setattr(mod, "LLMContextAggregatorPair", recording_pair)
@@ -739,17 +778,20 @@ class TestUnitPipecatWorkerAPI:
     async def test_worker_is_added_then_run_without_arguments(self, monkeypatch, module):
         """add_workers(worker) then run(): passing the worker to run() is the deprecated form.
 
-        The runner is built with its defaults, so handle_sigterm stays False and uvicorn
-        keeps its own SIGTERM handler (CLAUDE.md "Pipecat PipelineRunner signal handling").
+        The runner installs no signal handler, so uvicorn keeps its own for SIGINT and
+        SIGTERM (CLAUDE.md "Pipecat PipelineRunner signal handling"): handle_sigint
+        defaults to True and is turned off, handle_sigterm is left at its False default.
         """
         from pipecat.workers.runner import WorkerRunner
 
         await run_agent_offline(monkeypatch, module)
         (runner,) = _FakeRunner.created
-        assert runner.init_args == () and runner.init_kwargs == {}
+        assert runner.init_args == () and runner.init_kwargs == {"handle_sigint": False}
         assert runner.workers == _FakeWorker.created
         assert runner.run_calls == [((), {})]
-        assert inspect.signature(WorkerRunner).parameters["handle_sigterm"].default is False
+        defaults = inspect.signature(WorkerRunner).parameters
+        assert defaults["handle_sigint"].default is True
+        assert defaults["handle_sigterm"].default is False
 
     @pytest.mark.parametrize("module", AGENT_MODULES)
     async def test_building_and_starting_emits_no_deprecation_warning(self, monkeypatch, module):
@@ -808,6 +850,197 @@ class TestUnitPipecatWorkerAPI:
             and site not in w.filename
         ]
         assert own == []
+
+
+class TestUnitTurnEnd:
+    """End of the caller's turn: a bounded speech timeout, released early by a final clip."""
+
+    @pytest.mark.parametrize("module", AGENT_MODULES)
+    async def test_user_aggregator_turn_strategies(self, monkeypatch, module):
+        """Silero VAD and the default start strategies (barge-in unchanged); the stop
+        strategy is the speech timeout, not Pipecat's default smart-turn analyzer."""
+        from pipecat.audio.vad.silero import SileroVADAnalyzer
+        from pipecat.turns.user_start import (
+            TranscriptionUserTurnStartStrategy,
+            VADUserTurnStartStrategy,
+        )
+        from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
+
+        mod = importlib.import_module(module)
+        await run_agent_offline(monkeypatch, module)
+        (params,) = USER_PARAMS
+        assert type(params.vad_analyzer) is SileroVADAnalyzer
+        strategies = params.user_turn_strategies
+        assert [type(s) for s in strategies.start] == [
+            VADUserTurnStartStrategy,
+            TranscriptionUserTurnStartStrategy,
+        ]
+        (stop,) = strategies.stop
+        assert type(stop) is SpeechTimeoutUserTurnStopStrategy
+        assert stop.wait_for_transcript is True
+        assert stop._user_speech_timeout == mod.USER_SPEECH_TIMEOUT_SECS == 0.6
+
+    async def test_clip_is_finalized(self, agent_mod):
+        stt, pushed = make_stt(agent_mod)
+        await stt._handle_event({"type": "clip", "clip": CLIP})
+        assert [f.finalized for f in pushed] == [True]
+
+    def test_metadata_frame_carries_the_fallback_latency_without_a_warning(
+        self, agent_mod, captured_messages
+    ):
+        """No P99 is measured for Velma-2: Pipecat's own fallback is passed explicitly,
+        so the per-call "ttfs_p99_latency not set" warning is not logged."""
+        from pipecat.services.stt_latency import DEFAULT_TTFS_P99
+
+        stt, _pushed = make_stt(agent_mod)
+        assert stt.supports_ttfs is True
+        assert stt.service_metadata_frame().ttfs_p99_latency == DEFAULT_TTFS_P99
+        assert not [m for m in captured_messages if "ttfs_p99_latency" in m]
+        measured = agent_mod.ModulateSTTService(api_key="k", ttfs_p99_latency=0.4)
+        assert measured.service_metadata_frame().ttfs_p99_latency == 0.4
+
+    @pytest.mark.parametrize("module", AGENT_MODULES)
+    @pytest.mark.parametrize("finalized", [True, False])
+    async def test_final_clip_releases_the_turn_without_the_stt_wait(
+        self, monkeypatch, module, finalized
+    ):
+        """The stop strategy run_agent configures, fed this service's own frames.
+
+        After VAD stop the strategy waits the speech timeout and, separately, the STT
+        latency allowance (0.8s here: the 1.0s fallback less VAD's 0.2s). The clip's
+        finalized mark ends the second wait, so the turn stops on the speech timeout
+        alone. The same transcript without the mark is still waiting at that point.
+        """
+        from pipecat.frames.frames import VADUserStoppedSpeakingFrame
+        from pipecat.utils.asyncio.task_manager import TaskManager
+
+        mod = importlib.import_module(module)
+        monkeypatch.setattr(mod, "USER_SPEECH_TIMEOUT_SECS", 0.05)
+        await run_agent_offline(monkeypatch, module)
+        (strategy,) = USER_PARAMS[0].user_turn_strategies.stop
+        stt, pushed = make_stt(mod)
+        await stt._handle_event({"type": "clip", "clip": CLIP})
+        (clip_frame,) = pushed
+        clip_frame.finalized = finalized
+
+        stopped: list[float] = []
+
+        async def on_stopped(_strategy: Any, _params: Any) -> None:
+            stopped.append(time.monotonic())
+
+        strategy.add_event_handler("on_user_turn_stopped", on_stopped)
+        await strategy.setup(SimpleNamespace(task_manager=TaskManager()))
+        try:
+            await strategy.process_frame(stt.service_metadata_frame())
+            await strategy.process_frame(VADUserStoppedSpeakingFrame(stop_secs=0.2))
+            await strategy.process_frame(clip_frame)
+            await asyncio.sleep(0.4)
+            assert len(stopped) == (1 if finalized else 0)
+        finally:
+            await strategy.cleanup()
+
+
+class _ClosesAtOnceSocket:
+    """A Modulate socket that accepts the handshake, then closes as soon as it is read.
+
+    This is what a rejected API key looks like on the wire (close code 4001).
+    """
+
+    def __init__(self) -> None:
+        from websockets.protocol import State
+
+        self.state = State.OPEN
+        self.sent: list[Any] = []
+
+    async def send(self, message: Any) -> None:
+        self.sent.append(message)
+
+    async def ping(self) -> None:
+        return None
+
+    async def close(self, *args: Any, **kwargs: Any) -> None:
+        from websockets.protocol import State
+
+        self.state = State.CLOSED
+
+    def __aiter__(self) -> _ClosesAtOnceSocket:
+        return self
+
+    async def __anext__(self) -> Any:
+        from websockets.exceptions import ConnectionClosedError
+        from websockets.frames import Close
+
+        raise ConnectionClosedError(Close(4001, "invalid api key"), None)
+
+
+class TestUnitUnusableServiceEndsTheCall:
+    """A service that can no longer work ends the pipeline, so run_agent returns.
+
+    Offline: the real PipelineWorker and WorkerRunner run a pipeline cut down to the
+    real ModulateSTTService, whose websocket_connect is stubbed. No failure is special
+    cased: the base class's reconnect logic gives up and ProcessorUnusablePolicy.END
+    does the rest.
+    """
+
+    @pytest.mark.parametrize("module", AGENT_MODULES)
+    async def test_worker_policy_is_end(self, monkeypatch, module):
+        from pipecat.pipeline.worker import ProcessorUnusablePolicy
+
+        await run_agent_offline(monkeypatch, module)
+        (worker,) = _FakeWorker.created
+        assert worker.init_kwargs["processor_unusable_policy"] is ProcessorUnusablePolicy.END
+
+    @pytest.mark.parametrize("module", AGENT_MODULES)
+    @pytest.mark.parametrize("failure", ["connect_refused", "closes_after_handshake"])
+    async def test_stt_that_cannot_connect_ends_run_agent(
+        self, monkeypatch, captured_messages, module, failure
+    ):
+        from pipecat.pipeline.pipeline import Pipeline
+
+        mod = importlib.import_module(module)
+        for key in ("OPENAI_API_KEY", "CARTESIA_API_KEY"):
+            monkeypatch.setattr(mod, key, "test-key")
+        monkeypatch.setattr(mod, "MODULATE_API_KEY", "secret-modulate-key")
+        attempts: list[str] = []
+
+        async def fake_connect(url: str, **kwargs: Any) -> Any:
+            attempts.append(url)
+            if failure == "connect_refused":
+                raise OSError(f"cannot reach {url}")
+            return _ClosesAtOnceSocket()
+
+        monkeypatch.setattr(mod, "websocket_connect", fake_connect)
+        services: list[Any] = []
+
+        def no_backoff_stt(**kwargs: Any) -> Any:
+            # Same service, without the 4s pauses between its reconnect attempts.
+            service = real_stt(
+                reconnect_backoff_min_wait=0.0, reconnect_backoff_max_wait=0.0, **kwargs
+            )
+            services.append(service)
+            return service
+
+        real_stt = mod.ModulateSTTService
+        monkeypatch.setattr(mod, "ModulateSTTService", no_backoff_stt)
+        # Only the STT service: the LLM and TTS are built but never started.
+        monkeypatch.setattr(mod, "Pipeline", lambda processors: Pipeline([processors[1]]))
+
+        sigint_before = signal.getsignal(signal.SIGINT)
+        await asyncio.wait_for(
+            mod.run_agent(websocket=_FakeWebSocket(), call_id="c-1", stream_id="s-1"), 20
+        )
+
+        (stt,) = services
+        assert type(stt) is real_stt
+        assert stt.is_usable is False
+        # the first connect plus the base class's retries, then it gave up
+        assert 3 <= len(attempts) <= 5
+        log = "\n".join(captured_messages)
+        assert "can no longer do its job" in log
+        assert f"Pipeline ended for {'outbound ' if 'outbound' in module else ''}call c-1" in log
+        assert "secret-modulate-key" not in log
+        # the runner left the process's SIGINT handling alone
+        assert signal.getsignal(signal.SIGINT) is sigint_before
 
 
 class TestUnitSystemPromptSource:
@@ -1119,6 +1352,158 @@ class TestUnitServerRoutes:
             ),
             ("number", {"number": "14155550123", "app_id": "42"}),
         ]
+
+
+# =============================================================================
+# UNIT TESTS - REST hangup when the agent finishes (stubbed plivo.RestClient)
+# =============================================================================
+
+
+class FakePlivoCalls:
+    """Stands in for plivo.RestClient; ``error`` is what calls.delete() raises, if anything."""
+
+    built: list[tuple[str, str]]
+    deleted: list[str]
+    error: Exception | None = None
+
+    def __init__(self, auth_id: str = "", auth_token: str = "", **kwargs: Any) -> None:
+        type(self).built.append((auth_id, auth_token))
+        self.calls = self
+
+    def delete(self, call_uuid: str) -> None:
+        type(self).deleted.append(call_uuid)
+        if type(self).error is not None:
+            raise type(self).error
+
+
+@pytest.fixture
+def plivo_calls(monkeypatch):
+    """Fake Plivo credentials on both servers and a stubbed REST client."""
+    FakePlivoCalls.built = []
+    FakePlivoCalls.deleted = []
+    FakePlivoCalls.error = None
+    monkeypatch.setattr(plivo, "RestClient", FakePlivoCalls)
+    for module in SERVER_MODULES:
+        monkeypatch.setattr(importlib.import_module(module), "PLIVO_AUTH_ID", "MATESTAUTHID")
+    return FakePlivoCalls
+
+
+@pytest.fixture
+def captured_records():
+    """Collect (level name, message) for every log record."""
+    records: list[tuple[str, str]] = []
+    sink_id = logger.add(
+        lambda m: records.append((m.record["level"].name, m.record["message"])), level="DEBUG"
+    )
+    yield records
+    logger.remove(sink_id)
+
+
+def _run_ws(server: Any, path: str = "/ws", start: dict | None = None) -> None:
+    """Open /ws the way Plivo does, send the first event, and let the handler finish."""
+    from fastapi.testclient import TestClient
+
+    first = {"event": "start", "start": {"callId": "c-1", "streamId": "s-1"}}
+    with TestClient(server.app).websocket_connect(path) as ws:
+        ws.send_text(json.dumps(first if start is None else start))
+        with pytest.raises(Exception):  # noqa: B017 - the server closing the socket
+            ws.receive_text()
+
+
+@pytest.mark.parametrize("module", SERVER_MODULES)
+class TestUnitServerHangup:
+    """/ws hangs the Plivo call up once the agent is done; the <Stream> keeps it alive."""
+
+    def test_hangup_after_run_agent_returns(
+        self, monkeypatch, plivo_calls, captured_records, module
+    ):
+        server = _server(module, monkeypatch)
+        recorder = _RunAgentRecorder()
+        monkeypatch.setattr(server, "run_agent", recorder)
+        _run_ws(server)
+        assert len(recorder.calls) == 1
+        assert plivo_calls.built == [("MATESTAUTHID", TEST_AUTH_TOKEN)]
+        assert plivo_calls.deleted == ["c-1"]
+        assert ("INFO", "Hung up call via REST: c-1") in captured_records
+
+    def test_hangup_after_run_agent_raises(
+        self, monkeypatch, plivo_calls, captured_records, module
+    ):
+        server = _server(module, monkeypatch)
+
+        async def failing_agent(**kwargs: Any) -> None:
+            raise RuntimeError("pipeline blew up")
+
+        monkeypatch.setattr(server, "run_agent", failing_agent)
+        _run_ws(server)
+        assert plivo_calls.deleted == ["c-1"]
+        assert ("ERROR", "WebSocket error: pipeline blew up") in captured_records
+        assert ("INFO", "Hung up call via REST: c-1") in captured_records
+
+    def test_call_id_from_stream_body_when_start_has_none(self, monkeypatch, plivo_calls, module):
+        server = _server(module, monkeypatch)
+        monkeypatch.setattr(server, "run_agent", _RunAgentRecorder())
+        body = quote(
+            base64.b64encode(json.dumps({"call_uuid": "c-body"}).encode()).decode(), safe=""
+        )
+        _run_ws(server, f"/ws?body={body}", {"event": "start", "start": {"streamId": "s-1"}})
+        assert plivo_calls.deleted == ["c-body"]
+
+    def test_no_hangup_for_unknown_call_id(self, monkeypatch, plivo_calls, module):
+        server = _server(module, monkeypatch)
+        recorder = _RunAgentRecorder()
+        monkeypatch.setattr(server, "run_agent", recorder)
+        _run_ws(server, start={"event": "start", "start": {"streamId": "s-1"}})
+        assert recorder.calls[0]["call_id"] == "unknown"
+        assert plivo_calls.built == [] and plivo_calls.deleted == []
+
+    @pytest.mark.parametrize("missing", ["PLIVO_AUTH_ID", "PLIVO_AUTH_TOKEN"])
+    def test_no_hangup_without_credentials(
+        self, monkeypatch, plivo_calls, captured_records, module, missing
+    ):
+        server = _server(module, monkeypatch)
+        monkeypatch.setattr(server, missing, "")
+        monkeypatch.setattr(server, "run_agent", _RunAgentRecorder())
+        _run_ws(server)
+        assert plivo_calls.built == [] and plivo_calls.deleted == []
+        assert ("INFO", "Skipping REST hangup (no Plivo credentials)") in captured_records
+
+    def test_not_found_is_swallowed_quietly(
+        self, monkeypatch, plivo_calls, captured_records, module
+    ):
+        """The usual case: the caller hung up first, so Plivo no longer knows the call."""
+        server = _server(module, monkeypatch)
+        monkeypatch.setattr(server, "run_agent", _RunAgentRecorder())
+        plivo_calls.error = plivo.exceptions.ResourceNotFoundError("not found")
+        _run_ws(server)
+        assert plivo_calls.deleted == ["c-1"]
+        assert ("DEBUG", "Call c-1 already ended; nothing to hang up") in captured_records
+        assert not [r for r in captured_records if r[0] in ("WARNING", "ERROR", "CRITICAL")]
+        assert not [r for r in captured_records if r[1].startswith("Hung up call")]
+
+    def test_other_rest_failure_does_not_escape(
+        self, monkeypatch, plivo_calls, captured_records, module
+    ):
+        """Any other failure is logged by type only (the text may carry credentials)."""
+        server = _server(module, monkeypatch)
+        monkeypatch.setattr(server, "run_agent", _RunAgentRecorder())
+        plivo_calls.error = plivo.exceptions.AuthenticationError("bad token sekret")
+        _run_ws(server)
+        assert (
+            "WARNING",
+            "REST hangup failed for call c-1: AuthenticationError",
+        ) in captured_records
+        assert "sekret" not in "\n".join(message for _level, message in captured_records)
+
+    async def test_hangup_call_never_raises(self, monkeypatch, plivo_calls, module):
+        server = _server(module, monkeypatch)
+        for error in (plivo.exceptions.ResourceNotFoundError("gone"), RuntimeError("boom")):
+            plivo_calls.error = error
+            assert await server._hangup_call("c-9") is None
+        assert plivo_calls.deleted == ["c-9", "c-9"]
+        # an empty call id never reaches Plivo
+        assert await server._hangup_call("") is None
+        assert plivo_calls.deleted == ["c-9", "c-9"]
 
 
 # =============================================================================
@@ -1444,7 +1829,7 @@ class TestLocalIntegration:
                     if data.get("event") == "playAudio":
                         play_audio = data
                         break
-            except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
+            except (TimeoutError, websockets.exceptions.ConnectionClosed):
                 pass
         assert play_audio, "No audio received from server"
         assert play_audio["media"]["contentType"] == "audio/x-mulaw"
@@ -1471,7 +1856,7 @@ class TestLocalIntegration:
                     data = json.loads(await asyncio.wait_for(ws.recv(), timeout=0.02))
                     if data.get("event") == "playAudio":
                         audio_chunks.append(base64.b64decode(data["media"]["payload"]))
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     await ws.send(json.dumps({"event": "media", "media": {"payload": silence}}))
                 except websockets.exceptions.ConnectionClosed:
                     break
