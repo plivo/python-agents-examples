@@ -663,7 +663,7 @@ echo ""
 # =============================================================================
 # A server that verifies Plivo signatures (it references validate_v3_signature) must
 # declare a dependency on every route except the health check "/", /ws included.
-# Servers without the check are older examples and are skipped.
+# A server that does not verify Plivo signatures is skipped.
 
 echo "--- Webhook Authentication ---"
 
@@ -698,7 +698,7 @@ PY
 )
     case "$auth_result" in
         ok) pass "$direction/server.py: every Plivo route (webhooks and /ws) checks the signature" ;;
-        none) skip "$direction/server.py: no Plivo signature check (older example)" ;;
+        none) skip "$direction/server.py: does not verify Plivo signatures" ;;
         error) fail "$direction/server.py: could not be parsed for the signature check" ;;
         *) fail "$direction/server.py: routes without the signature dependency ($auth_result)" ;;
     esac

@@ -12,7 +12,7 @@ Read `CLAUDE.md` for testing requirements. Read the existing test files in `{exa
 
 Use `grok3-voice-native/tests/` as the primary reference for test patterns.
 
-**Signed requests.** The servers check Plivo's signature on every webhook and on `/ws` (CLAUDE.md "Webhook Authentication"), so tests must sign what they send. Reference: `deepgram-voiceagent/tests/` (`grok3-voice-native` predates this).
+**Signed requests.** The servers check Plivo's signature on every webhook and on `/ws` (CLAUDE.md "Webhook Authentication"), so tests must sign what they send. Reference: `deepgram-voiceagent/tests/`.
 - Test servers run with a dummy `PLIVO_AUTH_TOKEN` and `PUBLIC_URL` set to their own `http://localhost:<port>` URL
 - Webhooks: `signed_webhook()` / `plivo_signature_headers()` from `tests/helpers.py`
 - `/ws`: take the stream URL from a signed answer webhook's XML and connect with `stream_signature_headers(stream_url, token)`
@@ -81,7 +81,7 @@ Skip if credentials not configured: `pytestmark = pytest.mark.skipif(...)`
 Similar to test_live_call.py but for outbound:
 1. Start outbound server subprocess
 2. Start ngrok tunnel
-3. Place the call with Plivo's Make Call API (`client.calls.create(from_=PLIVO_PHONE_NUMBER, to_=PLIVO_TEST_NUMBER, answer_url=<tunnel>/outbound/answer?opening_reason=..., ...)`)
+3. Place the call with Plivo's Make Call API (`client.calls.create(from_=PLIVO_PHONE_NUMBER, to_=PLIVO_TEST_NUMBER, answer_url=<tunnel>/outbound/answer?greeting=..., ...)`)
 4. Wait for call to connect
 5. Record, transcribe, verify greeting
 

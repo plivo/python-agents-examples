@@ -90,12 +90,12 @@ Copy `grok3-voice-native/inbound/server.py` → `{example-name}/inbound/server.p
 - Replace Plivo app name (`Grok_Voice_Agent` → `{NewAgent}_Voice_Agent`)
 - Keep ALL routes, webhook logic, and WebSocket handling identical
 
-Then add Plivo signature checks to both `inbound/server.py` and `outbound/server.py` (CLAUDE.md "Webhook Authentication"; `grok3-voice-native` predates it). Copy from `deepgram-voiceagent/inbound/server.py`:
+Then add Plivo signature checks to both `inbound/server.py` and `outbound/server.py` (CLAUDE.md "Webhook Authentication"). Copy from `deepgram-voiceagent/inbound/server.py`:
 - `check_webhook_auth_config()` (called at startup: refuse to run with an empty `PLIVO_AUTH_TOKEN`), `public_request_url()`, `_reject_unsigned()`, `verify_plivo_signature()` and `PLIVO_SIGNED`
 - `dependencies=PLIVO_SIGNED` on every Plivo webhook route (answer, hangup, fallback, …) and on `@app.websocket("/ws")`. Only the health check (`/`) stays open
 - No env switch to turn the check off
 
-For `outbound/server.py`, follow `deepgram-voiceagent/outbound/server.py` (the simple path in CLAUDE.md "Outbound Calls"): `/`, `/outbound/answer` (reads `opening_reason`/`objective`/`context` from the query string into the `<Stream>` body), `/outbound/hangup` (logs only), `/ws`. Do not copy `POST /outbound/call`, status/campaign routes or `CallManager` from `grok3-voice-native`.
+For `outbound/server.py`, follow `deepgram-voiceagent/outbound/server.py` (the simple path in CLAUDE.md "Outbound Calls"): `/`, `/outbound/answer` (reads the optional `greeting` query param into the `<Stream>` body), `/outbound/hangup` (logs only), `/ws`. Do not copy `POST /outbound/call`, status/campaign routes or `CallManager` from `grok3-voice-native`.
 
 ### 4. Create system prompts
 
@@ -110,7 +110,7 @@ Copy `grok3-voice-native/inbound/system_prompt.md` and `outbound/system_prompt.m
   - All method bodies have `# TODO: Implement {api}-specific logic` comments
   - Include the tool functions (check_order_status, send_sms, etc.) from reference
   - Include public `run_agent()` function
-- `outbound/agent.py`: Same skeleton + `build_outbound_prompt()` / greeting rendered from the per-call context (`opening_reason`, `objective`, `context`) that `run_agent()` receives. No `CallManager`, `OutboundCallRecord` or `determine_outcome` (legacy); follow `deepgram-voiceagent/outbound/`
+- `outbound/agent.py`: Same skeleton; `run_agent()` receives an optional `greeting` and speaks it verbatim, with a default greeting when it is empty. The prompt is `outbound/system_prompt.md` as is. No `CallManager`, `OutboundCallRecord` or `determine_outcome`; follow `deepgram-voiceagent/outbound/`
 
 **For framework orchestration**:
 - `inbound/agent.py`: Skeleton with `run_agent()` function that assembles a Pipeline

@@ -77,7 +77,7 @@ Run through EVERY item. Report PASS or FAIL with details for each.
 27. **python-dotenv**: `load_dotenv()` called in utils.py
 28. **Lint clean**: `uv run ruff check .` returns 0 errors
 
-#### Webhook Authentication (3 checks, new examples; CLAUDE.md "Webhook Authentication", reference `deepgram-voiceagent/`)
+#### Webhook Authentication (3 checks; CLAUDE.md "Webhook Authentication", reference `deepgram-voiceagent/`)
 
 28a. **Every Plivo route is signed**: each webhook route and `@app.websocket("/ws")` in both `server.py` files declares the signature dependency (`dependencies=PLIVO_SIGNED`); only the health check (`/`) is open. The check uses the Plivo SDK's `validate_v3_signature`
 28b. **Signed URL rebuilt from `PUBLIC_URL`**: never from `request.url`. Webhook: `PUBLIC_URL` + path + query string. Stream: `http://` + `PUBLIC_URL` host + path, no query string
